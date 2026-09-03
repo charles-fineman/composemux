@@ -151,6 +151,17 @@ both because compose services are long-running where Nx tasks are short:
   to move the anchor, so the view drifts as nx's does. Raise `scrollback` to
   widen the window, at roughly 7 MB per service per 1000 rows.
 
+## Contributing
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it
+covers setup, the test conventions, and one constraint that is easy to trip
+over: composemux deliberately mirrors the Nx TUI's keybindings and layout, so a
+change that improves on Nx in isolation may still be declined.
+
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md). For
+security issues, see [SECURITY.md](SECURITY.md) — please report privately rather
+than opening an issue.
+
 ## Attribution
 
 This is a port of the Nx terminal UI, which is MIT licensed and copyright
@@ -162,3 +173,6 @@ It is an independent project, not affiliated with or endorsed by Nrwl / Nx.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Contributions are accepted under the same licence (inbound = outbound).
+Contributors keep the copyright in their own work; there is no CLA.
