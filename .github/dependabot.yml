@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Rust dependencies. Grouped so a quiet week produces one PR rather than six.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps"
+
+  # Keep the Actions themselves current; this is the supply chain that has
+  # write access to releases.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
