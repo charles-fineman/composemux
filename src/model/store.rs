@@ -17,6 +17,51 @@ const RAW_BYTES_PER_ROW: usize = 1024;
 const MIN_RAW_CAP: usize = 256 * 1024;
 const MAX_RAW_CAP: usize = 8 * 1024 * 1024;
 
+/// The SGR sequence reproducing the styling left active after `prefix` and then
+/// `dropped` are parsed.
+///
+/// Replaying through a scratch emulator rather than scanning for escape codes by
+/// hand: the parser already knows which sequences set what, and which of them
+/// cancel each other out.
+fn pen_after(prefix: &[u8], dropped: &[u8]) -> Vec<u8> {
+    let mut scratch = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+    scratch.process(prefix);
+    scratch.process(dropped);
+    let screen = scratch.screen();
+
+    let mut sgr = String::from("\x1b[0m");
+    if screen.bold() {
+        sgr.push_str("\x1b[1m");
+    }
+    if screen.italic() {
+        sgr.push_str("\x1b[3m");
+    }
+    if screen.underline() {
+        sgr.push_str("\x1b[4m");
+    }
+    if screen.inverse() {
+        sgr.push_str("\x1b[7m");
+    }
+    sgr.push_str(&colour_sgr(screen.fgcolor(), true));
+    sgr.push_str(&colour_sgr(screen.bgcolor(), false));
+    sgr.into_bytes()
+}
+
+fn colour_sgr(colour: vt100::Color, foreground: bool) -> String {
+    let (base, bright, extended) = if foreground {
+        (30, 90, 38)
+    } else {
+        (40, 100, 48)
+    };
+    match colour {
+        vt100::Color::Default => String::new(),
+        vt100::Color::Idx(i) if i < 8 => format!("\x1b[{}m", base + u16::from(i)),
+        vt100::Color::Idx(i) if i < 16 => format!("\x1b[{}m", bright + u16::from(i - 8)),
+        vt100::Color::Idx(i) => format!("\x1b[{extended};5;{i}m"),
+        vt100::Color::Rgb(r, g, b) => format!("\x1b[{extended};2;{r};{g};{b}m"),
+    }
+}
+
 fn raw_cap_for(scrollback: usize) -> usize {
     scrollback
         .saturating_mul(RAW_BYTES_PER_ROW)
@@ -51,6 +96,12 @@ pub struct LogStore {
     /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
     /// across chunks isn't mistaken for a bare newline.
     pending_cr: bool,
+    /// The styling active where `raw` begins.
+    ///
+    /// Trimming drops the bytes that set it, so without this a replay would
+    /// render the retained lines in default colours. A service that sets a
+    /// colour once and leaves it on loses it otherwise.
+    pen: Vec<u8>,
     /// True once any output at all has been received.
     has_output: bool,
 }
@@ -63,6 +114,7 @@ impl LogStore {
             raw: Vec::new(),
             raw_cap: raw_cap_for(scrollback),
             pending_cr: false,
+            pen: Vec::new(),
             has_output: false,
         }
     }
@@ -157,7 +209,8 @@ impl LogStore {
             // if the cut lands inside an escape sequence, which is a far better
             // outcome than discarding the buffer and blanking the pane.
             .unwrap_or(excess);
-        self.raw.drain(..cut);
+        let dropped: Vec<u8> = self.raw.drain(..cut).collect();
+        self.pen = pen_after(&self.pen, &dropped);
     }
 
     /// Rows of scrollback currently retained above the visible window.
@@ -188,6 +241,7 @@ impl LogStore {
         // has content, so keep what is on screen and forgo the rewrap instead.
         if cols != cur_cols && !(self.raw.is_empty() && self.has_output) {
             let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
+            rebuilt.process(&self.pen);
             rebuilt.process(&self.raw);
             self.parser = rebuilt;
         } else {
@@ -621,6 +675,72 @@ mod tests {
         s.raw.clear();
         s.resize(5, 100);
         assert!(non_empty(&s).iter().any(|l| l.contains("still here")));
+    }
+
+    /// Fills past the retained cap so a trim is guaranteed, then rewraps.
+    fn trim_then_resize(setup: &[u8]) -> LogStore {
+        let mut s = LogStore::new(16);
+        s.resize(5, 40);
+        s.process(setup);
+        let filler = "y".repeat(4096);
+        for _ in 0..200 {
+            s.process(format!("{filler}\n").as_bytes());
+        }
+        assert!(!s.pen.is_empty(), "a trim should have happened");
+        s.resize(5, 100);
+        s
+    }
+
+    #[test]
+    fn styling_set_before_the_retained_window_survives_a_resize() {
+        // The bytes that set the colour are trimmed away, so a replay would
+        // render everything in the default colour without the carried pen.
+        let s = trim_then_resize(b"\x1b[31m");
+        assert_eq!(
+            s.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+    }
+
+    #[test]
+    fn a_carried_pen_covers_attributes_and_backgrounds() {
+        let s = trim_then_resize(b"\x1b[1m\x1b[4m\x1b[44m");
+        let cell = s.screen().cell(0, 0).unwrap();
+        assert!(cell.bold(), "bold should survive");
+        assert!(cell.underline(), "underline should survive");
+        assert_eq!(cell.bgcolor(), vt100::Color::Idx(4));
+    }
+
+    #[test]
+    fn a_carried_pen_covers_bright_indexed_and_rgb_colours() {
+        let bright = trim_then_resize(b"\x1b[91m");
+        assert_eq!(
+            bright.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(9)
+        );
+
+        let indexed = trim_then_resize(b"\x1b[38;5;200m");
+        assert_eq!(
+            indexed.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(200)
+        );
+
+        let rgb = trim_then_resize(b"\x1b[38;2;10;20;30m");
+        assert_eq!(
+            rgb.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Rgb(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn styling_that_was_reset_before_the_trim_is_not_resurrected() {
+        // The pen must reflect the state at the trim boundary, not every
+        // sequence that ever appeared.
+        let s = trim_then_resize(b"\x1b[31m\x1b[0m");
+        assert_eq!(
+            s.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Default
+        );
     }
 
     #[test]
