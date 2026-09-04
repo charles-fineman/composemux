@@ -40,11 +40,13 @@ pub fn draw(app: &App, frame: &mut Frame) {
     // The next pane `tab` would move to, so the hint appears in the right place.
     let next_tab_target = next_tab_pane(app);
 
-    for (idx, rect) in areas.panes.iter().enumerate() {
+    // One rect per *occupied* slot, so position and slot are not the same
+    // number: pinning only to pane 2 leaves slot 0 empty and yields one rect.
+    for (rect, idx) in areas.panes.iter().zip(app.occupied_panes()) {
         let key = app.pane_key(idx);
-        let row = key
-            .as_ref()
-            .and_then(|k| app.rows().iter().find(|r| &r.key == k));
+        // Resolved against every service, not the filtered rows: a pinned pane
+        // keeps streaming a service the filter has hidden.
+        let row = key.as_ref().and_then(|k| app.service_row(k));
         let (title, status, uptime) = match row {
             Some(r) => (
                 r.display_name.clone(),
@@ -254,6 +256,50 @@ mod tests {
             border_y > 5,
             "the pane should sit below the list, at {border_y}"
         );
+    }
+
+    #[test]
+    fn pinning_only_to_pane_two_renders_that_service() {
+        // One pin means one rect, but the service sits in slot 1 -- feeding that
+        // rect slot 0 drew an empty placeholder pane that never filled.
+        let mut app = app();
+        press(&mut app, KeyCode::Char('2'));
+        app.ingest(
+            crate::tui::app::ServiceKey::new("api", 1),
+            b"output from api\n",
+        );
+        let (_, sizes) = layout_for(&app, Rect::new(0, 0, 160, 40));
+        app.resize_panes(&sizes);
+        let text = render_to_text(&app, 160, 40);
+
+        assert!(
+            !text.contains("Waiting for output"),
+            "the pane should be showing the pinned service:\n{text}"
+        );
+        assert!(text.contains("output from api"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_pinned_pane_keeps_its_header_when_the_filter_hides_the_service() {
+        // The header used to be resolved through the visible rows, so filtering
+        // the pinned service out degraded its title and uptime.
+        let mut app = app();
+        press(&mut app, KeyCode::Char('1'));
+        app.ingest(crate::tui::app::ServiceKey::new("api", 1), b"still here\n");
+        press(&mut app, KeyCode::Char('/'));
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert!(app.rows().is_empty(), "the filter should match nothing");
+
+        let (_, sizes) = layout_for(&app, Rect::new(0, 0, 160, 40));
+        app.resize_panes(&sizes);
+        let text = render_to_text(&app, 160, 40);
+        assert!(
+            text.contains("api"),
+            "the pane title should survive the filter:\n{text}"
+        );
+        assert!(text.contains("still here"));
     }
 
     #[test]
