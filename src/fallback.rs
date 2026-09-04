@@ -11,6 +11,15 @@ use std::io::Write;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Longest unterminated run held before it is emitted anyway.
+///
+/// Output that never sends a newline -- a progress bar driving itself with
+/// carriage returns, a stuck process spraying binary -- would otherwise buffer
+/// for the life of the process. This path is the unattended one, used under CI
+/// and wrapper scripts, so growing without bound here fails where nobody is
+/// watching.
+const MAX_PARTIAL: usize = 1024 * 1024;
+
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
 #[derive(Default)]
 struct LineAssembler {
@@ -27,7 +36,30 @@ impl LineAssembler {
             let text = String::from_utf8_lossy(&line);
             lines.push(text.trim_end_matches(['\n', '\r']).to_string());
         }
+
+        // Nothing terminated the run and it has grown past what is reasonable
+        // to hold. Emit it rather than keep buffering: a long line printed early
+        // is a far better failure than memory climbing until the process dies.
+        if self.partial.len() > MAX_PARTIAL {
+            let held = std::mem::take(&mut self.partial);
+            lines.push(String::from_utf8_lossy(&held).into_owned());
+        }
         lines
+    }
+}
+
+/// Pads service names so the prefixes line up, the way `docker compose logs`
+/// does. The width grows as services appear, since they are not all known up
+/// front; earlier lines keep the width they were written at.
+#[derive(Default)]
+struct Prefixes {
+    width: usize,
+}
+
+impl Prefixes {
+    fn format(&mut self, service: &str) -> String {
+        self.width = self.width.max(service.chars().count());
+        format!("{service:<width$}  | ", width = self.width)
     }
 }
 
@@ -43,6 +75,7 @@ pub async fn run(
     tokio::spawn(async move { supervisor.run(supervisor_cancel).await });
 
     let mut assemblers: HashMap<String, LineAssembler> = HashMap::new();
+    let mut prefixes = Prefixes::default();
     let stdout = std::io::stdout();
 
     loop {
@@ -51,10 +84,11 @@ pub async fn run(
             message = rx.recv() => {
                 let Some(message) = message else { break };
                 if let SourceEvent::Output { service, bytes, .. } = message {
-                    let assembler = assemblers.entry(service.clone()).or_default();
+                    let prefix = prefixes.format(&service);
+                    let assembler = assemblers.entry(service).or_default();
                     let mut lock = stdout.lock();
                     for line in assembler.push(&bytes) {
-                        writeln!(lock, "{service}  | {line}")?;
+                        writeln!(lock, "{prefix}{line}")?;
                     }
                     lock.flush()?;
                 }
@@ -92,6 +126,34 @@ mod tests {
         let mut a = LineAssembler::default();
         let lines = a.push(&[0xff, 0xfe, b'\n']);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn an_unterminated_run_is_emitted_rather_than_buffered_forever() {
+        // A progress bar driving itself with carriage returns never sends a
+        // newline, so the buffer would grow for the life of the process.
+        let mut a = LineAssembler::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut emitted = 0;
+        for _ in 0..40 {
+            emitted += a.push(&chunk).len();
+        }
+        assert!(emitted > 0, "the held run should have been flushed");
+        assert!(
+            a.partial.len() <= MAX_PARTIAL,
+            "buffer grew to {} bytes",
+            a.partial.len()
+        );
+    }
+
+    #[test]
+    fn prefixes_line_up_as_services_appear() {
+        let mut p = Prefixes::default();
+        assert_eq!(p.format("api"), "api  | ");
+        // A longer name widens the column for everything after it.
+        assert_eq!(p.format("cleanexit"), "cleanexit  | ");
+        assert_eq!(p.format("api"), "api        | ");
+        assert_eq!(p.format("db"), "db         | ");
     }
 
     #[test]
