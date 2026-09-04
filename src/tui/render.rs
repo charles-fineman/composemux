@@ -8,20 +8,31 @@ use crate::tui::layout_manager::{is_too_small, LayoutAreas};
 use ratatui::Frame;
 
 /// Computes this frame's geometry and the emulator size each pane needs.
+///
+/// Sizes are keyed by pane *slot*, not by rect position. The layout emits one
+/// rect per occupied slot, so with only pane 2 pinned the single rect belongs to
+/// slot 1 — reporting it as slot 0 left that pane's emulator at its default
+/// size, wrapping at a width the pane never had.
 pub fn layout_for(app: &App, area: ratatui::layout::Rect) -> (LayoutAreas, Vec<(usize, u16, u16)>) {
     let areas = app.layout().calculate(area, status_bar::HEIGHT);
     let sizes = areas
         .panes
         .iter()
-        .enumerate()
-        .map(|(i, rect)| {
+        .zip(app.occupied_panes())
+        .map(|(rect, slot)| {
             let (rows, cols) = log_pane::inner_size(*rect);
-            (i, rows, cols)
+            (slot, rows, cols)
         })
         .collect();
     (areas, sizes)
 }
 
+/// Renders one frame: the service list, any open output panes, the status bar,
+/// and whichever popup is on top.
+///
+/// Pane rects are matched to pane *slots* rather than to their own position,
+/// because the layout emits one rect per occupied slot — with only pane 2
+/// pinned there is a single rect, and it belongs to slot 1.
 pub fn draw(app: &App, frame: &mut Frame) {
     let area = frame.area();
     let buf = frame.buffer_mut();
@@ -110,6 +121,8 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
 
+    /// A service in a given state, with the fields tests do not care about
+    /// left at their defaults.
     fn service(name: &str, status: ServiceStatus) -> Service {
         Service {
             name: name.to_string(),
@@ -122,6 +135,8 @@ mod tests {
         }
     }
 
+    /// An app with one running, one failed and one succeeded service, which
+    /// exercises every status colour and glyph at once.
     fn app() -> App {
         let cfg = Config::default();
         let mut app = App::new("demo", &cfg);
@@ -140,7 +155,7 @@ mod tests {
         );
     }
 
-    /// Renders and returns the frame as plain text lines.
+    /// Renders a frame and returns it as plain text, one string per row.
     fn render_to_lines(app: &App, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -161,6 +176,7 @@ mod tests {
             .collect()
     }
 
+    /// The rendered frame as a single string, for substring assertions.
     fn render_to_text(app: &App, width: u16, height: u16) -> String {
         render_to_lines(app, width, height).join("\n")
     }
@@ -277,6 +293,34 @@ mod tests {
             "the pane should be showing the pinned service:\n{text}"
         );
         assert!(text.contains("output from api"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_sparsely_pinned_pane_gets_its_emulator_sized() {
+        // The content half of this was fixed by mapping rects to slots in draw;
+        // layout_for reported the same rect as slot 0, so resize_panes skipped
+        // the service in slot 1 and its emulator stayed at the default size,
+        // wrapping at a width the pane never had.
+        let mut app = app();
+        press(&mut app, KeyCode::Char('2'));
+        let frame = Rect::new(0, 0, 160, 40);
+        let (areas, sizes) = layout_for(&app, frame);
+        app.resize_panes(&sizes);
+
+        let key = crate::tui::app::ServiceKey::new("api", 1);
+        app.ingest(key.clone(), b"x\n");
+        let (rows, cols) = app
+            .store(&key)
+            .expect("the pinned service should have a buffer")
+            .screen()
+            .size();
+
+        let (want_rows, want_cols) = log_pane::inner_size(areas.panes[0]);
+        assert_eq!(
+            (rows, cols),
+            (want_rows, want_cols),
+            "the emulator should match the pane it is drawn in"
+        );
     }
 
     #[test]
