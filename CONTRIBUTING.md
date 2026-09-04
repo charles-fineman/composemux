@@ -18,13 +18,15 @@ but diverges from Nx will usually be declined even when it's better in
 isolation; if you think a divergence is genuinely warranted, open an issue and
 make the case before you write the code.
 
-Two related notes, so they don't surprise you mid-review:
+Three related notes, so they don't surprise you mid-review:
 
 - Layout constants (`⌊width/3⌋` sidebars, the auto-layout breakpoints, the
   scroll-momentum figures) are ported values, not tuned ones. They look
   arbitrary because they are somebody else's arbitrary.
 - Modules derived from upstream carry a header comment naming the file they
   came from. Keep it accurate when you edit the module.
+- Match upstream's behaviour, not its code. It isn't always available to copy,
+  and it isn't always right — the newline fix in #11 came from a bug in theirs.
 
 Deviations do exist — auto-exit only firing on a clean shutdown, and scroll
 position anchoring to content — and both earned their place by following from
@@ -33,27 +35,6 @@ That's the shape of argument that works.
 
 If you're adapting code from anywhere else, say so in the PR and name the
 upstream file. See [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY).
-
-### Where matching upstream stops being possible
-
-Some upstream behaviour rests on a patched dependency. Nx does not use the
-published `vt100` crate; it pins a personal fork at an unreleased commit, which
-adds methods for retaining raw output and dumping the screen with styling. Those
-methods do not exist in `vt100` as published. Cargo does allow a `git` and a
-`version` together, but publishing then resolves the *registry* version — which
-here is an unrelated crate without the fork's methods, so the published build
-would not compile. A git-only dependency cannot be published at all. Either way
-the fork is not available to us.
-
-Where that happens, reimplement the behaviour rather than the code, and do not
-assume the upstream implementation is correct while you are at it. The
-newline-normalisation fix in #11 came from upstream's version being subtly wrong
-across chunk boundaries — fine for a PTY, not for bytes arriving off a network
-stream.
-
-Beware one specific trap if you go looking: the fork declares the same package
-name *and version* as a real, unrelated crate on crates.io. Depending on that
-published crate compiles cleanly and silently lacks everything you wanted.
 
 ## Scope
 
