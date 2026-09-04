@@ -17,6 +17,12 @@ If you already use the Nx TUI, the keys and the look are the same on purpose.
 cargo install composemux
 ```
 
+Prebuilt binaries are attached to each [release](https://github.com/sofired/composemux/releases)
+for Linux (x86-64 gnu and musl, arm64), macOS (Apple Silicon) and Windows
+(x86-64). On Intel Macs, build from source with `cargo install` — GitHub has
+retired its Intel macOS runners, so there is no longer a machine to build that
+binary on.
+
 ## Use
 
 Run it inside a directory with a running Compose project:
