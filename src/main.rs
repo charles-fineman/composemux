@@ -13,11 +13,16 @@ use docker::{DockerClient, LogSupervisor, SourceEvent};
 use futures::StreamExt;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tui::app::{Action, App, ExitReason, ServiceKey};
+
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
 
 /// Animation tick. Also paces the auto-exit countdown.
 const TICK: Duration = Duration::from_millis(100);
@@ -102,16 +107,22 @@ async fn run() -> Result<i32> {
     }
 
     let cancel = CancellationToken::new();
-    install_signal_handlers(cancel.clone());
+    // -1 until a signal arrives, so a cancellation from any other source keeps
+    // its own exit reason.
+    let signal_exit = Arc::new(AtomicI32::new(-1));
+    install_signal_handlers(cancel.clone(), signal_exit.clone());
 
     // A full-screen UI is useless when output is piped, and would write escape
     // sequences into whatever is capturing it.
     if args.no_tui || !std::io::stdout().is_terminal() {
         fallback::run(&client, &project, cfg.tail, cancel).await?;
-        return Ok(0);
+        return Ok(match signal_exit.load(Ordering::SeqCst) {
+            signo if signo > 0 => 128 + signo,
+            _ => 0,
+        });
     }
 
-    run_tui(client, project, cfg, cancel).await
+    run_tui(client, project, cfg, cancel, signal_exit).await
 }
 
 async fn run_tui(
@@ -119,6 +130,7 @@ async fn run_tui(
     project: String,
     cfg: Config,
     cancel: CancellationToken,
+    signal_exit: Arc<AtomicI32>,
 ) -> Result<i32> {
     let client = Arc::new(client);
     let mut app = App::new(&project, &cfg);
@@ -126,7 +138,9 @@ async fn run_tui(
     let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(4096);
     let supervisor = LogSupervisor::new(&client, &project, cfg.tail, log_tx);
     let supervisor_cancel = cancel.clone();
-    tokio::spawn(async move { supervisor.run(supervisor_cancel).await });
+    spawn_supervised(cancel.clone(), async move {
+        supervisor.run(supervisor_cancel).await
+    });
 
     // Service status is polled rather than derived from events, so uptime and
     // health stay current even when nothing is happening.
@@ -155,7 +169,12 @@ async fn run_tui(
     tui::terminal::restore()?;
 
     let exit = result?;
-    Ok(exit.code())
+    // A signal outranks whatever the loop reported, so the status reflects how
+    // the process was actually asked to stop.
+    Ok(match signal_exit.load(Ordering::SeqCst) {
+        signo if signo > 0 => ExitReason::Signal(signo).code(),
+        _ => exit.code(),
+    })
 }
 
 fn spawn_refresher(
@@ -166,7 +185,8 @@ fn spawn_refresher(
     refresh: Arc<Notify>,
     cancel: CancellationToken,
 ) {
-    tokio::spawn(async move {
+    let watchdog = cancel.clone();
+    spawn_supervised(watchdog, async move {
         loop {
             if let Ok(mut services) = client.list_services(&project).await {
                 services.retain(|s| cfg.is_visible(&s.name));
@@ -304,13 +324,25 @@ fn handle_action(app: &mut App, area: ratatui::layout::Rect) -> Result<()> {
     Ok(())
 }
 
-/// Ctrl-C and SIGTERM both need the terminal restored before we exit, or the
-/// calling CLI inherits a raw-mode terminal.
-fn install_signal_handlers(cancel: CancellationToken) {
+/// Every terminating signal needs the terminal restored before we exit, or the
+/// calling script inherits a raw-mode terminal on the alternate screen.
+///
+/// `SIGINT` is trapped even though `ctrl+c` never produces one here -- raw mode
+/// suppresses `ISIG`, so it arrives as a key event. A `SIGINT` sent any other
+/// way (`kill -INT`, a process supervisor, a CI harness) would otherwise take
+/// the default disposition and skip restoration entirely.
+///
+/// The number is recorded so the exit status can follow `128 + signo`, letting
+/// a supervisor tell its own shutdown from a user quitting.
+fn install_signal_handlers(cancel: CancellationToken, signal_exit: Arc<AtomicI32>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
+            let mut int = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
             let mut term = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -319,14 +351,36 @@ fn install_signal_handlers(cancel: CancellationToken) {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            tokio::select! {
-                _ = term.recv() => cancel.cancel(),
-                _ = hup.recv() => cancel.cancel(),
-            }
+            let signo = tokio::select! {
+                _ = int.recv() => SIGINT,
+                _ = term.recv() => SIGTERM,
+                _ = hup.recv() => SIGHUP,
+            };
+            signal_exit.store(signo, Ordering::SeqCst);
+            cancel.cancel();
         }
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
+            signal_exit.store(SIGINT, Ordering::SeqCst);
+            cancel.cancel();
+        }
+    });
+}
+
+/// Runs a background task, bringing the whole program down if it panics.
+///
+/// A panic inside a spawned task fires the process-wide panic hook -- which
+/// restores the terminal -- while the render loop keeps drawing onto what is now
+/// the primary screen in cooked mode, and never exits. Cancelling turns that
+/// into a deliberate shutdown.
+fn spawn_supervised<F>(cancel: CancellationToken, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(task);
+    tokio::spawn(async move {
+        if handle.await.is_err() {
             cancel.cancel();
         }
     });

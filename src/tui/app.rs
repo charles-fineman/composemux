@@ -59,15 +59,20 @@ pub enum ExitReason {
     Quit,
     Interrupt,
     AutoExit,
+    /// Terminated by a signal, carrying its number so the exit status can
+    /// follow the `128 + signo` convention a supervisor expects.
+    Signal(i32),
 }
 
 impl ExitReason {
     /// Exit status handed back to the wrapping CLI.
     pub fn code(self) -> i32 {
         match self {
-            // 130 is the conventional status for death by SIGINT, letting a
-            // caller tell a deliberate quit from an interrupt.
+            // ctrl+c never reaches us as a signal -- raw mode suppresses ISIG,
+            // so it arrives as a key -- but a caller still expects the status a
+            // real SIGINT would have produced.
             ExitReason::Interrupt => 130,
+            ExitReason::Signal(signo) => 128 + signo,
             ExitReason::Quit | ExitReason::AutoExit => 0,
         }
     }
@@ -1247,6 +1252,13 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert_eq!(app.exit_reason(), Some(ExitReason::Quit));
         assert_eq!(app.exit_reason().unwrap().code(), 0);
+    }
+
+    #[test]
+    fn a_signal_exit_follows_the_128_plus_signo_convention() {
+        assert_eq!(ExitReason::Signal(2).code(), 130); // SIGINT
+        assert_eq!(ExitReason::Signal(15).code(), 143); // SIGTERM
+        assert_eq!(ExitReason::Signal(1).code(), 129); // SIGHUP
     }
 
     #[test]

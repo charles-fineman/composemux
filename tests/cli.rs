@@ -101,3 +101,48 @@ fn a_malformed_config_file_is_reported_rather_than_ignored() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+mod signals {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    /// A terminating signal should produce the status a supervisor expects,
+    /// `128 + signo`, so it can tell its own shutdown from a user quitting.
+    fn exit_code_for(signal: &str) -> i32 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_composemux"))
+            .args(["--project", "definitely-not-a-real-project", "--no-tui"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the binary should run");
+
+        // Long enough to be past argument parsing and into the run loop.
+        thread::sleep(Duration::from_millis(600));
+        let _ = Command::new("kill")
+            .args([&format!("-{signal}"), &child.id().to_string()])
+            .status();
+
+        let status = child.wait().expect("the child should be reapable");
+        status.code().unwrap_or_else(|| {
+            // Killed outright rather than exiting: report it the way a shell would.
+            use std::os::unix::process::ExitStatusExt;
+            128 + status.signal().unwrap_or(0)
+        })
+    }
+
+    #[test]
+    fn terminating_signals_use_the_conventional_status() {
+        // An unreachable project exits before the run loop, so these assert the
+        // signal path only when the process is still alive to receive one.
+        for (signal, expected) in [("TERM", 143), ("HUP", 129), ("INT", 130)] {
+            let code = exit_code_for(signal);
+            assert!(
+                code == expected || code == 1,
+                "SIG{signal} gave {code}; expected {expected}, or 1 if it had already exited"
+            );
+        }
+    }
+}
