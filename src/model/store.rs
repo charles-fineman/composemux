@@ -11,12 +11,46 @@
 /// Rows of scrollback retained per service. Matches nx's `SCROLLBACK_SIZE`.
 pub const DEFAULT_SCROLLBACK: usize = 1_000;
 
+/// Retained bytes per row of scrollback. Generous: a replay must be able to
+/// reproduce everything the parser would have kept, and long lines are common.
+const RAW_BYTES_PER_ROW: usize = 1024;
+const MIN_RAW_CAP: usize = 256 * 1024;
+const MAX_RAW_CAP: usize = 8 * 1024 * 1024;
+
+fn raw_cap_for(scrollback: usize) -> usize {
+    scrollback
+        .saturating_mul(RAW_BYTES_PER_ROW)
+        .clamp(MIN_RAW_CAP, MAX_RAW_CAP)
+}
+
+/// Floor on the emulated screen size.
+///
+/// `vt100` underflows in `col_wrap` on very narrow grids, so this is a crash
+/// guard rather than a cosmetic minimum. It matches the floor the pane's own
+/// geometry already applies, so it never binds in the render path.
+const MIN_ROWS: u16 = 3;
+const MIN_COLS: u16 = 20;
+
 /// Size used before the first layout pass tells us the real pane geometry.
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 
 pub struct LogStore {
     parser: vt100::Parser,
+    /// Rows of scrollback the parser retains; needed to rebuild it on resize.
+    scrollback_len: usize,
+    /// Normalised bytes as fed to the parser, replayed when the width changes.
+    ///
+    /// `vt100` stores rows already wrapped and does not reflow them, so the
+    /// only way to rewrap history is to parse it again at the new width.
+    raw: Vec<u8>,
+    /// Upper bound on `raw`, trimmed at a line boundary. Sized to comfortably
+    /// exceed `scrollback_len` lines so a replay still reproduces everything
+    /// the parser would have retained.
+    raw_cap: usize,
+    /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
+    /// across chunks isn't mistaken for a bare newline.
+    pending_cr: bool,
     /// True once any output at all has been received.
     has_output: bool,
 }
@@ -25,6 +59,10 @@ impl LogStore {
     pub fn new(scrollback: usize) -> Self {
         Self {
             parser: vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, scrollback),
+            scrollback_len: scrollback,
+            raw: Vec::new(),
+            raw_cap: raw_cap_for(scrollback),
+            pending_cr: false,
             has_output: false,
         }
     }
@@ -60,19 +98,62 @@ impl LogStore {
     /// larger `scrollback` widens the window in which anchoring works, at a
     /// linear memory cost.
     pub fn process(&mut self, bytes: &[u8]) {
+        let normalised = self.normalise_newlines(bytes);
+        self.retain(&normalised);
+
         let offset = self.parser.screen().scrollback();
         if offset == 0 {
-            self.parser.process(bytes);
+            self.parser.process(&normalised);
             self.has_output = true;
             return;
         }
 
         let before = self.max_scroll();
-        self.parser.process(bytes);
+        self.parser.process(&normalised);
         let after = self.max_scroll();
         let added = after.saturating_sub(before);
         self.parser.screen_mut().set_scrollback(offset + added);
         self.has_output = true;
+    }
+
+    /// Turns a lone `\n` into `\r\n`, the way a terminal driver's ONLCR would.
+    ///
+    /// Container logs are LF-terminated. Fed to the emulator raw, a bare `\n`
+    /// moves the cursor down without returning it to column 0, so every line
+    /// starts where the last one ended and the output walks off to the right.
+    ///
+    /// The carry flag matters: output arrives in arbitrary chunks, so a `\r` can
+    /// end one and its `\n` begin the next. Deciding per chunk would insert a
+    /// spurious `\r` at that seam.
+    fn normalise_newlines(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut prev_cr = self.pending_cr;
+        for &byte in input {
+            if byte == b'\n' && !prev_cr {
+                out.push(b'\r');
+            }
+            out.push(byte);
+            prev_cr = byte == b'\r';
+        }
+        self.pending_cr = prev_cr;
+        out
+    }
+
+    /// Keeps the bytes needed to rewrap on resize, bounded and cut at a line
+    /// boundary so a replay never begins mid-escape-sequence.
+    fn retain(&mut self, bytes: &[u8]) {
+        self.raw.extend_from_slice(bytes);
+        if self.raw.len() <= self.raw_cap {
+            return;
+        }
+        let excess = self.raw.len() - self.raw_cap;
+        let cut = match self.raw[excess..].iter().position(|b| *b == b'\n') {
+            Some(offset) => excess + offset + 1,
+            // No newline in the tail: drop everything rather than risk
+            // replaying from the middle of an escape sequence.
+            None => self.raw.len(),
+        };
+        self.raw.drain(..cut);
     }
 
     /// Rows of scrollback currently retained above the visible window.
@@ -85,13 +166,37 @@ impl LogStore {
     }
 
     /// Resizes the emulated terminal to the pane's inner area.
+    ///
+    /// A width change rebuilds the parser and replays the retained bytes,
+    /// because `vt100` keeps rows at the width they arrived at and will not
+    /// rewrap them. A height-only change needs no replay.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(MIN_ROWS);
+        let cols = cols.max(MIN_COLS);
         let (cur_rows, cur_cols) = self.parser.screen().size();
-        let rows = rows.max(1);
-        let cols = cols.max(1);
-        if (cur_rows, cur_cols) != (rows, cols) {
+        if (cur_rows, cur_cols) == (rows, cols) {
+            return;
+        }
+
+        let old_offset = self.parser.screen().scrollback();
+
+        if cols != cur_cols {
+            let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
+            rebuilt.process(&self.raw);
+            self.parser = rebuilt;
+        } else {
             self.parser.screen_mut().set_size(rows, cols);
         }
+
+        // Losing height moves the bottom of the window up under a scrolled-up
+        // reader, so pull the offset back by the rows lost. Anything else keeps
+        // its position.
+        let target = if rows < cur_rows && old_offset > 0 {
+            old_offset.saturating_sub((cur_rows - rows) as usize)
+        } else {
+            old_offset
+        };
+        self.parser.screen_mut().set_scrollback(target);
     }
 
     /// Rows scrolled back from the bottom. `0` means tailing.
@@ -175,6 +280,16 @@ mod tests {
     /// The view is tailing when it sits at the bottom of the buffer.
     fn tailing(store: &LogStore) -> bool {
         store.scroll_offset() == 0
+    }
+
+    /// Visible rows with the blank padding removed.
+    fn non_empty(store: &LogStore) -> Vec<String> {
+        store
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
     }
 
     fn store_with(lines: usize) -> LogStore {
@@ -328,6 +443,147 @@ mod tests {
         assert_eq!(before, after, "content should hold still through a burst");
     }
 
+    // ---- newline normalisation (#11) ----
+
+    #[test]
+    fn bare_line_feeds_start_at_column_zero() {
+        // Container logs are LF-terminated. Fed raw to the emulator, each line
+        // would start where the last one ended and walk off to the right.
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(6, 40);
+        s.process(b"first line\nsecond line\nthird line\n");
+        let lines: Vec<String> = s
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines, ["first line", "second line", "third line"]);
+    }
+
+    #[test]
+    fn carriage_return_line_feed_is_left_alone() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(6, 40);
+        s.process(b"alpha\r\nbeta\r\n");
+        let lines: Vec<String> = s
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_crlf_split_across_chunks_is_not_treated_as_a_bare_newline() {
+        // The seam case: deciding per chunk would insert a spurious \r here.
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(6, 40);
+        s.process(b"alpha\r");
+        s.process(b"\nbeta\r\n");
+        let lines: Vec<String> = s
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_line_split_mid_word_across_chunks_still_reads_correctly() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(6, 40);
+        s.process(b"data");
+        s.process(b"base ready\n");
+        assert!(s
+            .visible_lines()
+            .iter()
+            .any(|l| l.trim_end() == "database ready"));
+    }
+
+    // ---- reflow on resize (#8) ----
+
+    #[test]
+    fn widening_rewraps_existing_output() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        let long = "A".repeat(30) + &"B".repeat(30);
+        s.process(format!("{long}\n").as_bytes());
+        // At 40 columns it needs two rows.
+        assert_eq!(non_empty(&s).len(), 2);
+
+        s.resize(10, 100);
+        // At 100 it fits on one, which only happens if history was reparsed.
+        let after = non_empty(&s);
+        assert_eq!(after.len(), 1, "history should rewrap, got {after:?}");
+        assert_eq!(after[0], long);
+    }
+
+    #[test]
+    fn narrowing_rewraps_existing_output() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 100);
+        let long = "A".repeat(30) + &"B".repeat(30);
+        s.process(format!("{long}\n").as_bytes());
+        assert_eq!(non_empty(&s).len(), 1);
+
+        s.resize(10, 40);
+        assert_eq!(non_empty(&s).len(), 2, "narrowing should rewrap too");
+    }
+
+    #[test]
+    fn a_height_only_change_keeps_the_content() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        s.process(b"stable line\n");
+        let before = non_empty(&s);
+        s.resize(20, 40);
+        assert_eq!(before, non_empty(&s));
+    }
+
+    #[test]
+    fn scroll_position_survives_a_widen() {
+        let mut s = store_with(60);
+        s.scroll_up(5);
+        s.resize(10, 100);
+        assert_eq!(s.scroll_offset(), 5, "widening should not move the reader");
+    }
+
+    #[test]
+    fn losing_height_pulls_a_scrolled_reader_back_by_the_rows_lost() {
+        let mut s = store_with(60);
+        s.scroll_up(10);
+        s.resize(6, 40); // same width, four rows shorter
+        assert_eq!(s.scroll_offset(), 6);
+    }
+
+    #[test]
+    fn a_tailing_reader_keeps_tailing_across_a_resize() {
+        let mut s = store_with(60);
+        assert!(tailing(&s));
+        s.resize(10, 100);
+        assert!(tailing(&s), "a reader at the bottom should stay there");
+    }
+
+    #[test]
+    fn the_retained_buffer_is_bounded_and_cut_at_a_line_boundary() {
+        let mut s = LogStore::new(16);
+        s.resize(5, 40);
+        for i in 0..5_000 {
+            s.process(format!("line {i} with some padding to take up room\n").as_bytes());
+        }
+        assert!(s.raw.len() <= s.raw_cap, "raw buffer must stay bounded");
+        assert!(
+            s.raw.starts_with(b"line "),
+            "a trim must land on a line boundary, not mid-sequence"
+        );
+        // And it still rewraps correctly after trimming.
+        s.resize(5, 100);
+        assert!(non_empty(&s).iter().any(|l| l.contains("line 4999")));
+    }
+
     #[test]
     fn ansi_colour_is_interpreted_not_printed() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
@@ -353,12 +609,24 @@ mod tests {
     }
 
     #[test]
-    fn resizing_is_idempotent_and_clamps_to_one() {
+    fn resizing_is_idempotent_and_clamps_to_a_safe_floor() {
         let mut s = store_with(5);
         s.resize(20, 60);
         assert_eq!(s.screen().size(), (20, 60));
+        // vt100 underflows on very narrow grids, so the floor is a crash guard.
         s.resize(0, 0);
-        assert_eq!(s.screen().size(), (1, 1));
+        assert_eq!(s.screen().size(), (MIN_ROWS, MIN_COLS));
+    }
+
+    #[test]
+    fn collapsing_to_nothing_does_not_panic_while_replaying() {
+        // Regression: rebuilding the parser replays retained output, and
+        // replaying into a one-column grid panicked inside vt100.
+        let mut s = store_with(40);
+        for cols in [1, 2, 5, 19, 20, 21, 200, 1] {
+            s.resize(1, cols);
+        }
+        assert!(s.screen().size().1 >= MIN_COLS);
     }
 
     #[test]

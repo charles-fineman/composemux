@@ -34,6 +34,25 @@ That's the shape of argument that works.
 If you're adapting code from anywhere else, say so in the PR and name the
 upstream file. See [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY).
 
+### Where matching upstream stops being possible
+
+Some upstream behaviour rests on a patched dependency. Nx does not use the
+published `vt100` crate; it pins a personal fork at an unreleased commit, which
+adds methods for retaining raw output and dumping the screen with styling. Those
+methods do not exist in `vt100` as published, and a crate with a git dependency
+cannot be published to crates.io at all — so we cannot simply take the same
+dependency.
+
+Where that happens, reimplement the behaviour rather than the code, and do not
+assume the upstream implementation is correct while you are at it. The
+newline-normalisation fix in #11 came from upstream's version being subtly wrong
+across chunk boundaries — fine for a PTY, not for bytes arriving off a network
+stream.
+
+Beware one specific trap if you go looking: the fork declares the same package
+name *and version* as a real, unrelated crate on crates.io. Depending on that
+published crate compiles cleanly and silently lacks everything you wanted.
+
 ## Scope
 
 composemux is **read-only** by design. It attaches to containers something else
