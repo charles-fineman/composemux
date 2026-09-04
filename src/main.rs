@@ -93,33 +93,45 @@ async fn run() -> Result<i32> {
         .or_else(project::detect)
         .context("could not determine a compose project name; pass --project")?;
 
-    let client = DockerClient::connect().await?;
-    let services = client.list_services(&project).await?;
-    if services.is_empty() {
-        let available = client.list_projects().await?;
-        if available.is_empty() {
-            bail!("no compose projects are running");
-        }
-        bail!(
-            "no services found for compose project '{project}'\navailable projects: {}",
-            available.join(", ")
-        );
-    }
-
     let cancel = CancellationToken::new();
     // -1 until a signal arrives, so a cancellation from any other source keeps
     // its own exit reason.
     let signal_exit = Arc::new(AtomicI32::new(-1));
+    // Installed before the first call to the daemon. Startup is not instant --
+    // it opens a connection, negotiates an API version and lists containers --
+    // and a daemon that is starting up or wedged can stall all three. Handling
+    // signals only after that left the slowest part of the program running
+    // under the default disposition.
     install_signal_handlers(cancel.clone(), signal_exit.clone());
+
+    // Since tokio's handlers *replace* that default disposition, everything
+    // from here on has to be cancellable, or a signal would leave the process
+    // stalled against an unresponsive daemon with nothing left to kill it.
+    let startup = async {
+        let client = DockerClient::connect().await?;
+        let services = client.list_services(&project).await?;
+        if services.is_empty() {
+            let available = client.list_projects().await?;
+            if available.is_empty() {
+                bail!("no compose projects are running");
+            }
+            bail!(
+                "no services found for compose project '{project}'\navailable projects: {}",
+                available.join(", ")
+            );
+        }
+        Ok::<DockerClient, anyhow::Error>(client)
+    };
+    let client = tokio::select! {
+        result = startup => result?,
+        _ = cancel.cancelled() => return Ok(exit_status(&signal_exit)),
+    };
 
     // A full-screen UI is useless when output is piped, and would write escape
     // sequences into whatever is capturing it.
     if args.no_tui || !std::io::stdout().is_terminal() {
         fallback::run(&client, &project, cfg.tail, cancel).await?;
-        return Ok(match signal_exit.load(Ordering::SeqCst) {
-            signo if signo > 0 => 128 + signo,
-            _ => 0,
-        });
+        return Ok(exit_status(&signal_exit));
     }
 
     run_tui(client, project, cfg, cancel, signal_exit).await
@@ -334,6 +346,17 @@ fn handle_action(app: &mut App, area: ratatui::layout::Rect) -> Result<()> {
 ///
 /// The number is recorded so the exit status can follow `128 + signo`, letting
 /// a supervisor tell its own shutdown from a user quitting.
+/// The status to exit with, given whichever signal was recorded.
+///
+/// `128 + signo` is what a shell reports for a signalled child, so a
+/// supervisor can tell a terminating signal from a user pressing `q`.
+fn exit_status(signal_exit: &AtomicI32) -> i32 {
+    match signal_exit.load(Ordering::SeqCst) {
+        signo if signo > 0 => 128 + signo,
+        _ => 0,
+    }
+}
+
 fn install_signal_handlers(cancel: CancellationToken, signal_exit: Arc<AtomicI32>) {
     tokio::spawn(async move {
         #[cfg(unix)]
