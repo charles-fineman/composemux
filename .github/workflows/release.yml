@@ -80,7 +80,7 @@ jobs:
             shasum -a 256 "$stem.tar.gz" > "$stem.tar.gz.sha256"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: composemux-${{ matrix.target }}
           path: |
