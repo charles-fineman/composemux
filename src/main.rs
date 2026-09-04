@@ -52,7 +52,7 @@ struct Args {
     tail: Option<usize>,
 
     /// Rows of output retained per service. Costs roughly 7 MB per service per
-    /// 1000 rows, and sets how far a scrolled-up pane holds its position.
+    /// 1000 rows, and sets how long a scrolled-up pane holds its position.
     #[arg(long)]
     scrollback: Option<usize>,
 

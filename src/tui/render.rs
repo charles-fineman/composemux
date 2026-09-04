@@ -322,6 +322,75 @@ mod tests {
     }
 
     #[test]
+    fn widening_the_frame_rewraps_log_output() {
+        // Exercises the real wiring: layout_for -> resize_panes ->
+        // LogStore::resize -> render. A unit test on LogStore alone would not
+        // catch the panes being sized from stale geometry.
+        let mut app = app();
+        press(&mut app, KeyCode::Char('1'));
+        let key = crate::tui::app::ServiceKey::new("api", 1);
+        let long = "X".repeat(150);
+        app.ingest(key, format!("{long}\n").as_bytes());
+
+        let narrow = Rect::new(0, 0, 90, 30);
+        let (_, sizes) = layout_for(&app, narrow);
+        app.resize_panes(&sizes);
+        let before = render_to_lines(&app, 90, 30);
+        let widest_before = before
+            .iter()
+            .filter(|l| l.contains("XXX"))
+            .map(|l| l.chars().filter(|c| *c == 'X').count())
+            .max()
+            .unwrap_or(0);
+
+        let wide = Rect::new(0, 0, 200, 30);
+        let (_, sizes) = layout_for(&app, wide);
+        app.resize_panes(&sizes);
+        let after = render_to_lines(&app, 200, 30);
+        let widest_after = after
+            .iter()
+            .filter(|l| l.contains("XXX"))
+            .map(|l| l.chars().filter(|c| *c == 'X').count())
+            .max()
+            .unwrap_or(0);
+
+        assert!(
+            widest_after > widest_before,
+            "widening should rewrap history to the new width: {widest_before} -> {widest_after}"
+        );
+    }
+
+    #[test]
+    fn log_output_starts_at_the_left_edge() {
+        // Container logs are LF-terminated; without normalisation each line
+        // would begin where the previous one ended.
+        let mut app = app();
+        press(&mut app, KeyCode::Char('1'));
+        app.ingest(
+            crate::tui::app::ServiceKey::new("api", 1),
+            b"alpha\nbravo\ncharlie\n",
+        );
+        let (_, sizes) = layout_for(&app, Rect::new(0, 0, 160, 40));
+        app.resize_panes(&sizes);
+        let lines = render_to_lines(&app, 160, 40);
+
+        // Column, not byte offset: rows carry multi-byte glyphs (the throbber,
+        // status marks, the pane border) so the two are not the same number.
+        let col = |needle: &str| {
+            lines
+                .iter()
+                .find_map(|l| l.find(needle).map(|byte| l[..byte].chars().count()))
+                .expect("line should be rendered")
+        };
+        assert_eq!(col("alpha"), col("bravo"));
+        assert_eq!(
+            col("alpha"),
+            col("charlie"),
+            "every line should start in the same column"
+        );
+    }
+
+    #[test]
     fn a_pane_with_no_output_yet_says_so() {
         let mut app = app();
         press(&mut app, KeyCode::Char('1'));

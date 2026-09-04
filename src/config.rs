@@ -36,7 +36,8 @@ pub struct Config {
     ///
     /// Costs roughly 7 MB per service at the default, scaling linearly, so
     /// raising it on a large project is a real memory trade. It also sets how
-    /// far a scrolled-up pane can hold its position as new output arrives.
+    /// long a scrolled-up pane can hold its position: the view only moves once
+    /// the lines in it fall out of the buffer.
     #[serde(default = "default_scrollback")]
     pub scrollback: usize,
     #[serde(default)]

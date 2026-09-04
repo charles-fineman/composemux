@@ -18,13 +18,15 @@ but diverges from Nx will usually be declined even when it's better in
 isolation; if you think a divergence is genuinely warranted, open an issue and
 make the case before you write the code.
 
-Two related notes, so they don't surprise you mid-review:
+Three related notes, so they don't surprise you mid-review:
 
 - Layout constants (`⌊width/3⌋` sidebars, the auto-layout breakpoints, the
   scroll-momentum figures) are ported values, not tuned ones. They look
   arbitrary because they are somebody else's arbitrary.
 - Modules derived from upstream carry a header comment naming the file they
   came from. Keep it accurate when you edit the module.
+- Match upstream's behaviour, not its code. It isn't always available to copy,
+  and it isn't always right — the newline fix in #11 came from a bug in theirs.
 
 Deviations do exist — auto-exit only firing on a clean shutdown, and scroll
 position anchoring to content — and both earned their place by following from
