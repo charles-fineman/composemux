@@ -33,6 +33,9 @@ fn pen_after(prefix: &[u8], dropped: &[u8]) -> Vec<u8> {
     if screen.bold() {
         sgr.push_str("\x1b[1m");
     }
+    if screen.dim() {
+        sgr.push_str("\x1b[2m");
+    }
     if screen.italic() {
         sgr.push_str("\x1b[3m");
     }
@@ -209,8 +212,12 @@ impl LogStore {
             // if the cut lands inside an escape sequence, which is a far better
             // outcome than discarding the buffer and blanking the pane.
             .unwrap_or(excess);
-        let dropped: Vec<u8> = self.raw.drain(..cut).collect();
-        self.pen = pen_after(&self.pen, &dropped);
+        self.pen = pen_after(&self.pen, &self.raw[..cut]);
+        // `drain` would leave the old capacity behind: one oversized chunk can
+        // hold many times `raw_cap` for the life of the store. `split_off`
+        // hands back a right-sized buffer and frees the original.
+        let tail = self.raw.split_off(cut);
+        self.raw = tail;
     }
 
     /// Rows of scrollback currently retained above the visible window.
@@ -712,6 +719,12 @@ mod tests {
     }
 
     #[test]
+    fn a_carried_pen_covers_dim() {
+        let s = trim_then_resize(b"\x1b[2m");
+        assert!(s.screen().cell(0, 0).unwrap().dim(), "dim should survive");
+    }
+
+    #[test]
     fn a_carried_pen_covers_bright_indexed_and_rgb_colours() {
         let bright = trim_then_resize(b"\x1b[91m");
         assert_eq!(
@@ -740,6 +753,21 @@ mod tests {
         assert_eq!(
             s.screen().cell(0, 0).unwrap().fgcolor(),
             vt100::Color::Default
+        );
+    }
+
+    #[test]
+    fn an_oversized_chunk_does_not_leave_its_allocation_behind() {
+        // Trimming the length is not enough: the buffer would keep the peak
+        // capacity for the life of the store.
+        let mut s = LogStore::new(16);
+        s.resize(5, 40);
+        s.process(&vec![b'z'; s.raw_cap * 12]);
+        assert!(
+            s.raw.capacity() <= s.raw_cap * 2,
+            "retained {} bytes of capacity for a {} byte cap",
+            s.raw.capacity(),
+            s.raw_cap
         );
     }
 
