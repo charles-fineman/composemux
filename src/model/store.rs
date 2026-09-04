@@ -11,69 +11,36 @@
 /// Rows of scrollback retained per service. Matches nx's `SCROLLBACK_SIZE`.
 pub const DEFAULT_SCROLLBACK: usize = 1_000;
 
-const MIN_RAW_CAP: usize = 256 * 1024;
-const MAX_RAW_CAP: usize = 16 * 1024 * 1024;
+/// Hard ceiling on the retained buffer, per service.
+///
+/// The line budget below is what keeps the buffer correct; this only guards
+/// against pathological content — enormous lines, or output with no newlines at
+/// all — where a line count says nothing about size. Hitting it can still cost
+/// retained history, but at eight megabytes rather than at a few hundred
+/// kilobytes, which is where a bytes-per-row estimate used to give out.
+const MAX_RAW_BYTES: usize = 8 * 1024 * 1024;
 
 /// The SGR sequence reproducing the styling left active after `prefix` and then
 /// `dropped` are parsed.
 ///
-/// Replaying through a scratch emulator rather than scanning for escape codes by
-/// hand: the parser already knows which sequences set what, and which of them
-/// cancel each other out.
+/// Both halves defer to the crate. The dropped bytes go through a scratch
+/// emulator rather than being scanned for escape codes, and the result is
+/// serialised by `attributes_formatted`, which diffs the parser's own attribute
+/// state against the default. Hand-enumerating attributes is what dropped `dim`
+/// once already, and would drop the next one the crate learns about.
 fn pen_after(prefix: &[u8], dropped: &[u8]) -> Vec<u8> {
     let mut scratch = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
     scratch.process(prefix);
     scratch.process(dropped);
-    let screen = scratch.screen();
-
-    let mut sgr = String::from("\x1b[0m");
-    if screen.bold() {
-        sgr.push_str("\x1b[1m");
-    }
-    if screen.dim() {
-        sgr.push_str("\x1b[2m");
-    }
-    if screen.italic() {
-        sgr.push_str("\x1b[3m");
-    }
-    if screen.underline() {
-        sgr.push_str("\x1b[4m");
-    }
-    if screen.inverse() {
-        sgr.push_str("\x1b[7m");
-    }
-    sgr.push_str(&colour_sgr(screen.fgcolor(), true));
-    sgr.push_str(&colour_sgr(screen.bgcolor(), false));
-    sgr.into_bytes()
+    scratch.screen().attributes_formatted()
 }
 
-fn colour_sgr(colour: vt100::Color, foreground: bool) -> String {
-    let (base, bright, extended) = if foreground {
-        (30, 90, 38)
-    } else {
-        (40, 100, 48)
-    };
-    match colour {
-        vt100::Color::Default => String::new(),
-        vt100::Color::Idx(i) if i < 8 => format!("\x1b[{}m", base + u16::from(i)),
-        vt100::Color::Idx(i) if i < 16 => format!("\x1b[{}m", bright + u16::from(i - 8)),
-        vt100::Color::Idx(i) => format!("\x1b[{extended};5;{i}m"),
-        vt100::Color::Rgb(r, g, b) => format!("\x1b[{extended};2;{r};{g};{b}m"),
-    }
+fn bytecount(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|b| **b == b'\n').count()
 }
 
-/// Bytes to retain so a replay reproduces every row the parser still holds.
-///
-/// Derived from the actual geometry rather than a fixed per-row guess: the
-/// parser keeps `scrollback` rows plus the visible ones, and a full row costs
-/// `cols` bytes plus the two of its CRLF. A fixed guess is wrong at both ends --
-/// wasteful in a narrow pane, and short in a wide one, where a trim would drop
-/// rows the parser was still showing and a later rewrap would lose them.
-fn raw_cap_for(scrollback: usize, rows: u16, cols: u16) -> usize {
-    scrollback
-        .saturating_add(rows as usize)
-        .saturating_mul((cols as usize).saturating_add(2))
-        .clamp(MIN_RAW_CAP, MAX_RAW_CAP)
+fn keep_lines_for(scrollback: usize, rows: u16) -> usize {
+    scrollback.saturating_add(rows as usize).max(1)
 }
 
 /// Floor on the emulated screen size.
@@ -97,13 +64,16 @@ pub struct LogStore {
     /// `vt100` stores rows already wrapped and does not reflow them, so the
     /// only way to rewrap history is to parse it again at the new width.
     raw: Vec<u8>,
-    /// Upper bound on `raw`, trimmed at a line boundary. Sized to comfortably
-    /// exceed `scrollback_len` lines so a replay still reproduces everything
-    /// the parser would have retained.
-    raw_cap: usize,
+    /// Complete lines to keep in `raw`.
+    keep_lines: usize,
+    /// Newlines currently in `raw`, tracked so trimming does not rescan.
+    lines: usize,
     /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
     /// across chunks isn't mistaken for a bare newline.
     pending_cr: bool,
+    /// Set when a rewrap had to be skipped, so the next resize retries instead
+    /// of short-circuiting on a size that was applied without one.
+    rewrap_pending: bool,
     /// The styling active where `raw` begins.
     ///
     /// Trimming drops the bytes that set it, so without this a replay would
@@ -120,9 +90,11 @@ impl LogStore {
             parser: vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, scrollback),
             scrollback_len: scrollback,
             raw: Vec::new(),
-            raw_cap: raw_cap_for(scrollback, INITIAL_ROWS, INITIAL_COLS),
+            keep_lines: keep_lines_for(scrollback, INITIAL_ROWS),
+            lines: 0,
             pending_cr: false,
             pen: Vec::new(),
+            rewrap_pending: false,
             has_output: false,
         }
     }
@@ -137,42 +109,23 @@ impl LogStore {
 
     /// Feeds raw container output to the emulator.
     ///
-    /// A view at offset 0 keeps tailing. A view scrolled up stays anchored to
-    /// the *content* it is showing: the offset is advanced by however many rows
-    /// the write pushed into scrollback.
+    /// A view at offset 0 keeps tailing; a view scrolled up stays on the content
+    /// it is showing. Both come from `vt100`, which advances the scroll offset
+    /// as rows evict into scrollback, so nothing here needs to compensate.
     ///
-    /// This is a deliberate deviation from nx, which preserves the raw offset
-    /// and therefore lets the view drift as new output arrives. Nx task output
-    /// is short and finite, so drift is cosmetic there; container logs are
-    /// unbounded, and drifting away from a stack trace while reading it is
-    /// exactly the wrong behaviour.
-    ///
-    /// # Limitation
-    ///
-    /// Anchoring holds only while the buffer is still filling. Once it reaches
-    /// its row limit, every new row evicts the oldest, and the offset — which
-    /// counts back from the bottom and is clamped to the retained depth — can no
-    /// longer be advanced to compensate. `vt100` exposes neither a scroll
-    /// callback nor an absolute row counter, so there is no signal to measure
-    /// the eviction against; past saturation the view drifts as nx's does. A
-    /// larger `scrollback` widens the window in which anchoring works, at a
-    /// linear memory cost.
+    /// Doing that by hand was worse than doing nothing. The correction only had
+    /// a signal to work from while the buffer was filling, and once it was full
+    /// it overwrote the emulator's own -- correct -- offset, producing exactly
+    /// the drift it was meant to prevent.
     pub fn process(&mut self, bytes: &[u8]) {
-        let normalised = self.normalise_newlines(bytes);
-        self.retain(&normalised);
-
-        let offset = self.parser.screen().scrollback();
-        if offset == 0 {
-            self.parser.process(&normalised);
-            self.has_output = true;
+        // An empty write is not output: marking it as such would replace the
+        // "waiting" placeholder with a blank pane.
+        if bytes.is_empty() {
             return;
         }
-
-        let before = self.max_scroll();
+        let normalised = self.normalise_newlines(bytes);
+        self.retain(&normalised);
         self.parser.process(&normalised);
-        let after = self.max_scroll();
-        let added = after.saturating_sub(before);
-        self.parser.screen_mut().set_scrollback(offset + added);
         self.has_output = true;
     }
 
@@ -199,39 +152,64 @@ impl LogStore {
         out
     }
 
-    /// Keeps the bytes needed to rewrap on resize, bounded and cut at a line
-    /// boundary so a replay never begins mid-escape-sequence.
+    /// Keeps the output needed to rewrap on resize.
+    ///
+    /// Trimming scans the buffer, so it runs once the surplus is worth the
+    /// scan rather than on every write.
     fn retain(&mut self, bytes: &[u8]) {
         self.raw.extend_from_slice(bytes);
-        if self.raw.len() <= self.raw_cap {
+        self.lines += bytecount(bytes);
+
+        let comfortable = self.lines <= self.keep_lines.saturating_mul(2);
+        if comfortable && self.raw.len() <= MAX_RAW_BYTES {
             return;
         }
-        let excess = self.raw.len() - self.raw_cap;
-        let cut = self.raw[excess..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map(|offset| excess + offset + 1)
-            // No line boundary anywhere in the tail, which happens with output
-            // that only ever emits carriage returns -- a progress bar, say.
-            // Cut at the cap regardless: the first replayed row may be garbled
-            // if the cut lands inside an escape sequence, which is a far better
-            // outcome than discarding the buffer and blanking the pane.
-            .unwrap_or(excess);
+
+        let cut = self.trim_point();
+        if cut == 0 {
+            return;
+        }
         self.pen = pen_after(&self.pen, &self.raw[..cut]);
+        self.lines -= bytecount(&self.raw[..cut]);
         // `drain` would leave the old capacity behind: one oversized chunk can
-        // hold many times `raw_cap` for the life of the store. `split_off`
+        // hold many times the ceiling for the life of the store. `split_off`
         // hands back a right-sized buffer and frees the original.
         let tail = self.raw.split_off(cut);
         self.raw = tail;
     }
 
-    /// Rows of scrollback currently retained above the visible window.
-    fn max_scroll(&mut self) -> usize {
-        let current = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let max = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(current);
-        max
+    /// Where to cut so the newest `keep_lines` lines survive, without letting
+    /// the buffer past its ceiling.
+    fn trim_point(&self) -> usize {
+        let mut seen = 0;
+        let mut cut = 0;
+        for (index, byte) in self.raw.iter().enumerate().rev() {
+            if *byte == b'\n' {
+                seen += 1;
+                if seen > self.keep_lines {
+                    cut = index + 1;
+                    break;
+                }
+            }
+        }
+
+        if self.raw.len() - cut <= MAX_RAW_BYTES {
+            return cut;
+        }
+
+        // Over the ceiling even after keeping only the budgeted lines, so the
+        // lines themselves are enormous or there are none at all. Cut to the
+        // ceiling, preferring a line boundary; landing mid-sequence garbles at
+        // most the first replayed row, which beats losing the pane.
+        let floor = self.raw.len() - MAX_RAW_BYTES;
+        self.raw[floor..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|offset| floor + offset + 1)
+            // A line boundary at the very end would cut everything away, which
+            // is the one outcome worse than a garbled first row.
+            .filter(|cut| *cut < self.raw.len())
+            .unwrap_or(floor)
     }
 
     /// Resizes the emulated terminal to the pane's inner area.
@@ -243,23 +221,32 @@ impl LogStore {
         let rows = rows.max(MIN_ROWS);
         let cols = cols.max(MIN_COLS);
         let (cur_rows, cur_cols) = self.parser.screen().size();
-        if (cur_rows, cur_cols) == (rows, cols) {
+        let width_changed = cols != cur_cols;
+
+        // A pending rewrap has to defeat this, or a resize back to a width that
+        // was applied without one would short-circuit and never rewrap at all.
+        if (cur_rows, cur_cols) == (rows, cols) && !self.rewrap_pending {
             return;
         }
 
-        // Widening costs more bytes per row, so the retention budget has to
-        // grow with it or the next trim would cut into rows still on screen.
-        self.raw_cap = raw_cap_for(self.scrollback_len, rows, cols);
+        // More visible rows means more history to be able to reproduce.
+        self.keep_lines = keep_lines_for(self.scrollback_len, rows);
 
         let old_offset = self.parser.screen().scrollback();
 
-        // Rebuilding from an empty buffer would blank a pane that currently
-        // has content, so keep what is on screen and forgo the rewrap instead.
-        if cols != cur_cols && !(self.raw.is_empty() && self.has_output) {
-            let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
-            rebuilt.process(&self.pen);
-            rebuilt.process(&self.raw);
-            self.parser = rebuilt;
+        if width_changed || self.rewrap_pending {
+            if self.raw.is_empty() && self.has_output {
+                // Rebuilding from nothing would blank a pane that has content.
+                // Keep what is on screen and try again on the next resize.
+                self.parser.screen_mut().set_size(rows, cols);
+                self.rewrap_pending = true;
+            } else {
+                let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
+                rebuilt.process(&self.pen);
+                rebuilt.process(&self.raw);
+                self.parser = rebuilt;
+                self.rewrap_pending = false;
+            }
         } else {
             self.parser.screen_mut().set_size(rows, cols);
         }
@@ -378,6 +365,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_write_is_not_output() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(5, 40);
+        s.process(b"");
+        assert!(
+            !s.has_output(),
+            "an empty write should leave the pane waiting"
+        );
+    }
+
+    #[test]
     fn a_new_store_reports_no_output() {
         let s = LogStore::new(DEFAULT_SCROLLBACK);
         assert!(!s.has_output());
@@ -472,30 +470,24 @@ mod tests {
     }
 
     #[test]
-    fn a_scrolled_view_drifts_once_the_buffer_saturates() {
-        // Pins the documented limitation so it stays a known trade rather than
-        // becoming an accidental regression: with the ring buffer full there is
-        // no room left to advance the offset into.
+    fn a_scrolled_view_holds_still_even_once_the_buffer_is_full() {
+        // Regression: hand-rolled anchoring used to overwrite the emulator's own
+        // offset here, which drifted the view and was mistaken for a limitation
+        // of the emulator.
         let mut s = LogStore::new(64);
         s.resize(10, 40);
-        for i in 0..200 {
-            s.process(format!("line {i}\r\n").as_bytes());
+        for i in 0..500 {
+            s.process(format!("line {i}\n").as_bytes());
         }
         s.scroll_up(5);
-        let before = s.scroll_offset();
-        let content_before: Vec<String> = s.visible_lines();
+        let before = non_empty(&s);
         for i in 0..20 {
-            s.process(format!("more {i}\r\n").as_bytes());
+            s.process(format!("burst {i}\n").as_bytes());
         }
         assert_eq!(
-            s.scroll_offset(),
             before,
-            "the offset cannot advance past the retained depth"
-        );
-        assert_ne!(
-            content_before,
-            s.visible_lines(),
-            "so the content underneath it has moved on"
+            non_empty(&s),
+            "a scrolled-up reader should not be dragged along by new output"
         );
     }
 
@@ -650,7 +642,10 @@ mod tests {
         for i in 0..5_000 {
             s.process(format!("line {i} with some padding to take up room\n").as_bytes());
         }
-        assert!(s.raw.len() <= s.raw_cap, "raw buffer must stay bounded");
+        assert!(
+            s.lines <= s.keep_lines * 2,
+            "retained lines must stay bounded"
+        );
         assert!(
             s.raw.starts_with(b"line "),
             "a trim must land on a line boundary, not mid-sequence"
@@ -667,7 +662,7 @@ mod tests {
         let mut s = LogStore::new(16);
         s.resize(5, 40);
         s.process(b"visible content\n");
-        let blob = vec![b'X'; s.raw_cap + 1];
+        let blob = vec![b'X'; MAX_RAW_BYTES + 1];
         s.process(&blob);
 
         assert!(
@@ -678,6 +673,31 @@ mod tests {
         assert!(
             !non_empty(&s).is_empty(),
             "the pane went blank after a resize"
+        );
+    }
+
+    #[test]
+    fn a_skipped_rewrap_is_retried_rather_than_lost() {
+        // Applying a size without rewrapping used to make the early-return
+        // treat that size as done, so the pane never rewrapped at that width
+        // again -- silently reintroducing the bug this all exists to fix.
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        let long = "A".repeat(30) + &"B".repeat(30);
+        s.process(format!("{long}\n").as_bytes());
+
+        s.raw.clear();
+        s.resize(10, 100);
+        assert!(s.rewrap_pending, "the rewrap should be recorded as owed");
+        assert_eq!(non_empty(&s).len(), 2, "old wrapping is kept, not blanked");
+
+        // Buffer refills; the same width must now actually rewrap.
+        s.process(format!("{long}\n").as_bytes());
+        s.resize(10, 100);
+        assert!(!s.rewrap_pending);
+        assert!(
+            non_empty(&s).iter().any(|l| l == &long),
+            "the retried rewrap should have unwrapped the line"
         );
     }
 
@@ -766,6 +786,33 @@ mod tests {
     }
 
     #[test]
+    fn colour_dense_lines_are_not_lost_by_a_rewrap() {
+        // Bytes per visual row depend on the content, not just the width: output
+        // that reissues an SGR code per character costs many times a plain row.
+        // A bytes-per-row budget silently dropped most of the scrollback here.
+        let scrollback = 500;
+        let mut s = LogStore::new(scrollback);
+        s.resize(20, 80);
+        for i in 0..scrollback {
+            let mut line = format!("L{i:05} ");
+            for c in 0..70 {
+                line.push_str(&format!("\x1b[38;5;{}m", 16 + (c % 216)));
+                line.push('x');
+            }
+            s.process(format!("{line}\n").as_bytes());
+        }
+
+        s.resize(20, 100);
+        s.scroll_to_top();
+        let after = non_empty(&s);
+        assert!(
+            after.iter().any(|l| l.trim_start().starts_with("L00000")),
+            "the oldest retained line was lost by the rewrap: {:?}",
+            after.first()
+        );
+    }
+
+    #[test]
     fn a_wide_pane_keeps_its_oldest_row_across_a_width_change() {
         // The retention budget must scale with the pane: at ~1000 columns a
         // fixed per-row guess trimmed rows the parser was still holding, so a
@@ -798,12 +845,12 @@ mod tests {
     fn the_retention_budget_grows_with_the_pane() {
         let mut s = LogStore::new(1000);
         s.resize(20, 80);
-        let narrow = s.raw_cap;
-        s.resize(20, 1000);
+        let shallow = s.keep_lines;
+        s.resize(60, 1000);
         assert!(
-            s.raw_cap > narrow,
-            "a wider pane needs a bigger budget: {narrow} -> {}",
-            s.raw_cap
+            s.keep_lines > shallow,
+            "more visible rows means more history to reproduce: {shallow} -> {}",
+            s.keep_lines
         );
     }
 
@@ -813,12 +860,11 @@ mod tests {
         // capacity for the life of the store.
         let mut s = LogStore::new(16);
         s.resize(5, 40);
-        s.process(&vec![b'z'; s.raw_cap * 12]);
+        s.process(&vec![b'z'; MAX_RAW_BYTES * 2]);
         assert!(
-            s.raw.capacity() <= s.raw_cap * 2,
-            "retained {} bytes of capacity for a {} byte cap",
-            s.raw.capacity(),
-            s.raw_cap
+            s.raw.capacity() <= MAX_RAW_BYTES * 2,
+            "retained {} bytes of capacity for a {MAX_RAW_BYTES} byte ceiling",
+            s.raw.capacity()
         );
     }
 
@@ -914,5 +960,154 @@ mod tests {
         assert!(text.contains("line 0"), "expected scrollback in the copy");
         assert!(text.contains("line 39"), "expected the newest line too");
         assert!(tailing(&s), "copying must not disturb the scroll position");
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Visible rows with blank padding removed.
+    fn text(store: &mut LogStore) -> String {
+        store.all_text()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+        /// The invariant behind three separate defects: widening must never be
+        /// an *additional* source of loss on top of ordinary eviction.
+        ///
+        /// Only widening. Retention is counted in rows, so narrowing legitimately
+        /// evicts content -- the same text needs more rows once it wraps harder,
+        /// and the oldest of it falls out of a fixed-row scrollback exactly as it
+        /// would in a real terminal. The property test found that distinction
+        /// before I did.
+        ///
+        /// Example-based tests could not cover this: the byte cost of a visual
+        /// row depends on content an author has to think to write, which is how
+        /// colour-dense output slipped past five hand-written cases.
+        #[test]
+        fn widening_never_drops_content_that_was_still_present(
+            n_lines in 5usize..300,
+            filler in 1usize..120,
+            colourise in prop::bool::ANY,
+            scrollback in 20usize..300,
+            cols_before in 20u16..120,
+            widen_by in 0u16..80,
+        ) {
+            let cols_after = cols_before.saturating_add(widen_by);
+            let mut store = LogStore::new(scrollback);
+            store.resize(24, cols_before);
+            for i in 0..n_lines {
+                let mut line = format!("MARK{i:05} ");
+                for c in 0..filler {
+                    if colourise {
+                        line.push_str(if c % 2 == 0 { "\x1b[31m" } else { "\x1b[32m" });
+                    }
+                    line.push('x');
+                }
+                store.process(format!("{line}\n").as_bytes());
+            }
+
+            let before = text(&mut store);
+            store.resize(24, cols_after);
+            let after = text(&mut store);
+
+            for i in 0..n_lines {
+                let marker = format!("MARK{i:05}");
+                if before.contains(&marker) {
+                    prop_assert!(after.contains(&marker), "widening dropped {marker}");
+                }
+            }
+
+            // Whichever way the pane moves, the newest line is never the one lost.
+            let newest = format!("MARK{:05}", n_lines - 1);
+            prop_assert!(after.contains(&newest), "newest line lost: {newest}");
+        }
+
+        /// The carried pen must reproduce every attribute the emulator tracks,
+        /// compared as a whole rather than one the author remembered to check.
+        /// This is what makes a missing attribute fail without anyone writing a
+        /// test for that specific attribute.
+        #[test]
+        fn the_carried_pen_reproduces_every_attribute(
+            codes in prop::collection::vec(0usize..11, 1..24),
+            split_pct in 0usize..=100,
+        ) {
+            const SGR: [&str; 11] = [
+                "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[3m", "\x1b[4m", "\x1b[7m",
+                "\x1b[31m", "\x1b[42m", "\x1b[38;5;200m", "\x1b[48;2;10;20;30m", "\x1b[91m",
+            ];
+            fn attrs(cell: &vt100::Cell) -> (bool, bool, bool, bool, bool, vt100::Color, vt100::Color) {
+                (
+                    cell.bold(), cell.dim(), cell.italic(), cell.underline(),
+                    cell.inverse(), cell.fgcolor(), cell.bgcolor(),
+                )
+            }
+
+            let bytes: Vec<u8> = codes.iter().map(|i| SGR[*i]).collect::<String>().into_bytes();
+            let split = bytes.len() * split_pct / 100;
+            let (prefix, dropped) = bytes.split_at(split);
+
+            let mut reference = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+            reference.process(prefix);
+            reference.process(dropped);
+            reference.process(b"x");
+            let want = attrs(reference.screen().cell(0, 0).unwrap());
+
+            let mut replayed = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+            replayed.process(&pen_after(prefix, dropped));
+            replayed.process(b"x");
+            let got = attrs(replayed.screen().cell(0, 0).unwrap());
+
+            prop_assert_eq!(got, want);
+        }
+
+        /// Footprint stays bounded for arbitrary writes, rather than for the one
+        /// multiplier a bug report happened to use.
+        #[test]
+        fn the_retained_buffer_stays_bounded(
+            chunks in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..2000), 1..24),
+            scrollback in 4usize..48,
+            rows in 3u16..24,
+            cols in 20u16..120,
+        ) {
+            let mut store = LogStore::new(scrollback);
+            store.resize(rows, cols);
+            for chunk in &chunks {
+                store.process(chunk);
+                prop_assert!(store.raw.len() <= MAX_RAW_BYTES);
+                prop_assert!(
+                    store.raw.capacity() <= MAX_RAW_BYTES.saturating_mul(2).max(4096),
+                    "capacity {} grew unboundedly",
+                    store.raw.capacity()
+                );
+                prop_assert!(
+                    !store.raw.is_empty() || !store.has_output(),
+                    "replay data was discarded wholesale"
+                );
+            }
+        }
+
+        /// Arbitrary bytes and arbitrary geometry, in any order, must not panic.
+        /// Generalises a fixed list of widths that once guarded a vt100
+        /// underflow.
+        #[test]
+        fn arbitrary_input_and_geometry_never_panics(
+            chunks in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..600), 0..12),
+            sizes in prop::collection::vec((0u16..200, 0u16..200), 1..8),
+            scrollback in 0usize..64,
+        ) {
+            let mut store = LogStore::new(scrollback);
+            for (rows, cols) in &sizes {
+                store.resize(*rows, *cols);
+                for chunk in &chunks {
+                    store.process(chunk);
+                }
+                let _ = store.all_text();
+            }
+        }
     }
 }

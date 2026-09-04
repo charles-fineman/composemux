@@ -101,11 +101,10 @@ logs.
 capture.
 
 Scroll up to read something and it stays where you put it as new output
-arrives, rather than drifting off the top. That holds until the service's
-buffer fills — `scrollback`, 1000 rows by default. Past that, every new row
-evicts the oldest one and there's nowhere left to move the anchor, so the view
-starts to drift the way `tail -f` would. Raise `scrollback` if you need a wider
-window; it costs roughly 7 MB per service per 1000 rows.
+arrives, rather than drifting off the top. It only moves once the lines you are
+looking at fall out of the buffer entirely — `scrollback`, 1000 rows by default.
+Raise it if you need to hold a position for longer; it costs roughly 7 MB per
+service per 1000 rows.
 
 Copying sends an OSC 52 escape sequence, handing the buffer straight to your
 terminal emulator — so it works when composemux is running on a remote box over
