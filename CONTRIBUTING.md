@@ -39,9 +39,11 @@ upstream file. See [LICENSE-THIRD-PARTY](LICENSE-THIRD-PARTY).
 Some upstream behaviour rests on a patched dependency. Nx does not use the
 published `vt100` crate; it pins a personal fork at an unreleased commit, which
 adds methods for retaining raw output and dumping the screen with styling. Those
-methods do not exist in `vt100` as published, and a crate with a git dependency
-cannot be published to crates.io at all — so we cannot simply take the same
-dependency.
+methods do not exist in `vt100` as published. Cargo does allow a `git` and a
+`version` together, but publishing then resolves the *registry* version — which
+here is an unrelated crate without the fork's methods, so the published build
+would not compile. A git-only dependency cannot be published at all. Either way
+the fork is not available to us.
 
 Where that happens, reimplement the behaviour rather than the code, and do not
 assume the upstream implementation is correct while you are at it. The

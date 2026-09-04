@@ -147,12 +147,16 @@ impl LogStore {
             return;
         }
         let excess = self.raw.len() - self.raw_cap;
-        let cut = match self.raw[excess..].iter().position(|b| *b == b'\n') {
-            Some(offset) => excess + offset + 1,
-            // No newline in the tail: drop everything rather than risk
-            // replaying from the middle of an escape sequence.
-            None => self.raw.len(),
-        };
+        let cut = self.raw[excess..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|offset| excess + offset + 1)
+            // No line boundary anywhere in the tail, which happens with output
+            // that only ever emits carriage returns -- a progress bar, say.
+            // Cut at the cap regardless: the first replayed row may be garbled
+            // if the cut lands inside an escape sequence, which is a far better
+            // outcome than discarding the buffer and blanking the pane.
+            .unwrap_or(excess);
         self.raw.drain(..cut);
     }
 
@@ -180,7 +184,9 @@ impl LogStore {
 
         let old_offset = self.parser.screen().scrollback();
 
-        if cols != cur_cols {
+        // Rebuilding from an empty buffer would blank a pane that currently
+        // has content, so keep what is on screen and forgo the rewrap instead.
+        if cols != cur_cols && !(self.raw.is_empty() && self.has_output) {
             let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
             rebuilt.process(&self.raw);
             self.parser = rebuilt;
@@ -582,6 +588,39 @@ mod tests {
         // And it still rewraps correctly after trimming.
         s.resize(5, 100);
         assert!(non_empty(&s).iter().any(|l| l.contains("line 4999")));
+    }
+
+    #[test]
+    fn output_without_newlines_survives_a_resize() {
+        // A \r-driven progress bar emits no newline at all, so the retained
+        // buffer can pass its cap with no line boundary to trim at.
+        let mut s = LogStore::new(16);
+        s.resize(5, 40);
+        s.process(b"visible content\n");
+        let blob = vec![b'X'; s.raw_cap + 1];
+        s.process(&blob);
+
+        assert!(
+            !s.raw.is_empty(),
+            "an oversized record must not discard every retained byte"
+        );
+        s.resize(5, 100);
+        assert!(
+            !non_empty(&s).is_empty(),
+            "the pane went blank after a resize"
+        );
+    }
+
+    #[test]
+    fn a_resize_never_blanks_a_pane_that_has_content() {
+        // Belt and braces for the case above: even if the retained buffer were
+        // empty, what is already on screen must survive a width change.
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(5, 40);
+        s.process(b"still here\n");
+        s.raw.clear();
+        s.resize(5, 100);
+        assert!(non_empty(&s).iter().any(|l| l.contains("still here")));
     }
 
     #[test]
