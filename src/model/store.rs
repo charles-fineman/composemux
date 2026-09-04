@@ -11,11 +11,8 @@
 /// Rows of scrollback retained per service. Matches nx's `SCROLLBACK_SIZE`.
 pub const DEFAULT_SCROLLBACK: usize = 1_000;
 
-/// Retained bytes per row of scrollback. Generous: a replay must be able to
-/// reproduce everything the parser would have kept, and long lines are common.
-const RAW_BYTES_PER_ROW: usize = 1024;
 const MIN_RAW_CAP: usize = 256 * 1024;
-const MAX_RAW_CAP: usize = 8 * 1024 * 1024;
+const MAX_RAW_CAP: usize = 16 * 1024 * 1024;
 
 /// The SGR sequence reproducing the styling left active after `prefix` and then
 /// `dropped` are parsed.
@@ -65,9 +62,17 @@ fn colour_sgr(colour: vt100::Color, foreground: bool) -> String {
     }
 }
 
-fn raw_cap_for(scrollback: usize) -> usize {
+/// Bytes to retain so a replay reproduces every row the parser still holds.
+///
+/// Derived from the actual geometry rather than a fixed per-row guess: the
+/// parser keeps `scrollback` rows plus the visible ones, and a full row costs
+/// `cols` bytes plus the two of its CRLF. A fixed guess is wrong at both ends --
+/// wasteful in a narrow pane, and short in a wide one, where a trim would drop
+/// rows the parser was still showing and a later rewrap would lose them.
+fn raw_cap_for(scrollback: usize, rows: u16, cols: u16) -> usize {
     scrollback
-        .saturating_mul(RAW_BYTES_PER_ROW)
+        .saturating_add(rows as usize)
+        .saturating_mul((cols as usize).saturating_add(2))
         .clamp(MIN_RAW_CAP, MAX_RAW_CAP)
 }
 
@@ -115,7 +120,7 @@ impl LogStore {
             parser: vt100::Parser::new(INITIAL_ROWS, INITIAL_COLS, scrollback),
             scrollback_len: scrollback,
             raw: Vec::new(),
-            raw_cap: raw_cap_for(scrollback),
+            raw_cap: raw_cap_for(scrollback, INITIAL_ROWS, INITIAL_COLS),
             pending_cr: false,
             pen: Vec::new(),
             has_output: false,
@@ -241,6 +246,10 @@ impl LogStore {
         if (cur_rows, cur_cols) == (rows, cols) {
             return;
         }
+
+        // Widening costs more bytes per row, so the retention budget has to
+        // grow with it or the next trim would cut into rows still on screen.
+        self.raw_cap = raw_cap_for(self.scrollback_len, rows, cols);
 
         let old_offset = self.parser.screen().scrollback();
 
@@ -753,6 +762,48 @@ mod tests {
         assert_eq!(
             s.screen().cell(0, 0).unwrap().fgcolor(),
             vt100::Color::Default
+        );
+    }
+
+    #[test]
+    fn a_wide_pane_keeps_its_oldest_row_across_a_width_change() {
+        // The retention budget must scale with the pane: at ~1000 columns a
+        // fixed per-row guess trimmed rows the parser was still holding, so a
+        // rewrap silently dropped the top of the scrollback.
+        let scrollback = 200;
+        let mut s = LogStore::new(scrollback);
+        s.resize(20, 1000);
+        for i in 0..scrollback {
+            // Rows that fill the width, which is the expensive case.
+            s.process(format!("{i:04} {}\n", "w".repeat(980)).as_bytes());
+        }
+
+        s.scroll_to_top();
+        let oldest = non_empty(&s)
+            .first()
+            .cloned()
+            .expect("something should be on screen at the top");
+
+        s.resize(20, 1100);
+        s.scroll_to_top();
+        let after = non_empty(&s);
+        assert!(
+            after.iter().any(|l| l.starts_with(&oldest[..8])),
+            "oldest retained row was lost by the rewrap: {:?}",
+            after.first()
+        );
+    }
+
+    #[test]
+    fn the_retention_budget_grows_with_the_pane() {
+        let mut s = LogStore::new(1000);
+        s.resize(20, 80);
+        let narrow = s.raw_cap;
+        s.resize(20, 1000);
+        assert!(
+            s.raw_cap > narrow,
+            "a wider pane needs a bigger budget: {narrow} -> {}",
+            s.raw_cap
         );
     }
 
