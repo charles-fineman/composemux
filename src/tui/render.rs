@@ -123,6 +123,11 @@ mod tests {
 
     /// A service in a given state, with the fields tests do not care about
     /// left at their defaults.
+    /// The first frame of the running throbber, and the glyph a pane shows
+    /// when it cannot resolve its service at all.
+    const RUNNING_THROBBER: char = '\u{280b}';
+    const NOT_STARTED_GLYPH: char = '\u{00b7}';
+
     fn service(name: &str, status: ServiceStatus) -> Service {
         Service {
             name: name.to_string(),
@@ -328,6 +333,17 @@ mod tests {
         // The header used to be resolved through the visible rows, so filtering
         // the pinned service out degraded its title and uptime.
         let mut app = app();
+        // Status and uptime are the only things that actually differ between
+        // the two paths, so the service needs a running clock to assert on.
+        // Two minutes is coarse enough that the assertion cannot race the
+        // test: `duration()` measures a running service against `now`.
+        let mut api = service("api", ServiceStatus::Running);
+        api.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        app.set_services(vec![
+            api,
+            service("worker", ServiceStatus::Failure),
+            service("db", ServiceStatus::Success),
+        ]);
         press(&mut app, KeyCode::Char('1'));
         app.ingest(crate::tui::app::ServiceKey::new("api", 1), b"still here\n");
         press(&mut app, KeyCode::Char('/'));
@@ -339,11 +355,26 @@ mod tests {
         let (_, sizes) = layout_for(&app, Rect::new(0, 0, 160, 40));
         app.resize_panes(&sizes);
         let text = render_to_text(&app, 160, 40);
+        // The title alone proves nothing: the degraded path falls back to the
+        // pinned key's name, which is also "api". Status and uptime are what
+        // separate the two.
         assert!(
             text.contains("api"),
             "the pane title should survive the filter:\n{text}"
         );
         assert!(text.contains("still here"));
+        assert!(
+            text.contains(RUNNING_THROBBER),
+            "the running throbber should survive the filter:\n{text}"
+        );
+        assert!(
+            !text.contains(NOT_STARTED_GLYPH),
+            "the pane degraded to NotStarted:\n{text}"
+        );
+        assert!(
+            text.contains("2m"),
+            "the uptime should survive the filter:\n{text}"
+        );
     }
 
     #[test]
