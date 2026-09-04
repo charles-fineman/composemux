@@ -71,9 +71,9 @@ pub struct LogStore {
     /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
     /// across chunks isn't mistaken for a bare newline.
     pending_cr: bool,
-    /// Set when a rewrap had to be skipped, so the next resize retries instead
+    /// Set when a replay had to be skipped, so the next resize retries instead
     /// of short-circuiting on a size that was applied without one.
-    rewrap_pending: bool,
+    replay_pending: bool,
     /// The styling active where `raw` begins.
     ///
     /// Trimming drops the bytes that set it, so without this a replay would
@@ -94,7 +94,7 @@ impl LogStore {
             lines: 0,
             pending_cr: false,
             pen: Vec::new(),
-            rewrap_pending: false,
+            replay_pending: false,
             has_output: false,
         }
     }
@@ -214,18 +214,22 @@ impl LogStore {
 
     /// Resizes the emulated terminal to the pane's inner area.
     ///
-    /// A width change rebuilds the parser and replays the retained bytes,
-    /// because `vt100` keeps rows at the width they arrived at and will not
-    /// rewrap them. A height-only change needs no replay.
+    /// Any size change rebuilds the parser and replays the retained bytes.
+    ///
+    /// A width change needs it because `vt100` keeps rows at the width they
+    /// arrived at and will not rewrap them. A height change needs it because
+    /// `Grid::set_size` shrinks its row vector from the end, discarding the
+    /// newest lines rather than moving them into scrollback -- which left a
+    /// pane unable to reach its own tail, with `End` powerless because the
+    /// offset was already at the bottom of what remained.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(MIN_ROWS);
         let cols = cols.max(MIN_COLS);
         let (cur_rows, cur_cols) = self.parser.screen().size();
-        let width_changed = cols != cur_cols;
 
-        // A pending rewrap has to defeat this, or a resize back to a width that
-        // was applied without one would short-circuit and never rewrap at all.
-        if (cur_rows, cur_cols) == (rows, cols) && !self.rewrap_pending {
+        // A pending replay has to defeat this, or a resize back to a size that
+        // was applied without one would short-circuit and never replay at all.
+        if (cur_rows, cur_cols) == (rows, cols) && !self.replay_pending {
             return;
         }
 
@@ -234,21 +238,17 @@ impl LogStore {
 
         let old_offset = self.parser.screen().scrollback();
 
-        if width_changed || self.rewrap_pending {
-            if self.raw.is_empty() && self.has_output {
-                // Rebuilding from nothing would blank a pane that has content.
-                // Keep what is on screen and try again on the next resize.
-                self.parser.screen_mut().set_size(rows, cols);
-                self.rewrap_pending = true;
-            } else {
-                let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
-                rebuilt.process(&self.pen);
-                rebuilt.process(&self.raw);
-                self.parser = rebuilt;
-                self.rewrap_pending = false;
-            }
-        } else {
+        if self.raw.is_empty() && self.has_output {
+            // Rebuilding from nothing would blank a pane that has content.
+            // Keep what is on screen and try again on the next resize.
             self.parser.screen_mut().set_size(rows, cols);
+            self.replay_pending = true;
+        } else {
+            let mut rebuilt = vt100::Parser::new(rows, cols, self.scrollback_len);
+            rebuilt.process(&self.pen);
+            rebuilt.process(&self.raw);
+            self.parser = rebuilt;
+            self.replay_pending = false;
         }
 
         // Losing height moves the bottom of the window up under a scrolled-up
@@ -602,6 +602,40 @@ mod tests {
     }
 
     #[test]
+    fn shrinking_height_keeps_the_newest_lines_reachable() {
+        // vt100's Grid::set_size shrinks its row vector from the end, so the
+        // newest lines were discarded outright. The pane could not reach its own
+        // tail, and End was powerless because the offset was already 0.
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(24, 100);
+        for i in 0..400 {
+            s.process(format!("L{i:03}\n").as_bytes());
+        }
+        assert_eq!(non_empty(&s).last().map(String::as_str), Some("L399"));
+
+        s.resize(12, 100);
+        s.scroll_to_bottom();
+        assert_eq!(
+            non_empty(&s).last().map(String::as_str),
+            Some("L399"),
+            "the tail must survive a height reduction"
+        );
+    }
+
+    #[test]
+    fn growing_height_reveals_more_without_losing_the_tail() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 100);
+        for i in 0..400 {
+            s.process(format!("L{i:03}\n").as_bytes());
+        }
+        s.resize(30, 100);
+        let visible = non_empty(&s);
+        assert_eq!(visible.last().map(String::as_str), Some("L399"));
+        assert!(visible.len() > 10, "a taller pane should show more rows");
+    }
+
+    #[test]
     fn a_height_only_change_keeps_the_content() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
@@ -677,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_rewrap_is_retried_rather_than_lost() {
+    fn a_skipped_replay_is_retried_rather_than_lost() {
         // Applying a size without rewrapping used to make the early-return
         // treat that size as done, so the pane never rewrapped at that width
         // again -- silently reintroducing the bug this all exists to fix.
@@ -688,13 +722,13 @@ mod tests {
 
         s.raw.clear();
         s.resize(10, 100);
-        assert!(s.rewrap_pending, "the rewrap should be recorded as owed");
+        assert!(s.replay_pending, "the replay should be recorded as owed");
         assert_eq!(non_empty(&s).len(), 2, "old wrapping is kept, not blanked");
 
         // Buffer refills; the same width must now actually rewrap.
         s.process(format!("{long}\n").as_bytes());
         s.resize(10, 100);
-        assert!(!s.rewrap_pending);
+        assert!(!s.replay_pending);
         assert!(
             non_empty(&s).iter().any(|l| l == &long),
             "the retried rewrap should have unwrapped the line"
