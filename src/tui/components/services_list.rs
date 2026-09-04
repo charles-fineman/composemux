@@ -13,18 +13,24 @@ use crate::tui::focus::Focus;
 use crate::tui::status_icons::status_char;
 use crate::tui::theme::THEME;
 use crate::tui::utils::{format_duration, status_style};
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table,
-    TableState, Widget,
+    Block, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    Table, TableState, Widget,
 };
 
 const STATUS_ICON_WIDTH: u16 = 6;
 const HEALTH_COLUMN_WIDTH: u16 = 6;
 const UPTIME_COLUMN_WIDTH: u16 = 10;
 const COLUMN_SEPARATOR_WIDTH: u16 = 1;
+/// A column reserved for the scrollbar so it never sits on top of a value.
+const SCROLLBAR_WIDTH: u16 = 1;
+/// The header line plus the blank row under it.
+const HEADER_ROWS: u16 = 3;
+/// Longest project name shown in the badge before it is elided.
+const BADGE_MAX_WIDTH: u16 = 24;
 /// Header, spacing row and the blank line beneath, as in nx.
 const HEADER_OVERHEAD_ROWS: u16 = 3;
 const BOTTOM_PADDING_ROWS: u16 = 1;
@@ -72,15 +78,35 @@ pub fn viewport_height(area_height: u16) -> u16 {
 
 pub fn render(app: &App, area: Rect, buf: &mut ratatui::buffer::Buffer) {
     let focused = app.focus() == Focus::ServiceList;
+
+    // The scrollbar gets a column of its own. Drawing it over the table meant
+    // it ate the last character of the rightmost value, turning `683ms` into
+    // `683m` -- a wrong number that reads like a right one.
+    let needs_scrollbar = scrollbar_needed(app, area);
+    let table_area = Rect {
+        width: area
+            .width
+            .saturating_sub(if needs_scrollbar { SCROLLBAR_WIDTH } else { 0 }),
+        ..area
+    };
+
+    // The header is drawn above the table rather than as its first row, so the
+    // project badge is bounded by the pane rather than by the status-icon
+    // column it happened to share.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(HEADER_ROWS), Constraint::Fill(1)])
+        .split(table_area);
+    render_header(app, focused, chunks[0], buf);
+
     let longest = app
         .rows()
         .iter()
         .map(|r| r.display_name.len() as u16)
         .max()
         .unwrap_or(0);
-    let columns = column_visibility(area.width, longest);
+    let columns = column_visibility(chunks[1].width, longest);
 
-    let header = header_row(app, focused, columns);
     let rows: Vec<Row> = app
         .rows()
         .iter()
@@ -105,26 +131,36 @@ pub fn render(app: &App, area: Rect, buf: &mut ratatui::buffer::Buffer) {
     };
 
     let table = Table::new(rows, constraints)
-        .header(header)
         .block(Block::default())
         .style(base);
 
     let mut state = TableState::default().with_selected(Some(app.selected_index()));
-    StatefulWidget::render(table, area, buf, &mut state);
+    StatefulWidget::render(table, chunks[1], buf, &mut state);
 
-    render_scrollbar(app, area, buf, focused);
+    if needs_scrollbar {
+        render_scrollbar(app, area, buf, focused);
+    }
 }
 
-fn header_row<'a>(app: &App, focused: bool, columns: ColumnVisibility) -> Row<'a> {
-    // The badge turns green when everything succeeded and red if anything
-    // failed, mirroring nx's run-status colouring.
+/// Draws the project badge and run summary above the table.
+///
+/// Rendered on its own line rather than as the table's header row: as a row its
+/// first cell was bound by the status-icon column, which clipped anything past
+/// about five characters of the project name.
+fn render_header(app: &App, focused: bool, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // Green once everything succeeded, red if anything failed, accent while
+    // work is still going.
     let any_failed = app
         .rows()
         .iter()
         .any(|r| r.service.status == ServiceStatus::Failure);
     let all_done =
         !app.rows().is_empty() && app.rows().iter().all(|r| r.service.status.is_finished());
-    let badge_color = if all_done {
+    let badge_colour = if all_done {
         if any_failed {
             THEME.error
         } else {
@@ -133,14 +169,6 @@ fn header_row<'a>(app: &App, focused: bool, columns: ColumnVisibility) -> Row<'a
     } else {
         THEME.info
     };
-
-    let badge = Span::styled(
-        format!(" {} ", app.project.to_uppercase()),
-        Style::reset()
-            .add_modifier(Modifier::BOLD)
-            .bg(badge_color)
-            .fg(THEME.primary_fg),
-    );
 
     let title_style = if focused {
         Style::default().fg(THEME.secondary_fg)
@@ -154,26 +182,37 @@ fn header_row<'a>(app: &App, focused: bool, columns: ColumnVisibility) -> Row<'a
         .iter()
         .filter(|r| r.service.status == ServiceStatus::Running)
         .count();
-    let title = Span::styled(
-        format!("  {running}/{} running", app.rows().len()),
-        title_style,
-    );
 
-    let mut cells = vec![Cell::from(Line::from(badge)), Cell::from(Line::from(title))];
-    let label = Style::default()
-        .fg(badge_color)
-        .add_modifier(Modifier::BOLD);
-    if columns.health {
-        cells.push(Cell::from(
-            Line::from(Span::styled("Health", label)).right_aligned(),
-        ));
+    let badge = truncate_badge(&app.project, area.width);
+    let mut spans = vec![Span::styled(
+        badge,
+        Style::reset()
+            .add_modifier(Modifier::BOLD)
+            .bg(badge_colour)
+            .fg(THEME.primary_fg),
+    )];
+    let summary = format!("  {running}/{} running", app.rows().len());
+    if (spans[0].content.chars().count() + summary.chars().count()) as u16 <= area.width {
+        spans.push(Span::styled(summary, title_style));
     }
-    if columns.uptime {
-        cells.push(Cell::from(
-            Line::from(Span::styled("Uptime", label)).right_aligned(),
-        ));
+
+    let header = Rect { height: 1, ..area };
+    Widget::render(Paragraph::new(Line::from(spans)), header, buf);
+}
+
+/// The project badge, trimmed to fit rather than clipped mid-render.
+fn truncate_badge(project: &str, available: u16) -> String {
+    let name = project.to_uppercase();
+    // Two spaces of padding, and leave room for at least part of the summary.
+    let budget = available.saturating_sub(2).min(BADGE_MAX_WIDTH) as usize;
+    if budget == 0 {
+        return String::new();
     }
-    Row::new(cells).top_margin(1).bottom_margin(1)
+    if name.chars().count() <= budget {
+        return format!(" {name} ");
+    }
+    let kept: String = name.chars().take(budget.saturating_sub(1)).collect();
+    format!(" {kept}\u{2026} ")
 }
 
 fn build_row<'a>(
@@ -267,6 +306,11 @@ pub fn uptime_text(row: &crate::tui::app::Row) -> String {
     }
 }
 
+/// Whether the list is longer than the space available for it.
+fn scrollbar_needed(app: &App, area: Rect) -> bool {
+    area.width >= 2 && app.rows().len() > viewport_height(area.height) as usize
+}
+
 fn render_scrollbar(app: &App, area: Rect, buf: &mut ratatui::buffer::Buffer, focused: bool) {
     let total = app.rows().len();
     let viewport = viewport_height(area.height) as usize;
@@ -346,6 +390,38 @@ mod tests {
         // is capped at the layout threshold.
         let v = column_visibility(80, 200);
         assert!(v.uptime && v.health);
+    }
+
+    #[test]
+    fn a_long_project_name_is_not_clipped_to_the_status_column() {
+        // The badge used to sit in the table's status-icon column, so
+        // "digital-university" rendered as "DIGIT" no matter how wide the pane.
+        let badge = truncate_badge("digital-university", 60);
+        assert!(
+            badge.contains("DIGITAL-UNIVERSITY"),
+            "expected the whole name, got {badge:?}"
+        );
+    }
+
+    #[test]
+    fn a_very_long_project_name_is_elided_rather_than_clipped() {
+        let badge = truncate_badge(&"x".repeat(80), 60);
+        assert!(
+            badge.ends_with("\u{2026} "),
+            "should end in an ellipsis: {badge:?}"
+        );
+        assert!(badge.chars().count() <= BADGE_MAX_WIDTH as usize + 2);
+    }
+
+    #[test]
+    fn a_narrow_pane_still_produces_a_usable_badge() {
+        for width in [0u16, 1, 2, 3, 8, 40] {
+            let badge = truncate_badge("platform", width);
+            assert!(
+                badge.chars().count() <= width.max(2) as usize + 2,
+                "badge {badge:?} overflows a {width}-column pane"
+            );
+        }
     }
 
     #[test]

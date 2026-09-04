@@ -456,6 +456,49 @@ mod tests {
     }
 
     #[test]
+    fn a_scrollbar_does_not_eat_the_last_column_of_a_value() {
+        // The scrollbar used to be drawn over the rightmost column, turning
+        // "683ms" into "683m" -- a wrong value that reads like a right one.
+        let cfg = Config::default();
+        let mut app = App::new("demo", &cfg);
+        let mut services = Vec::new();
+        for i in 0..40 {
+            let mut svc = service(&format!("svc{i:02}"), ServiceStatus::Running);
+            svc.started_at = Some(chrono::Utc::now() - chrono::Duration::milliseconds(683));
+            services.push(svc);
+        }
+        app.set_services(services);
+
+        let lines = render_to_lines(&app, 120, 20);
+        // Elapsed time varies between building and rendering, so assert on the
+        // shape: a millisecond value must keep its unit. Truncation dropped the
+        // trailing "s", leaving a number that reads as minutes.
+        let has_intact_ms = lines.iter().any(|l| {
+            l.chars()
+                .collect::<Vec<_>>()
+                .windows(3)
+                .any(|w| w[0].is_ascii_digit() && w[1] == 'm' && w[2] == 's')
+        });
+        assert!(
+            has_intact_ms,
+            "the uptime unit was truncated by the scrollbar:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_project_badge_shows_the_whole_name_when_there_is_room() {
+        let cfg = Config::default();
+        let mut app = App::new("digital-university", &cfg);
+        app.set_services(vec![service("api", ServiceStatus::Running)]);
+        let text = render_to_text(&app, 140, 20);
+        assert!(
+            text.contains("DIGITAL-UNIVERSITY"),
+            "the badge was clipped:\n{text}"
+        );
+    }
+
+    #[test]
     fn an_empty_project_renders_without_panicking() {
         let cfg = Config::default();
         let app = App::new("empty", &cfg);
