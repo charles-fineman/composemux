@@ -862,7 +862,7 @@ mod tests {
         s.resize(5, 40);
         s.process(&vec![b'z'; MAX_RAW_BYTES * 2]);
         assert!(
-            s.raw.capacity() <= MAX_RAW_BYTES * 2,
+            s.raw.capacity() <= MAX_RAW_BYTES + MAX_RAW_BYTES / 2,
             "retained {} bytes of capacity for a {MAX_RAW_BYTES} byte ceiling",
             s.raw.capacity()
         );
@@ -1087,6 +1087,12 @@ mod property_tests {
                 prop_assert!(
                     !store.raw.is_empty() || !store.has_output(),
                     "replay data was discarded wholesale"
+                );
+                prop_assert!(
+                    store.lines <= store.keep_lines.saturating_mul(2),
+                    "line budget exceeded: {} retained against a budget of {}",
+                    store.lines,
+                    store.keep_lines
                 );
             }
         }
