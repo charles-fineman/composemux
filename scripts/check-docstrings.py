@@ -29,8 +29,10 @@ string literal ends attribution early, so a line is missed rather than
 wrongly blamed. Erring towards silence is the right direction for a rule
 that makes people write prose.
 
-It is zero-tolerance rather than a percentage, so passing this leaves an
-80% threshold well clear.
+There is no percentage here. One undocumented declaration you touched fails
+the run, which is deliberately stricter than the reviewer's 80%: a rule with
+no arithmetic in it is easier to act on, and being stricter means passing
+this cannot leave that check unhappy.
 """
 
 from __future__ import annotations
@@ -59,7 +61,9 @@ def touched_lines(base: str) -> dict[str, set[int]]:
     committed yet, so the answer arrives before the push rather than after.
     """
     merge_base = git("merge-base", base, "HEAD").strip()
-    files = git("diff", "--name-only", merge_base).split()
+    # NUL-delimited: a path with a space in it is legal, and splitting on
+    # whitespace would hand `git diff` two paths that do not exist.
+    files = [f for f in git("diff", "--name-only", "-z", merge_base).split("\0") if f]
     touched: dict[str, set[int]] = {}
     for path in files:
         lines: set[int] = set()

@@ -8,6 +8,12 @@ that is what these pin, and they run without cargo.
 
 from __future__ import annotations
 
+import sys
+
+# Before the import below: loading the checker would otherwise leave a
+# __pycache__ beside it, and one of those has already been committed once.
+sys.dont_write_bytecode = True
+
 import importlib.util
 import os
 import subprocess
@@ -96,6 +102,15 @@ class TouchedLines(unittest.TestCase):
         self.commit("fn main() {}\n")
         (self.repo / "a.rs").write_text("fn main() {}\nfn added() {}\n", encoding="utf-8")
         self.assertIn(2, check.touched_lines("main")["a.rs"])
+
+    def test_a_path_with_a_space_survives(self):
+        # Whitespace-splitting git's output turns one real path into two
+        # imaginary ones, and the diff that follows fails on both.
+        self.commit("fn main() {}\n")
+        spaced = self.repo / "my module.rs"
+        spaced.write_text("fn added() {}\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        self.assertIn("my module.rs", check.touched_lines("main"))
 
     def test_an_unchanged_tree_touches_nothing(self):
         self.commit("fn main() {}\n")

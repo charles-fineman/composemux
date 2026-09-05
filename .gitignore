@@ -1,2 +1,6 @@
 /target
 /.serena/
+
+# Python bytecode from the checker's tests.
+__pycache__/
+*.pyc
