@@ -279,7 +279,17 @@ mod tests {
         let chunk = vec![b'x'; 64 * 1024];
         let mut emitted = 0usize;
         for _ in 0..40 {
-            emitted += a.push(&chunk).iter().map(|l| l.len()).sum::<usize>();
+            for line in a.push(&chunk) {
+                // The chunk size divides the cap exactly, so `partial` lands on
+                // MAX_PARTIAL and the next call enters the flush loop already
+                // full -- a state no single-push test can reach.
+                assert!(
+                    line.len() <= MAX_PARTIAL,
+                    "a cross-call flush emitted {} bytes, past the {MAX_PARTIAL}-byte cap",
+                    line.len()
+                );
+                emitted += line.len();
+            }
         }
         assert_eq!(
             emitted + a.partial.len(),
