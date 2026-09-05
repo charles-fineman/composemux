@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 11 left to document
 //! An output pane showing one service's logs.
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/terminal_pane.rs`

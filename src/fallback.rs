@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 2 left to document
 //! Plain streaming for when stdout isn't a terminal.
 //!
 //! The wrapping CLI may run in CI or with output piped, where a full-screen UI

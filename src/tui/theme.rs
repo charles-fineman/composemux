@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 10 left to document
 //! Colour theme.
 //!
 //! Ported from nx `packages/nx/src/native/tui/theme.rs`

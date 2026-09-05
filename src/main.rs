@@ -1,6 +1,14 @@
+// Documentation is required for every item, including private ones, and the
+// allow below marks the files that predate the rule. Deleting one of those
+// lines is how the backlog gets paid down; adding one is not on.
+#![warn(clippy::missing_docs_in_private_items)]
+/// Configuration file and flag handling.
 mod config;
+/// Talking to the Docker daemon: discovery, log streams and events.
 mod docker;
+/// Plain streaming for when stdout is not a terminal.
 mod fallback;
+/// Services and their log buffers.
 mod model;
 mod project;
 mod tui;
@@ -22,9 +30,13 @@ use tui::app::{Action, App, ExitReason, ServiceKey};
 
 // Only SIGINT has a windows counterpart (ctrl+c), so the other two would be
 // dead code there -- and CI runs clippy at `-D warnings` on windows too.
+/// Signal numbers, so an exit status can be reported as `128 + signo` the
+/// way a shell would.
 #[cfg(unix)]
 const SIGHUP: i32 = 1;
+/// See [`SIGHUP`].
 const SIGINT: i32 = 2;
+/// See [`SIGHUP`].
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
 
@@ -40,6 +52,7 @@ const MIN_REFRESH: Duration = Duration::from_millis(500);
 /// the UI would stop responding to keys.
 const MAX_DRAIN_PER_FRAME: usize = 512;
 
+/// Command-line arguments, which override anything in the config file.
 #[derive(Parser, Debug)]
 #[command(name = "composemux", version, about, long_about = None)]
 struct Args {
@@ -78,6 +91,7 @@ fn main() -> Result<()> {
     std::process::exit(code);
 }
 
+/// Everything after argument parsing, returning the process exit status.
 async fn run() -> Result<i32> {
     let args = Args::parse();
     let mut cfg = Config::load(args.config.as_deref())?;
@@ -146,6 +160,7 @@ async fn run() -> Result<i32> {
     run_tui(client, project, cfg, cancel, signal_exit).await
 }
 
+/// The full-screen path: draws, and owns the event loop until it exits.
 async fn run_tui(
     client: DockerClient,
     project: String,
@@ -198,6 +213,8 @@ async fn run_tui(
     })
 }
 
+/// Wakes the render loop on a timer, so the throbber and uptimes advance
+/// even when no logs are arriving.
 fn spawn_refresher(
     client: Arc<DockerClient>,
     project: String,
@@ -230,6 +247,7 @@ fn spawn_refresher(
     });
 }
 
+/// Drains input and log events until something asks the app to exit.
 async fn event_loop(
     terminal: &mut tui::terminal::Tui,
     app: &mut App,
@@ -316,6 +334,7 @@ async fn event_loop(
     }
 }
 
+/// Folds one event from the docker layer into the app.
 fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>) {
     match message {
         SourceEvent::Output {
@@ -327,6 +346,8 @@ fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>
     }
 }
 
+/// Performs whatever the last key press asked for that the app could not do
+/// on its own, such as reaching the clipboard.
 fn handle_action(app: &mut App, area: ratatui::layout::Rect) -> Result<()> {
     match app.take_action() {
         Some(Action::CopyOutput) => {

@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 1 left to document
 //! Auto-exit countdown and the session summary.
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/countdown_popup.rs`

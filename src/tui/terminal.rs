@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 3 left to document
 //! Terminal setup and teardown.
 //!
 //! The wrapping CLI keeps running after this process exits, so restoring the

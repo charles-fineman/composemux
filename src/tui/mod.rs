@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 1 left to document
 pub mod app;
 pub mod components;
 pub mod filter;

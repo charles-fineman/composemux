@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 5 left to document
 //! Docker Engine API access, scoped to a single compose project.
 
 use crate::docker::labels;
