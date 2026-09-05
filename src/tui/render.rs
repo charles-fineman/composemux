@@ -609,6 +609,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn the_project_badge_shows_the_whole_name_when_there_is_room() {
         let cfg = Config::default();
         let mut app = App::new("digital-university", &cfg);
