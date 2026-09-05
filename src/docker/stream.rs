@@ -415,8 +415,9 @@ async fn stream_container(
                 let Some(chunk) = next else { return Ok(()) };
                 // stdout and stderr both land in the same emulator, exactly as
                 // they would in a terminal attached to the container.
-                if !forward_frame(tx, desc, &chunk?.into_bytes()).await {
-                    // Receiver is gone; the UI has shut down.
+                if !forward_frame(tx, desc, &chunk?.into_bytes(), cancel).await {
+                    // Receiver gone, or this container was cancelled part way
+                    // through a frame.
                     return Ok(());
                 }
             }
@@ -425,7 +426,13 @@ async fn stream_container(
 }
 
 /// Sends one frame downstream in pieces no larger than [`MAX_CHUNK_BYTES`],
-/// returning `false` once the receiver has gone away.
+/// returning `false` once the receiver has gone away or `cancel` has fired.
+///
+/// It watches `cancel` per piece rather than relying on the caller's select.
+/// That select has already committed to this branch, so nothing polls the
+/// token while a send waits on a full channel -- and splitting a frame turned
+/// one such wait into one per piece, so a container removed during a burst
+/// would otherwise sit here until the UI drained.
 ///
 /// Cutting at a fixed offset is safe because both consumers are stateful
 /// across writes: the fallback assembler holds a partial line until its
@@ -437,17 +444,28 @@ async fn stream_container(
 /// An empty frame yields no pieces, which is why there is no explicit guard
 /// for one: forwarding it would replace a pane's "waiting" placeholder with a
 /// blank pane.
-async fn forward_frame(tx: &mpsc::Sender<SourceEvent>, desc: &ContainerDesc, frame: &[u8]) -> bool {
+async fn forward_frame(
+    tx: &mpsc::Sender<SourceEvent>,
+    desc: &ContainerDesc,
+    frame: &[u8],
+    cancel: &CancellationToken,
+) -> bool {
     for piece in frame.chunks(MAX_CHUNK_BYTES) {
-        let sent = tx
-            .send(SourceEvent::Output {
-                service: desc.service.clone(),
-                replica: desc.replica,
-                bytes: piece.to_vec(),
-            })
-            .await;
-        if sent.is_err() {
-            return false;
+        let event = SourceEvent::Output {
+            service: desc.service.clone(),
+            replica: desc.replica,
+            bytes: piece.to_vec(),
+        };
+        tokio::select! {
+            // Biased so a token that is already cancelled wins deterministically
+            // rather than depending on whether the channel happens to have room.
+            biased;
+            () = cancel.cancelled() => return false,
+            sent = tx.send(event) => {
+                if sent.is_err() {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -488,6 +506,50 @@ mod tests {
             replica: 1,
             running,
         }
+    }
+
+    /// A frame that fills a full channel must not pin the task once its
+    /// container is gone.
+    ///
+    /// The outer select has already committed to the stream branch by the time
+    /// a send blocks, so nothing there polls the token. Splitting frames made
+    /// this worse rather than better: one wait per piece instead of one per
+    /// frame.
+    #[tokio::test]
+    async fn a_cancelled_container_stops_forwarding_into_a_full_channel() {
+        // Capacity one, and already full, so the very first send blocks.
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(1);
+        tx.send(SourceEvent::Output {
+            service: "filler".to_string(),
+            replica: 1,
+            bytes: vec![b'x'],
+        })
+        .await
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let container = desc("a", true);
+        // Two pieces, so it cannot finish without a send completing.
+        let frame = vec![b'x'; MAX_CHUNK_BYTES + 1];
+
+        let forwarding = forward_frame(&tx, &container, &frame, &cancel);
+        tokio::pin!(forwarding);
+
+        // It is genuinely stuck: nothing drains the channel.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut forwarding)
+                .await
+                .is_err(),
+            "the send should be waiting on a full channel"
+        );
+
+        cancel.cancel();
+        let finished = tokio::time::timeout(Duration::from_secs(5), forwarding).await;
+        assert_eq!(
+            finished.expect("cancelling should release the forward"),
+            false,
+            "a cancelled forward reports that it stopped early"
+        );
     }
 
     fn attached(entries: &[(&str, bool)]) -> HashMap<String, Attach> {
@@ -536,7 +598,7 @@ mod tests {
         let size = 4 * MAX_CHUNK_BYTES + 7;
         let frame: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
 
-        assert!(forward_frame(&tx, &desc("a", true), &frame).await);
+        assert!(forward_frame(&tx, &desc("a", true), &frame, &CancellationToken::new()).await);
 
         let pieces = drain(&mut rx);
         for piece in &pieces {
@@ -558,7 +620,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let frame = vec![b'x'; MAX_CHUNK_BYTES];
 
-        assert!(forward_frame(&tx, &desc("a", true), &frame).await);
+        assert!(forward_frame(&tx, &desc("a", true), &frame, &CancellationToken::new()).await);
 
         let pieces = drain(&mut rx);
         assert_eq!(pieces.len(), 1, "a frame at the bound should not be split");
@@ -571,7 +633,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let frame = vec![b'x'; MAX_CHUNK_BYTES + 1];
 
-        assert!(forward_frame(&tx, &desc("a", true), &frame).await);
+        assert!(forward_frame(&tx, &desc("a", true), &frame, &CancellationToken::new()).await);
 
         let pieces = drain(&mut rx);
         assert_eq!(pieces.len(), 2);
@@ -586,7 +648,7 @@ mod tests {
     async fn an_empty_frame_is_not_forwarded() {
         let (tx, mut rx) = mpsc::channel(8);
 
-        assert!(forward_frame(&tx, &desc("a", true), b"").await);
+        assert!(forward_frame(&tx, &desc("a", true), b"", &CancellationToken::new()).await);
 
         assert!(drain(&mut rx).is_empty(), "an empty frame was forwarded");
     }
@@ -600,7 +662,13 @@ mod tests {
         drop(rx);
 
         assert!(
-            !forward_frame(&tx, &desc("a", true), b"anything").await,
+            !forward_frame(
+                &tx,
+                &desc("a", true),
+                b"anything",
+                &CancellationToken::new()
+            )
+            .await,
             "the caller must be told to stop reading"
         );
     }
