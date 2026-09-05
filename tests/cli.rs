@@ -107,7 +107,8 @@ mod signals {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     /// A stand-in Docker daemon that accepts a connection and then says
     /// nothing.
@@ -178,7 +179,28 @@ mod signals {
             .expect("kill should run");
         assert!(killed.success(), "could not signal the child");
 
-        child.wait().expect("the child should be reapable")
+        wait_bounded(&mut child, signal)
+    }
+
+    /// Reaps the child, giving up rather than blocking forever.
+    ///
+    /// The regression this test guards against is the process *not* exiting,
+    /// and `wait()` on a child that never exits blocks until the harness gives
+    /// up -- reporting a timeout on the whole binary rather than naming the
+    /// signal that went unhandled.
+    fn wait_bounded(child: &mut Child, signal: &str) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("the child should be reapable") {
+                Some(status) => return status,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the child was still running 10s after SIG{signal}");
+                }
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     #[test]

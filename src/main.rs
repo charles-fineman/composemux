@@ -20,8 +20,12 @@ use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tui::app::{Action, App, ExitReason, ServiceKey};
 
+// Only SIGINT has a windows counterpart (ctrl+c), so the other two would be
+// dead code there -- and CI runs clippy at `-D warnings` on windows too.
+#[cfg(unix)]
 const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
+#[cfg(unix)]
 const SIGTERM: i32 = 15;
 
 /// Animation tick. Also paces the auto-exit countdown.
@@ -102,7 +106,7 @@ async fn run() -> Result<i32> {
     // and a daemon that is starting up or wedged can stall all three. Handling
     // signals only after that left the slowest part of the program running
     // under the default disposition.
-    install_signal_handlers(cancel.clone(), signal_exit.clone());
+    install_signal_handlers(cancel.clone(), signal_exit.clone())?;
 
     // Since tokio's handlers *replace* that default disposition, everything
     // from here on has to be cancellable, or a signal would leave the process
@@ -123,8 +127,13 @@ async fn run() -> Result<i32> {
         Ok::<DockerClient, anyhow::Error>(client)
     };
     let client = tokio::select! {
-        result = startup => result?,
+        // Biased, so a signal that lands as startup is failing still reports
+        // the signal. Under the default random poll order the startup branch
+        // could win when both are ready, and `result?` would return the
+        // startup error instead of the status the supervisor is waiting for.
+        biased;
         _ = cancel.cancelled() => return Ok(exit_status(&signal_exit)),
+        result = startup => result?,
     };
 
     // A full-screen UI is useless when output is piped, and would write escape
@@ -357,23 +366,22 @@ fn exit_status(signal_exit: &AtomicI32) -> i32 {
     }
 }
 
-fn install_signal_handlers(cancel: CancellationToken, signal_exit: Arc<AtomicI32>) {
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut int = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
+/// Registers the terminating signals, then waits for one in the background.
+///
+/// Registration happens before this returns, not inside the spawned task.
+/// `tokio::spawn` only queues work: the receivers would not exist until the
+/// runtime first polled that task, and until they do the default disposition
+/// is still in force -- so a signal arriving in the gap would kill the process
+/// outright, which is the whole outcome this exists to avoid. The wait itself
+/// is what goes in the background.
+fn install_signal_handlers(cancel: CancellationToken, signal_exit: Arc<AtomicI32>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut int = signal(SignalKind::interrupt()).context("could not handle SIGINT")?;
+        let mut term = signal(SignalKind::terminate()).context("could not handle SIGTERM")?;
+        let mut hup = signal(SignalKind::hangup()).context("could not handle SIGHUP")?;
+        tokio::spawn(async move {
             let signo = tokio::select! {
                 _ = int.recv() => SIGINT,
                 _ = term.recv() => SIGTERM,
@@ -381,14 +389,22 @@ fn install_signal_handlers(cancel: CancellationToken, signal_exit: Arc<AtomicI32
             };
             signal_exit.store(signo, Ordering::SeqCst);
             cancel.cancel();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+        });
+    }
+    #[cfg(windows)]
+    {
+        // The same eager registration: `tokio::signal::ctrl_c` is a future
+        // that registers on first poll, which is the race this avoids.
+        let mut ctrl_c = tokio::signal::windows::ctrl_c().context("could not handle ctrl+c")?;
+        tokio::spawn(async move {
+            let _ = ctrl_c.recv().await;
             signal_exit.store(SIGINT, Ordering::SeqCst);
             cancel.cancel();
-        }
-    });
+        });
+    }
+    // Anywhere else there is nothing to register, and the default disposition
+    // stands. Every target we ship is unix or windows.
+    Ok(())
 }
 
 /// Runs a background task, bringing the whole program down if it panics.
