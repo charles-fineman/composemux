@@ -308,6 +308,34 @@ mod tests {
         assert_eq!(a.push(b"\nnext\n"), vec!["windows", "next"]);
     }
 
+    /// Bytes flushed past the cap are a raw, unterminated run -- not a line --
+    /// so a byte that merely looks like a terminator has to survive verbatim.
+    ///
+    /// The two loops in `push` are structurally alike and only one of them
+    /// should trim: giving the cap flush the same `trim_end_matches` as the
+    /// newline path silently drops a byte from output that was never a line,
+    /// and every other test in this module stays green when it does.
+    #[test]
+    fn a_capped_flush_keeps_a_trailing_byte_that_looks_like_a_terminator() {
+        let mut a = LineAssembler::default();
+        let mut input = vec![b'x'; MAX_PARTIAL - 1];
+        input.push(b'\r'); // lands exactly on the cap boundary
+        input.extend(std::iter::repeat_n(b'x', 10));
+
+        let lines = a.push(&input);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].len(),
+            MAX_PARTIAL,
+            "the trailing byte was dropped from the flushed piece"
+        );
+        assert!(
+            lines[0].ends_with('\r'),
+            "the trailing carriage return was trimmed"
+        );
+    }
+
     /// The seam between the two loops: one call that both emits a line and
     /// holds a tail.
     #[test]
