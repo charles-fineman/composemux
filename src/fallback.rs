@@ -143,6 +143,47 @@ fn handle_output(
     out.flush()
 }
 
+/// Prints events from `rx` until the channel closes, `cancel` fires, or a
+/// write fails.
+///
+/// Split from [`run`] so the loop can be driven by a plain channel and a
+/// `Vec<u8>`. What stays in `run` -- opening the channel and spawning the
+/// supervisor -- needs a Docker daemon and so cannot be reached from a test,
+/// but the two decisions that matter here can be: when the loop stops, and
+/// what has been written by the time it does.
+async fn stream_events(
+    rx: &mut mpsc::Receiver<SourceEvent>,
+    cancel: &CancellationToken,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let mut assemblers: HashMap<(String, u32), LineAssembler> = HashMap::new();
+    let mut prefixes = Prefixes::default();
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            message = rx.recv() => {
+                // `None` means every sender is gone -- the supervisor task
+                // returned or panicked -- so no further event can arrive. A
+                // closed channel yields `None` again immediately, so anything
+                // but leaving here spins on it for the life of the process.
+                let Some(message) = message else { break };
+                if let SourceEvent::Output { service, replica, bytes } = message {
+                    handle_output(
+                        &mut assemblers,
+                        &mut prefixes,
+                        service,
+                        replica,
+                        &bytes,
+                        out,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Streams every service's logs to stdout, one prefixed line at a time, until
 /// the stream ends, `cancel` fires, or a write to stdout fails -- the last of
 /// which is routine here rather than exotic, since this path exists for piped
@@ -158,35 +199,20 @@ pub async fn run(
     let supervisor_cancel = cancel.clone();
     tokio::spawn(async move { supervisor.run(supervisor_cancel).await });
 
-    let mut assemblers: HashMap<(String, u32), LineAssembler> = HashMap::new();
-    let mut prefixes = Prefixes::default();
-    let stdout = std::io::stdout();
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            message = rx.recv() => {
-                let Some(message) = message else { break };
-                if let SourceEvent::Output { service, replica, bytes } = message {
-                    let mut lock = stdout.lock();
-                    handle_output(
-                        &mut assemblers,
-                        &mut prefixes,
-                        service,
-                        replica,
-                        &bytes,
-                        &mut lock,
-                    )?;
-                }
-            }
-        }
-    }
+    // `Stdout` takes the lock per write, where this loop used to hold one
+    // `stdout.lock()` across each event. Nothing else writes to stdout while
+    // this runs -- the supervisor's debug output goes to a file, failures go to
+    // stderr, and the TUI is not running on this path -- so there is no second
+    // writer for the wider lock to have been excluding. Passing a plain
+    // `impl Write` is what puts the loop within reach of a test.
+    stream_events(&mut rx, &cancel, &mut std::io::stdout()).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn complete_lines_are_emitted_immediately() {
@@ -564,25 +590,26 @@ mod tests {
         assert_eq!(s.out.flushes, 2, "an event emitting no line still flushed");
     }
 
+    /// A sink whose every write fails, standing in for the reader having gone
+    /// away -- `head` closing the pipe is the ordinary case on this path.
+    struct Closed;
+
+    impl Write for Closed {
+        /// Always fails, so the error under test can only be the write.
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+        }
+
+        /// Succeeds, so a failure can only have come from the write.
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A dead reader is the ordinary way this path ends -- `run` returns the
     /// error and the process exits -- so the write must not be swallowed.
     #[test]
     fn a_failed_write_is_propagated() {
-        struct Closed;
-
-        impl Write for Closed {
-            /// Always fails, standing in for the reader having gone away --
-            /// `head` closing the pipe is the ordinary case here.
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
-            }
-
-            /// Succeeds, so a failure can only have come from the write.
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let err = handle_output(
             &mut HashMap::new(),
             &mut Prefixes::default(),
@@ -637,5 +664,92 @@ mod tests {
             "api-1  | a line\n",
             "the write itself succeeded, so only the flush can have failed"
         );
+    }
+
+    /// The loop must stop when every sender is gone, and must still have
+    /// printed what arrived before that.
+    ///
+    /// `recv` on a closed channel returns `None` immediately and for ever, so
+    /// treating it as anything but an exit burns a core until the process is
+    /// killed. Nothing else can end the loop here: `cancel` is never fired.
+    #[tokio::test]
+    async fn a_closed_channel_ends_the_loop_after_printing_what_arrived() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 2,
+            bytes: b"served\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        // A non-Output event, which the loop skips rather than ends on.
+        tx.send(SourceEvent::Topology)
+            .await
+            .expect("the receiver is alive");
+        drop(tx);
+
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped");
+
+        finished.expect("writing to a Vec cannot fail");
+        assert_eq!(out.lines(), vec!["web-2  | served"]);
+    }
+
+    /// Cancellation has to end the loop while a sender is still open, which is
+    /// the ordinary Ctrl-C case: the supervisor is still attached and holding
+    /// its `tx`, so the closed-channel exit is not available to stop it.
+    #[tokio::test]
+    async fn cancellation_ends_the_loop_while_a_sender_is_still_open() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(4);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut out = Sink::default();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, &mut out),
+        )
+        .await
+        .expect("cancellation did not stop the loop")
+        .expect("writing to a Vec cannot fail");
+
+        assert!(
+            !tx.is_closed(),
+            "the sender was open, so only cancel can have ended it"
+        );
+        assert!(out.lines().is_empty(), "nothing was ever sent");
+    }
+
+    /// A dead reader must come back out of the loop rather than being
+    /// swallowed per event. It is the third way `run` is documented to end,
+    /// and with the sender still open it is the only way this call can return
+    /// at all -- so losing the `?` leaves the loop waiting for ever.
+    #[tokio::test]
+    async fn a_write_failure_ends_the_loop_and_is_returned() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(SourceEvent::Output {
+            service: "api".to_string(),
+            replica: 1,
+            bytes: b"a line\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+
+        let cancel = CancellationToken::new();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, &mut Closed),
+        )
+        .await
+        .expect("the loop did not stop on a write failure")
+        .expect_err("a broken pipe should surface");
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }
