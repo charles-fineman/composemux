@@ -15,11 +15,21 @@ so the rule applies to what you are writing.
     scripts/check-docstrings.py                 # against origin/main
     scripts/check-docstrings.py <base-ref>
 
-Where this differs from the reviewer's version of the same check: it counts
-a declaration you add or change, and does not count a function you only
-edited the body of. It is zero-tolerance rather than a percentage, which
-covers the difference in the strict direction -- pass this and an 80%
-threshold is not in question.
+Editing only a body counts too. Clippy reports a diagnostic at the
+declaration line, so matching changed lines against it directly would let a
+body-only edit to an undocumented function through. A changed line is
+therefore attributed to the nearest undocumented declaration above it,
+unless a doc comment sits in between -- a doc comment means some documented
+declaration starts there, so the line belongs to that one instead and is
+not our concern.
+
+That is a heuristic, and worth knowing which way it fails: a `///` inside a
+string literal ends attribution early, so a line is missed rather than
+wrongly blamed. Erring towards silence is the right direction for a rule
+that makes people write prose.
+
+It is zero-tolerance rather than a percentage, so passing this leaves an
+80% threshold well clear.
 """
 
 from __future__ import annotations
@@ -103,6 +113,31 @@ def undocumented() -> list[tuple[str, int, str]]:
     return items
 
 
+DOC_LINE = re.compile(r"^\s*(?:///|/\*\*[^*])")
+
+
+def covers(path: str, declaration: int, touched: set[int]) -> bool:
+    """Whether `touched` includes the declaration or anything belonging to it.
+
+    "Belonging to it" runs from the declaration down to the next doc comment,
+    which is where the following documented declaration begins. Anything past
+    that is someone else's.
+    """
+    if declaration in touched:
+        return True
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+    except OSError:
+        return False
+    for number in range(declaration + 1, len(lines) + 1):
+        if DOC_LINE.match(lines[number - 1]):
+            return False
+        if number in touched:
+            return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", nargs="?", default="origin/main")
@@ -116,7 +151,7 @@ def main() -> int:
     offenders = [
         (path, line, what)
         for path, line, what in undocumented()
-        if line in touched.get(path, ())
+        if covers(path, line, touched.get(path, set()))
     ]
 
     if not offenders:
