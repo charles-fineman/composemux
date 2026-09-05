@@ -19,6 +19,12 @@ use unicode_width::UnicodeWidthStr;
 /// for the life of the process. This path is the unattended one, used under CI
 /// and wrapper scripts, so growing without bound here fails where nobody is
 /// watching.
+///
+/// It bounds accumulation *across* chunks, not any single one. By the time
+/// [`LineAssembler::push`] sees a chunk the daemon's frame has already been
+/// allocated upstream, so clamping here would cost a copy without avoiding
+/// the spike -- and a chunk larger than this before its first newline is
+/// still emitted whole. See #31, which tracks bounding it at the read site.
 const MAX_PARTIAL: usize = 1024 * 1024;
 
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
