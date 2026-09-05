@@ -28,22 +28,40 @@ struct LineAssembler {
 
 impl LineAssembler {
     /// Returns the complete lines contained in `bytes`, holding back any tail.
+    ///
+    /// The cap is applied while the input is consumed, not after it has been
+    /// appended. Checking afterwards bounded what was *kept* rather than what
+    /// was allocated: a single unterminated chunk larger than the cap went
+    /// into the buffer whole before anything looked at its size.
     fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.partial.extend_from_slice(bytes);
         let mut lines = Vec::new();
-        while let Some(pos) = self.partial.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.partial.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&line);
+        let mut rest = bytes;
+
+        while let Some(pos) = rest.iter().position(|b| *b == b'\n') {
+            let (line, tail) = rest.split_at(pos + 1);
+            self.partial.extend_from_slice(line);
+            let held = std::mem::take(&mut self.partial);
+            let text = String::from_utf8_lossy(&held);
             lines.push(text.trim_end_matches(['\n', '\r']).to_string());
+            rest = tail;
         }
 
-        // Nothing terminated the run and it has grown past what is reasonable
-        // to hold. Emit it rather than keep buffering: a long line printed early
-        // is a far better failure than memory climbing until the process dies.
-        if self.partial.len() > MAX_PARTIAL {
+        // What is left has no newline in it. Hold it back, but take it in
+        // cap-sized pieces rather than letting the run grow: a long line
+        // printed early is a far better failure than memory climbing until the
+        // process dies. A cut can land mid-character, which `from_utf8_lossy`
+        // renders as a replacement -- acceptable for output that has already
+        // run a megabyte without a newline. A line that *does* terminate is
+        // still emitted whole however long it is, since splitting real lines
+        // would corrupt them for whatever is parsing the log.
+        while self.partial.len() + rest.len() > MAX_PARTIAL {
+            let room = MAX_PARTIAL - self.partial.len();
+            self.partial.extend_from_slice(&rest[..room]);
+            rest = &rest[room..];
             let held = std::mem::take(&mut self.partial);
             lines.push(String::from_utf8_lossy(&held).into_owned());
         }
+        self.partial.extend_from_slice(rest);
         lines
     }
 }
@@ -57,12 +75,16 @@ struct Prefixes {
 }
 
 impl Prefixes {
+    /// The prefix for one line, widening the column if this name is the
+    /// longest seen so far.
     fn format(&mut self, service: &str) -> String {
         self.width = self.width.max(service.chars().count());
         format!("{service:<width$}  | ", width = self.width)
     }
 }
 
+/// Streams every service's logs to stdout, one prefixed line at a time, until
+/// the stream ends or `cancel` fires.
 pub async fn run(
     client: &DockerClient,
     project: &str,
@@ -128,6 +150,8 @@ mod tests {
         assert_eq!(lines.len(), 1);
     }
 
+    /// Output that never sends a newline must not buffer for the life of the
+    /// process.
     #[test]
     fn an_unterminated_run_is_emitted_rather_than_buffered_forever() {
         // A progress bar driving itself with carriage returns never sends a
@@ -146,6 +170,8 @@ mod tests {
         );
     }
 
+    /// Services are not all known up front, so the column widens as they
+    /// arrive and earlier lines keep the width they were written at.
     #[test]
     fn prefixes_line_up_as_services_appear() {
         let mut p = Prefixes::default();
@@ -154,6 +180,26 @@ mod tests {
         assert_eq!(p.format("cleanexit"), "cleanexit  | ");
         assert_eq!(p.format("api"), "api        | ");
         assert_eq!(p.format("db"), "db         | ");
+    }
+
+    /// One oversized chunk, rather than the many small ones above: the cap
+    /// used to be checked only after the whole chunk had been appended, so it
+    /// bounded what was retained and not the allocation itself.
+    #[test]
+    fn a_single_oversized_chunk_is_broken_up_rather_than_swallowed_whole() {
+        let mut a = LineAssembler::default();
+        let size = 4 * MAX_PARTIAL + 7;
+        let lines = a.push(&vec![b'x'; size]);
+
+        let longest = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+        assert!(
+            longest <= MAX_PARTIAL,
+            "emitted a {longest}-byte line, past the {MAX_PARTIAL}-byte cap"
+        );
+        assert!(a.partial.len() <= MAX_PARTIAL, "held {}", a.partial.len());
+        // Bounding it must not lose any of it.
+        let total: usize = lines.iter().map(|l| l.len()).sum::<usize>() + a.partial.len();
+        assert_eq!(total, size, "bytes went missing");
     }
 
     #[test]
