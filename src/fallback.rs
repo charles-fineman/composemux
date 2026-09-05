@@ -7,7 +7,7 @@
 use crate::docker::{DockerClient, LogSupervisor, SourceEvent};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{self, Write};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthStr;
@@ -96,6 +96,53 @@ impl Prefixes {
     }
 }
 
+/// Writes one event's worth of output as whole prefixed lines.
+///
+/// Split out of [`run`] so the wiring between the assemblers, the prefixes and
+/// the sink can be driven directly: `run` owns a channel and a supervisor and
+/// needs a Docker daemon, while everything that can actually go wrong here --
+/// output attributed to the wrong container, a partial line spliced onto
+/// another's, a write that never reaches the reader -- is synchronous.
+fn handle_output(
+    assemblers: &mut HashMap<(String, u32), LineAssembler>,
+    prefixes: &mut Prefixes,
+    service: String,
+    replica: u32,
+    bytes: &[u8],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    // The label names the container -- `web-1` -- rather than the service.
+    // That is what `docker compose logs` prints, and imitating it is this
+    // module's stated job; printing a bare `web` was the divergence.
+    //
+    // It is applied to every service, including one that only ever has a
+    // single container. Suffixing only scaled services, the way the TUI does,
+    // is reachable from here -- `run` holds the client and the project name and
+    // could list the containers -- but it would make the *shape* of a name
+    // depend on a replica count that moves underneath the stream. Scale `web`
+    // up and the container that had been printing `web` starts printing
+    // `web-1`, so a reader grepping `^web  |` silently stops matching the very
+    // container it was following, and the lines already written cannot be
+    // relabelled. The TUI can afford count-dependent names because it redraws
+    // the whole list from the current topology on every frame; a log stream
+    // has no way to revise what it has already emitted.
+    let label = format!("{service}-{replica}");
+    let prefix = prefixes.format(&label);
+    // Keyed by replica as well as name. Two containers of a scaled service are
+    // two independent streams, and a shared assembler splices the tail one of
+    // them is still holding onto the head of the other's next chunk, emitting
+    // a line neither of them ever wrote.
+    let assembler = assemblers.entry((service, replica)).or_default();
+    for line in assembler.push(bytes) {
+        writeln!(out, "{prefix}{line}")?;
+    }
+    // `std::io::Stdout` wraps a `LineWriter`, so on the real path the newlines
+    // above have already reached the pipe. `out` is any `Write`, though, and
+    // nothing here should depend on which one: flush unconditionally so the
+    // guarantee belongs to this function rather than to its caller's choice.
+    out.flush()
+}
+
 /// Streams every service's logs to stdout, one prefixed line at a time, until
 /// the stream ends, `cancel` fires, or a write to stdout fails -- the last of
 /// which is routine here rather than exotic, since this path exists for piped
@@ -111,7 +158,7 @@ pub async fn run(
     let supervisor_cancel = cancel.clone();
     tokio::spawn(async move { supervisor.run(supervisor_cancel).await });
 
-    let mut assemblers: HashMap<String, LineAssembler> = HashMap::new();
+    let mut assemblers: HashMap<(String, u32), LineAssembler> = HashMap::new();
     let mut prefixes = Prefixes::default();
     let stdout = std::io::stdout();
 
@@ -120,14 +167,16 @@ pub async fn run(
             _ = cancel.cancelled() => break,
             message = rx.recv() => {
                 let Some(message) = message else { break };
-                if let SourceEvent::Output { service, bytes, .. } = message {
-                    let prefix = prefixes.format(&service);
-                    let assembler = assemblers.entry(service).or_default();
+                if let SourceEvent::Output { service, replica, bytes } = message {
                     let mut lock = stdout.lock();
-                    for line in assembler.push(&bytes) {
-                        writeln!(lock, "{prefix}{line}")?;
-                    }
-                    lock.flush()?;
+                    handle_output(
+                        &mut assemblers,
+                        &mut prefixes,
+                        service,
+                        replica,
+                        &bytes,
+                        &mut lock,
+                    )?;
                 }
             }
         }
@@ -365,5 +414,213 @@ mod tests {
         a.push(b"start");
         a.push(b"-middle");
         assert_eq!(a.push(b"-end\nnext\n"), vec!["start-middle-end", "next"]);
+    }
+
+    /// Stands in for stdout, and counts flushes so the write path can be
+    /// checked without a terminal or a pipe.
+    #[derive(Default)]
+    struct Sink {
+        written: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    impl Sink {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.written)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// The state `run` carries across events, so a test can drive several
+    /// containers through the same maps the way the loop does.
+    #[derive(Default)]
+    struct Stream {
+        assemblers: HashMap<(String, u32), LineAssembler>,
+        prefixes: Prefixes,
+        out: Sink,
+    }
+
+    impl Stream {
+        fn lines(&self) -> Vec<String> {
+            self.out.lines()
+        }
+
+        fn emit(&mut self, service: &str, replica: u32, bytes: &[u8]) {
+            handle_output(
+                &mut self.assemblers,
+                &mut self.prefixes,
+                service.to_string(),
+                replica,
+                bytes,
+                &mut self.out,
+            )
+            .expect("writing to a Vec cannot fail");
+        }
+    }
+
+    /// Three containers writing at once, each caught mid-line: two replicas of
+    /// a scaled service and a second service between them. Interleaving is the
+    /// whole point -- one container at a time reassembles correctly however the
+    /// map is keyed, and keying on the service name alone splices `web-1`'s
+    /// held tail onto `web-2`'s next chunk into a line neither ever wrote.
+    #[test]
+    fn interleaved_partial_writes_from_replicas_and_services_stay_separate() {
+        let mut s = Stream::default();
+
+        s.emit("web", 1, b"GET /one");
+        s.emit("api", 1, b"listening");
+        s.emit("web", 2, b"GET /two");
+        s.emit("web", 1, b" 200\n");
+        s.emit("api", 1, b" on 8080\n");
+        s.emit("web", 2, b" 404\n");
+
+        assert_eq!(
+            s.lines(),
+            vec![
+                "web-1  | GET /one 200",
+                "api-1  | listening on 8080",
+                "web-2  | GET /two 404",
+            ]
+        );
+    }
+
+    /// The prefix has to distinguish the replicas too. Separating the buffers
+    /// but labelling both lines `web` would leave the reader unable to tell
+    /// which container it was reading, which is most of the value of keeping
+    /// them apart.
+    #[test]
+    fn replicas_of_one_service_are_labelled_apart() {
+        let mut s = Stream::default();
+
+        s.emit("web", 1, b"from one\n");
+        s.emit("web", 2, b"from two\n");
+
+        assert_eq!(s.lines(), vec!["web-1  | from one", "web-2  | from two"]);
+    }
+
+    /// An unscaled service is labelled `db-1`, not `db`: this path never sees
+    /// a service list, so it cannot know a service is single until the run is
+    /// over, and a suffix that appeared only when a second replica spoke would
+    /// relabel the same container mid-stream.
+    #[test]
+    fn a_single_replica_is_still_named_by_its_container() {
+        let mut s = Stream::default();
+
+        s.emit("db", 1, b"ready\n");
+
+        assert_eq!(s.lines(), vec!["db-1  | ready"]);
+    }
+
+    /// The alignment carries through to what is actually written, and each
+    /// line keeps its own service's prefix while the column grows.
+    #[test]
+    fn the_written_prefixes_line_up_as_longer_names_arrive() {
+        let mut s = Stream::default();
+
+        s.emit("api", 1, b"up\n");
+        s.emit("gateway", 12, b"up\n");
+        s.emit("api", 1, b"still up\n");
+
+        assert_eq!(
+            s.lines(),
+            vec!["api-1  | up", "gateway-12  | up", "api-1       | still up",]
+        );
+    }
+
+    /// Every event is flushed, including one that completed no line: what is
+    /// held back is a partial line, but what came before it is not, and a
+    /// reader tailing a pipe should not wait on the next event to see it.
+    #[test]
+    fn every_event_is_flushed() {
+        let mut s = Stream::default();
+
+        s.emit("api", 1, b"one\n");
+        assert_eq!(s.out.flushes, 1);
+
+        s.emit("api", 1, b"a partial line");
+        assert_eq!(s.out.flushes, 2, "an event emitting no line still flushed");
+    }
+
+    /// A dead reader is the ordinary way this path ends -- `run` returns the
+    /// error and the process exits -- so the write must not be swallowed.
+    #[test]
+    fn a_failed_write_is_propagated() {
+        struct Closed;
+
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let err = handle_output(
+            &mut HashMap::new(),
+            &mut Prefixes::default(),
+            "api".to_string(),
+            1,
+            b"a line\n",
+            &mut Closed,
+        )
+        .expect_err("a broken pipe should surface");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// The same failure can arrive on the flush rather than on the write: a
+    /// buffered writer accepts bytes into its buffer and only discovers the
+    /// closed pipe when it tries to drain them. Returning `flush`'s result is
+    /// what makes that reach `run`, and swallowing it is invisible to every
+    /// other test here -- the bytes still turn up in the sink.
+    #[test]
+    fn a_failed_flush_is_propagated() {
+        #[derive(Default)]
+        struct FlushFails {
+            written: Vec<u8>,
+        }
+
+        impl Write for FlushFails {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+            }
+        }
+
+        let mut out = FlushFails::default();
+        let err = handle_output(
+            &mut HashMap::new(),
+            &mut Prefixes::default(),
+            "api".to_string(),
+            1,
+            b"a line\n",
+            &mut out,
+        )
+        .expect_err("a broken pipe should surface from the flush");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            String::from_utf8_lossy(&out.written),
+            "api-1  | a line\n",
+            "the write itself succeeded, so only the flush can have failed"
+        );
     }
 }
