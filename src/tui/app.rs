@@ -538,6 +538,23 @@ impl App {
         }
     }
 
+    /// Pane slots holding a service, in order.
+    ///
+    /// The layout allocates one rect per occupied slot, so a renderer has to map
+    /// rect position to slot through this rather than assuming they match.
+    /// Pinning only to pane 2 leaves slot 0 empty and produces a single rect.
+    pub fn occupied_panes(&self) -> Vec<usize> {
+        self.panes_with_content()
+    }
+
+    /// Looks a service up regardless of the filter.
+    ///
+    /// A pinned pane keeps streaming a service the filter has hidden, so its
+    /// header must not be resolved through the visible rows.
+    pub fn service_row(&self, key: &ServiceKey) -> Option<&Row> {
+        self.all.iter().find(|r| &r.key == key)
+    }
+
     fn panes_with_content(&self) -> Vec<usize> {
         if self.spacebar_mode {
             return vec![0];
