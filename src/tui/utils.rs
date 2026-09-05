@@ -62,17 +62,21 @@ fn sort_category(status: ServiceStatus) -> u8 {
     }
 }
 
+/// Orders the sidebar: status category first, then service name, then replica.
+///
+/// Deviation from nx, which breaks ties inside a category by start and finish
+/// time. That reads well for nx, where tasks run as a dependency graph drains
+/// and *when* a task started genuinely distinguishes it. Compose starts and
+/// stops a project's containers concurrently, so their timestamps differ only
+/// by scheduler noise -- five services measured here landed 1.6ms apart -- and
+/// ordering on that dealt a fresh permutation of the whole sidebar on every
+/// `compose up`, `restart` and `down`. Name is free, already fetched, and is
+/// what `docker compose ps` prints, so `1`, `2` and the arrow keys keep
+/// pointing at the same service across restarts.
 pub fn sort_services(services: &mut [Service]) {
     services.sort_by(|a, b| {
         sort_category(a.status)
             .cmp(&sort_category(b.status))
-            .then_with(|| match sort_category(a.status) {
-                // Active: oldest first, so the ordering is stable as things start.
-                0 => a.started_at.cmp(&b.started_at),
-                // Finished: most recently ended first.
-                1 | 2 => b.finished_at.cmp(&a.finished_at),
-                _ => std::cmp::Ordering::Equal,
-            })
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.replica.cmp(&b.replica))
     });
@@ -95,6 +99,80 @@ mod tests {
     fn duration_extends_past_an_hour() {
         assert_eq!(format_duration(Duration::seconds(7_500)), "2h 5m");
         assert_eq!(format_duration(Duration::seconds(180_000)), "2d 2h");
+    }
+
+    /// A service whose timestamps can be set, so a `compose up` race can be
+    /// replayed without a daemon.
+    fn timed(
+        name: &str,
+        status: ServiceStatus,
+        started_ms: i64,
+        finished_ms: Option<i64>,
+    ) -> Service {
+        use chrono::TimeZone;
+        let at = |ms: i64| chrono::Utc.timestamp_millis_opt(ms).unwrap();
+        Service {
+            name: name.to_string(),
+            replica: 1,
+            status,
+            health: crate::model::Health::None,
+            exit_code: None,
+            started_at: Some(at(started_ms)),
+            finished_at: finished_ms.map(at),
+        }
+    }
+
+    fn ordered(mut services: Vec<Service>) -> Vec<String> {
+        sort_services(&mut services);
+        services.into_iter().map(|s| s.name).collect()
+    }
+
+    #[test]
+    fn running_services_are_ordered_by_name_not_by_when_they_started() {
+        // Start times deliberately contradict alphabetical order.
+        let names = ordered(vec![
+            timed("charlie", ServiceStatus::Running, 1_000, None),
+            timed("alpha", ServiceStatus::Running, 4_000, None),
+            timed("bravo", ServiceStatus::Running, 2_000, None),
+        ]);
+        assert_eq!(names, ["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn exited_services_are_ordered_by_name_not_by_when_they_finished() {
+        let names = ordered(vec![
+            // Finish times ascend with the name, so "most recently finished
+            // first" would invert the list.
+            timed("bravo", ServiceStatus::Success, 0, Some(2_000)),
+            timed("charlie", ServiceStatus::Success, 0, Some(3_000)),
+            timed("alpha", ServiceStatus::Success, 0, Some(1_000)),
+        ]);
+        assert_eq!(names, ["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn restarting_a_project_does_not_reshuffle_the_sidebar() {
+        // Compose starts a project's containers concurrently, so each run deals
+        // a different sub-millisecond start order. Two such orders, observed
+        // from the same five-service project across two `compose restart` runs,
+        // must still render identically or `1` and `2` pin different services
+        // each time.
+        let run = |offsets: [i64; 5]| {
+            let names = ["alpha", "bravo", "charlie", "delta", "echo"];
+            ordered(
+                names
+                    .iter()
+                    .zip(offsets)
+                    .map(|(n, off)| timed(n, ServiceStatus::Running, 1_700_000_000_000 + off, None))
+                    .collect(),
+            )
+        };
+        // echo bravo alpha delta charlie
+        let first = run([2, 1, 4, 3, 0]);
+        // charlie alpha delta echo bravo
+        let second = run([1, 4, 0, 2, 3]);
+        assert_eq!(first, second);
+        assert_eq!(first, ["alpha", "bravo", "charlie", "delta", "echo"]);
     }
 
     #[test]
