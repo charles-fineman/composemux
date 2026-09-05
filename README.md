@@ -92,7 +92,9 @@ pinned panes splitting the frame, whereas `enter` on a focused pane gives it
 everything. It's modal while it lasts — the keys that would put the list or the
 other pane back are ignored, and `enter` doesn't toggle back out — and `esc`
 restores the arrangement exactly as it was, hidden list included, without also
-giving up the pane. Press `esc` a second time for the service list.
+giving up the pane. Press `esc` a second time for the service list — unless you
+had hidden it with `b`, in which case it stays hidden and focus stays where it
+is.
 
 **In an output pane**
 
@@ -104,7 +106,7 @@ giving up the pane. Press `esc` a second time for the service list.
 | `c` | Copy the buffer to the clipboard |
 | `enter` | Full screen: this pane takes the frame, list and all |
 | `esc` | Leave full screen |
-| `esc` (again) | Back to the service list |
+| `esc` (again) | Back to the service list, if the list is showing |
 
 **Anywhere:** `?` help · `q` quit · `ctrl+c` interrupt · `F10` toggle mouse
 capture.

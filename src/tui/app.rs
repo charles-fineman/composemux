@@ -1287,9 +1287,35 @@ mod tests {
         );
     }
 
+    /// The second `esc` returns to the list only when there is a list to
+    /// return to. Restoring a hidden list keeps it hidden, and focus cannot
+    /// move to something that is not drawn, so the press does nothing --
+    /// which the README has to say rather than promising the list back.
     #[test]
+    fn a_second_escape_does_nothing_while_the_list_stays_hidden() {
+        let mut app = app_with_two_panes();
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.layout().visibility(), ListVisibility::Hidden);
+        assert_eq!(app.focus(), Focus::Pane(0));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.layout().visibility(),
+            ListVisibility::Hidden,
+            "esc should not reveal a list the user hid"
+        );
+        assert_eq!(
+            app.focus(),
+            Focus::Pane(0),
+            "focus cannot move to a list that is not drawn"
+        );
+    }
+
     /// `esc` keeps its old meaning once full screen is gone: the first press
     /// leaves the view, the second returns focus to the list.
+    #[test]
     fn a_second_escape_hands_focus_back_to_the_list() {
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Enter);
