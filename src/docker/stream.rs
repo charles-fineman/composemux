@@ -545,9 +545,8 @@ mod tests {
 
         cancel.cancel();
         let finished = tokio::time::timeout(Duration::from_secs(5), forwarding).await;
-        assert_eq!(
-            finished.expect("cancelling should release the forward"),
-            false,
+        assert!(
+            !finished.expect("cancelling should release the forward"),
             "a cancelled forward reports that it stopped early"
         );
     }
