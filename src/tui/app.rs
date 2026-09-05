@@ -127,6 +127,7 @@ pub struct App {
 }
 
 impl App {
+    /// A fresh app for `project`, with nothing pinned and nothing full screen.
     pub fn new(project: impl Into<String>, config: &Config) -> Self {
         Self {
             project: project.into(),
@@ -607,6 +608,7 @@ impl App {
         self.all.iter().find(|r| &r.key == key)
     }
 
+    /// The pane slots the layout should be asked to place.
     fn panes_with_content(&self) -> Vec<usize> {
         // Full screen hides the sibling pane as well as the list, so the layout
         // has to be asked for one rect rather than two.
@@ -1220,6 +1222,8 @@ mod tests {
     }
 
     #[test]
+    /// Focus cannot stay on a list that is no longer drawn, so `b` has to
+    /// move it somewhere -- the precondition the full-screen tests rely on.
     fn b_hides_the_list_and_moves_focus_to_a_pane() {
         let mut app = app_with(&["a"]);
         press(&mut app, KeyCode::Char('1'));
@@ -1243,6 +1247,8 @@ mod tests {
     }
 
     #[test]
+    /// The binding itself: nx's `full screen: <enter>`, which here means one
+    /// pane, no list and no sibling.
     fn enter_on_a_focused_pane_gives_it_the_whole_frame() {
         let mut app = app_with_two_panes();
         assert_eq!(app.focus(), Focus::Pane(0));
@@ -1258,6 +1264,8 @@ mod tests {
     }
 
     #[test]
+    /// Leaving restores the split that was there, not a default one -- a
+    /// two-pane layout has to come back as two panes.
     fn escape_puts_back_the_arrangement_full_screen_replaced() {
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Enter);
@@ -1273,6 +1281,8 @@ mod tests {
     }
 
     #[test]
+    /// `esc` keeps its old meaning once full screen is gone: the first press
+    /// leaves the view, the second returns focus to the list.
     fn a_second_escape_hands_focus_back_to_the_list() {
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Enter);
@@ -1287,6 +1297,8 @@ mod tests {
     }
 
     #[test]
+    /// Restoring means putting back what the user had, not what the default
+    /// is: a list hidden with `b` stays hidden on the way out.
     fn full_screen_restores_a_list_that_was_already_hidden() {
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Char('b'));
@@ -1303,6 +1315,9 @@ mod tests {
     }
 
     #[test]
+    /// Slot two with slot one empty is where pane geometry has gone wrong
+    /// before (#14): the full-screen rect belongs to the pane's slot, not to
+    /// its position among the rects.
     fn a_pane_pinned_only_to_slot_two_goes_full_screen_as_itself() {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char('j'));
@@ -1321,6 +1336,8 @@ mod tests {
     }
 
     #[test]
+    /// The view is modal: anything that would put a second thing on the frame
+    /// has to be swallowed while it is up.
     fn full_screen_ignores_the_keys_that_would_split_the_frame_again() {
         // One press per app, so a failure names the key that got through.
         // tab and shift+tab are here for the guarantee rather than the guard:
@@ -1363,8 +1380,9 @@ mod tests {
     }
 
     #[test]
+    /// nx's single-task view is left with `esc`; `enter` is only the way in.
+    /// #9 asked for a toggle, and this is the deliberate divergence from it.
     fn enter_does_not_leave_full_screen() {
-        // nx's single-task view is left with esc; enter is only the way in.
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
@@ -1374,9 +1392,9 @@ mod tests {
     }
 
     #[test]
+    /// Re-entering would save the full-screen layout as the thing to go back
+    /// to, stranding the user in it -- `esc` would restore what it already is.
     fn a_second_enter_does_not_move_the_restore_point() {
-        // Re-entering would save the full-screen layout as the thing to go back
-        // to, which strands the user in it: esc would restore what it already is.
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
@@ -1386,9 +1404,10 @@ mod tests {
     }
 
     #[test]
+    /// A spacebar pane follows the selection rather than a pin, so a stack
+    /// that empties out leaves the focused pane with nothing behind it, and
+    /// full-screening nothing would be a blank modal frame.
     fn enter_is_inert_when_the_focused_pane_has_lost_its_service() {
-        // A spacebar pane follows the selection rather than a pin, so a stack
-        // that empties out leaves the focused pane with nothing behind it.
         let mut app = app_with(&["a"]);
         press(&mut app, KeyCode::Char(' '));
         press(&mut app, KeyCode::Tab);
@@ -1405,9 +1424,9 @@ mod tests {
     }
 
     #[test]
+    /// The countdown dismissal runs before the pane bindings, and an unhandled
+    /// key is meant to act as well as dismiss -- as it already does for `j`.
     fn an_enter_that_dismisses_the_countdown_still_goes_full_screen() {
-        // The countdown dismissal runs before the pane bindings, and the key is
-        // meant to act as well as dismiss -- as it already does for j.
         let cfg = Config::default();
         let mut app = App::new("test", &cfg);
         app.set_services(vec![svc("a", ServiceStatus::Success)]);
@@ -1424,6 +1443,8 @@ mod tests {
     }
 
     #[test]
+    /// The modality is about layout, not about disabling the pane: reading is
+    /// the reason to be here at all.
     fn full_screen_still_scrolls_copies_and_quits() {
         let mut app = app_with(&["a"]);
         let key = ServiceKey::new("a", 1);
@@ -1443,6 +1464,8 @@ mod tests {
     }
 
     #[test]
+    /// Help is drawn over the view rather than replacing it, so dismissing it
+    /// returns to full screen instead of collapsing the layout.
     fn help_opens_over_full_screen_and_leaves_it_intact() {
         let mut app = app_with_two_panes();
         press(&mut app, KeyCode::Enter);
@@ -1459,6 +1482,8 @@ mod tests {
     }
 
     #[test]
+    /// Spacebar mode has no pin to restore from, so the round trip has to work
+    /// off the follow-the-selection pane as well as a pinned one.
     fn a_spacebar_pane_can_go_full_screen_and_come_back() {
         let mut app = app_with(&["a", "b"]);
         press(&mut app, KeyCode::Char(' '));

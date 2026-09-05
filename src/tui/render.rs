@@ -534,6 +534,9 @@ mod tests {
     }
 
     #[test]
+    /// Rendered rather than asserted on state: the point of the mode is what
+    /// reaches the frame, and only the frame can show the list and the sibling
+    /// are actually gone.
     fn a_full_screen_pane_is_the_only_thing_on_the_frame() {
         let mut app = app();
         press(&mut app, KeyCode::Char('1'));
@@ -568,11 +571,11 @@ mod tests {
     }
 
     #[test]
+    /// Full screen is the first state in which an occupied pane goes
+    /// unrendered, so it stops being resized while it keeps ingesting. Shrink
+    /// the terminal meanwhile and its emulator is a size behind; only the
+    /// rebuild from raw bytes on the next resize puts that right.
     fn a_pane_hidden_by_full_screen_rewraps_when_it_comes_back() {
-        // Full screen is the first state in which an occupied pane goes
-        // unrendered, so it stops being resized while it keeps ingesting. Shrink
-        // the terminal meanwhile and its emulator is a size behind; only the
-        // rebuild from raw bytes on the next resize puts that right.
         let mut app = app();
         press(&mut app, KeyCode::Char('1'));
         press(&mut app, KeyCode::Char('j'));

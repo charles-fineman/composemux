@@ -233,6 +233,8 @@ mod tests {
     }
 
     #[test]
+    /// The status bar is where the binding is found in passing, so it has to
+    /// carry nx's wording rather than our own.
     fn a_focused_pane_advertises_full_screen() {
         let mut app = app_with(&["a"]);
         app.open_and_focus_selection();
@@ -245,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    /// The bar follows the mode: once inside, the useful hint is how to leave.
     fn a_full_screen_pane_advertises_the_way_out() {
         let mut app = app_with(&["a"]);
         app.open_and_focus_selection();

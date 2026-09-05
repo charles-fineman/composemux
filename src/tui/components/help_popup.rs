@@ -152,6 +152,8 @@ mod tests {
     }
 
     #[test]
+    /// A binding users cannot discover is not shipped, and one with no
+    /// advertised way out is worse than absent.
     fn the_full_screen_binding_and_its_exit_are_both_documented() {
         assert!(
             BINDINGS
