@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthStr;
 
 /// Longest unterminated run held before it is emitted anyway.
 ///
@@ -77,14 +78,22 @@ struct Prefixes {
 impl Prefixes {
     /// The prefix for one line, widening the column if this name is the
     /// longest seen so far.
+    ///
+    /// Measured and padded in terminal columns, not scalars. `{:<width$}`
+    /// counts scalars, so a name of double-width glyphs would be padded to
+    /// half the space it actually occupies -- which is the alignment this
+    /// exists to provide.
     fn format(&mut self, service: &str) -> String {
-        self.width = self.width.max(service.chars().count());
-        format!("{service:<width$}  | ", width = self.width)
+        let width = service.width();
+        self.width = self.width.max(width);
+        format!("{service}{:pad$}  | ", "", pad = self.width - width)
     }
 }
 
 /// Streams every service's logs to stdout, one prefixed line at a time, until
-/// the stream ends or `cancel` fires.
+/// the stream ends, `cancel` fires, or a write to stdout fails -- the last of
+/// which is routine here rather than exotic, since this path exists for piped
+/// output and the reader can go away first.
 pub async fn run(
     client: &DockerClient,
     project: &str,
@@ -200,6 +209,110 @@ mod tests {
         // Bounding it must not lose any of it.
         let total: usize = lines.iter().map(|l| l.len()).sum::<usize>() + a.partial.len();
         assert_eq!(total, size, "bytes went missing");
+    }
+
+    /// The cap must not corrupt what it splits. A uniform payload cannot show
+    /// this -- every byte is interchangeable, so only a change in total length
+    /// is visible -- so this one is non-uniform and reassembled byte for byte.
+    #[test]
+    fn capped_output_reassembles_to_exactly_what_went_in() {
+        let mut a = LineAssembler::default();
+        let size = 4 * MAX_PARTIAL + 7;
+        // Printable ASCII, no newline: valid UTF-8, so `from_utf8_lossy` is a
+        // no-op and the comparison is exact.
+        let input: Vec<u8> = (0..size).map(|i| b'a' + (i % 26) as u8).collect();
+
+        let lines = a.push(&input);
+
+        let mut back: Vec<u8> = lines.iter().flat_map(|l| l.bytes()).collect();
+        back.extend_from_slice(&a.partial);
+        assert_eq!(back.len(), input.len(), "byte count changed");
+        assert!(back == input, "the pieces do not reassemble to the input");
+    }
+
+    /// The other half of the rule: only *unterminated* runs are capped. A line
+    /// that ends in a newline is emitted whole however long it runs, because
+    /// splitting a real line would corrupt it for whatever parses the log.
+    #[test]
+    fn a_terminated_line_longer_than_the_cap_is_emitted_whole() {
+        let mut a = LineAssembler::default();
+        let size = 3 * MAX_PARTIAL;
+        let mut input = vec![b'x'; size];
+        input.push(b'\n');
+
+        let lines = a.push(&input);
+
+        assert_eq!(lines.len(), 1, "a terminated line was split");
+        assert_eq!(lines[0].len(), size, "the line came back short");
+        assert!(a.partial.is_empty(), "nothing should be held back");
+    }
+
+    /// The cap is `>`, so reaching it exactly holds rather than flushes. This
+    /// pins the boundary in both directions, where off-by-one lives.
+    #[test]
+    fn the_cap_is_reached_before_it_is_exceeded() {
+        let mut exact = LineAssembler::default();
+        assert!(
+            exact.push(&vec![b'x'; MAX_PARTIAL]).is_empty(),
+            "reaching the cap exactly should not flush yet"
+        );
+        assert_eq!(exact.partial.len(), MAX_PARTIAL);
+
+        let mut over = LineAssembler::default();
+        let lines = over.push(&vec![b'x'; MAX_PARTIAL + 1]);
+        assert!(lines.iter().all(|l| l.len() <= MAX_PARTIAL));
+        let total: usize = lines.iter().map(|l| l.len()).sum::<usize>() + over.partial.len();
+        assert_eq!(total, MAX_PARTIAL + 1, "bytes went missing at the boundary");
+    }
+
+    /// Crossing the cap across many calls, rather than inside one chunk: the
+    /// other test drives the same limit but never leaves `push`.
+    #[test]
+    fn many_small_chunks_crossing_the_cap_lose_no_bytes() {
+        let mut a = LineAssembler::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut emitted = 0usize;
+        for _ in 0..40 {
+            emitted += a.push(&chunk).iter().map(|l| l.len()).sum::<usize>();
+        }
+        assert_eq!(
+            emitted + a.partial.len(),
+            40 * chunk.len(),
+            "bytes went missing across calls"
+        );
+    }
+
+    /// A chunk boundary can fall between the `\r` and the `\n`, which puts the
+    /// two halves of the terminator in different calls -- and the rewrite
+    /// moved the newline search from the buffer onto the incoming slice.
+    #[test]
+    fn a_crlf_split_across_chunks_is_still_trimmed() {
+        let mut a = LineAssembler::default();
+        assert!(a.push(b"windows\r").is_empty(), "no newline yet");
+        assert_eq!(a.push(b"\nnext\n"), vec!["windows", "next"]);
+    }
+
+    /// The seam between the two loops: one call that both emits a line and
+    /// holds a tail.
+    #[test]
+    fn one_push_can_emit_a_line_and_hold_a_tail() {
+        let mut a = LineAssembler::default();
+        assert_eq!(a.push(b"one\ntwo"), vec!["one"]);
+        assert_eq!(a.push(b"-end\n"), vec!["two-end"]);
+    }
+
+    /// Service names are ASCII in practice, but the padding should be honest
+    /// about what it measures.
+    #[test]
+    fn a_wide_name_is_padded_by_the_columns_it_occupies() {
+        let mut p = Prefixes::default();
+        // Three scalars, six columns.
+        assert_eq!(
+            p.format("\u{65e5}\u{672c}\u{8a9e}"),
+            "\u{65e5}\u{672c}\u{8a9e}  | "
+        );
+        // The column is six wide now, so a two-column name takes four spaces.
+        assert_eq!(p.format("ab"), "ab      | ");
     }
 
     #[test]
