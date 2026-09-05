@@ -68,11 +68,12 @@ fn sort_category(status: ServiceStatus) -> u8 {
 /// time. That reads well for nx, where tasks run as a dependency graph drains
 /// and *when* a task started genuinely distinguishes it. Compose starts and
 /// stops a project's containers concurrently, so their timestamps differ only
-/// by scheduler noise -- five services measured here landed 1.6ms apart -- and
-/// ordering on that dealt a fresh permutation of the whole sidebar on every
-/// `compose up`, `restart` and `down`. Name is free, already fetched, and is
-/// what `docker compose ps` prints, so `1`, `2` and the arrow keys keep
-/// pointing at the same service across restarts.
+/// by scheduler noise -- the five containers measured for #22 landed within
+/// 1.6ms of each other -- and ordering on that dealt a fresh permutation of the
+/// whole sidebar on every `compose up`, `restart` and `down`. Name is free,
+/// already fetched, and is what `docker compose ps` prints, so row positions
+/// stay put and a fixed keystroke sequence reaches the same service across
+/// restarts.
 pub fn sort_services(services: &mut [Service]) {
     services.sort_by(|a, b| {
         sort_category(a.status)
@@ -86,6 +87,7 @@ pub fn sort_services(services: &mut [Service]) {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use proptest::prelude::*;
 
     #[test]
     fn duration_matches_nx_thresholds() {
@@ -119,6 +121,14 @@ mod tests {
             exit_code: None,
             started_at: Some(at(started_ms)),
             finished_at: finished_ms.map(at),
+        }
+    }
+
+    /// Like `timed`, for the scaled case where one name spans several rows.
+    fn replica_of(name: &str, replica: u32, started_ms: i64) -> Service {
+        Service {
+            replica,
+            ..timed(name, ServiceStatus::Running, started_ms, None)
         }
     }
 
@@ -164,6 +174,10 @@ mod tests {
                     .iter()
                     .zip(offsets)
                     .map(|(n, off)| timed(n, ServiceStatus::Running, 1_700_000_000_000 + off, None))
+                    // Hand the sort a list that is not already in the expected
+                    // order, so a comparator that did nothing could not pass on
+                    // `sort_by`'s stability alone.
+                    .rev()
                     .collect(),
             )
         };
@@ -177,23 +191,82 @@ mod tests {
 
     #[test]
     fn active_sorts_above_failed_above_finished_above_pending() {
-        let mk = |n: &str, s: ServiceStatus| Service {
-            name: n.to_string(),
-            replica: 1,
-            status: s,
-            health: crate::model::Health::None,
-            exit_code: None,
-            started_at: None,
-            finished_at: None,
-        };
+        let mk = |n: &str, s: ServiceStatus| timed(n, s, 0, None);
+        // Names run backwards against the category ranks, so sorting by name
+        // alone cannot reproduce this order -- otherwise the test would still
+        // pass with the grouping deleted. Two services per category also pin
+        // down that the name comparison applies *within* a group.
         let mut v = vec![
-            mk("d", ServiceStatus::NotStarted),
-            mk("c", ServiceStatus::Success),
-            mk("b", ServiceStatus::Failure),
-            mk("a", ServiceStatus::Running),
+            mk("api", ServiceStatus::NotStarted),
+            mk("nginx", ServiceStatus::Success),
+            mk("web", ServiceStatus::Running),
+            mk("cache", ServiceStatus::NotStarted),
+            mk("redis", ServiceStatus::Failure),
+            mk("postgres", ServiceStatus::Stopped),
+            mk("sidecar", ServiceStatus::Unhealthy),
         ];
         sort_services(&mut v);
         let names: Vec<_> = v.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["a", "b", "c", "d"]);
+        assert_eq!(
+            names,
+            [
+                // Unhealthy is deliberately grouped with the active services.
+                "sidecar", "web",   // failed
+                "redis", // finished
+                "nginx", "postgres", // never started
+                "api", "cache",
+            ]
+        );
+    }
+
+    #[test]
+    fn replicas_of_one_service_are_ordered_by_index() {
+        // The higher replica started first, so the old start-time tie-break put
+        // web-2 above web-1 -- and the names tie, so nothing else orders these.
+        let mut v = vec![replica_of("web", 2, 1_000), replica_of("web", 1, 2_000)];
+        sort_services(&mut v);
+        let keys: Vec<_> = v.iter().map(|s| (s.name.as_str(), s.replica)).collect();
+        assert_eq!(keys, [("web", 1), ("web", 2)]);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// The property #22 was filed against, stated directly: what the user
+        /// sees must be a function of the services alone. Container timestamps
+        /// and the order the daemon happens to return rows in are both outside
+        /// the user's control, so re-dealing either must change nothing.
+        #[test]
+        fn neither_timestamps_nor_arrival_order_reach_the_screen(
+            statuses in prop::collection::vec(0usize..6, 1..8),
+            stamps_a in prop::collection::vec(0i64..1_000, 8),
+            stamps_b in prop::collection::vec(0i64..1_000, 8),
+        ) {
+            let status_of = |i: usize| match i {
+                0 => ServiceStatus::Running,
+                1 => ServiceStatus::Success,
+                2 => ServiceStatus::Failure,
+                3 => ServiceStatus::Unhealthy,
+                4 => ServiceStatus::Stopped,
+                _ => ServiceStatus::NotStarted,
+            };
+            // One distinct name per row, so (name, replica) is unique and the
+            // ordering is total; only the timestamps and the deal differ.
+            let deal = |stamps: &[i64], reversed: bool| {
+                let mut v: Vec<Service> = statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &s)| {
+                        timed(&format!("svc{i}"), status_of(s), stamps[i], Some(stamps[i]))
+                    })
+                    .collect();
+                if reversed {
+                    v.reverse();
+                }
+                sort_services(&mut v);
+                v.into_iter().map(|s| s.name).collect::<Vec<_>>()
+            };
+            prop_assert_eq!(deal(&stamps_a, false), deal(&stamps_b, true));
+        }
     }
 }
