@@ -81,8 +81,13 @@ impl ExitReason {
 /// A pane holding the whole frame, and the layout to put back when it lets go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FullScreen {
+    /// The pane slot holding the frame, not its position among the rendered
+    /// rects -- pinning to slot two alone leaves slot one empty.
     pane: usize,
+    /// The split to put back on the way out, so leaving restores what the
+    /// user had rather than a default.
     arrangement: PaneArrangement,
+    /// Whether the list was on before, so a list hidden with `b` stays hidden.
     visibility: ListVisibility,
 }
 
@@ -109,6 +114,8 @@ pub struct App {
     focus: FocusStack,
     filter: Filter,
     layout: LayoutManager,
+    /// Set while one pane owns the whole frame; also the restore point, so
+    /// re-entering must not overwrite it.
     full_screen: Option<FullScreen>,
     momentum: ScrollMomentum,
     throbber: usize,
