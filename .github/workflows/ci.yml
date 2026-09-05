@@ -45,6 +45,10 @@ jobs:
         with:
           # The check diffs against the base branch, so it needs the history.
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: scripts/check-docstrings.py "origin/${{ github.base_ref }}"
 
   release-build:
