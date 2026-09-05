@@ -18,10 +18,11 @@ so the rule applies to what you are writing.
 Editing only a body counts too. Clippy reports a diagnostic at the
 declaration line, so matching changed lines against it directly would let a
 body-only edit to an undocumented function through. A changed line is
-therefore attributed to the nearest undocumented declaration above it,
-unless a doc comment sits in between -- a doc comment means some documented
-declaration starts there, so the line belongs to that one instead and is
-not our concern.
+therefore attributed to the declaration above it, and only the nearest one:
+attribution stops at the next declaration of either kind. A doc comment
+means a documented declaration starts there, and clippy has already told us
+where the undocumented ones are, so both ends of a declaration's territory
+are known without parsing anything.
 
 That is a heuristic, and worth knowing which way it fails: a `///` inside a
 string literal ends attribution early, so a line is missed rather than
@@ -116,12 +117,14 @@ def undocumented() -> list[tuple[str, int, str]]:
 DOC_LINE = re.compile(r"^\s*(?:///|/\*\*[^*])")
 
 
-def covers(path: str, declaration: int, touched: set[int]) -> bool:
+def covers(path: str, declaration: int, limit: int, touched: set[int]) -> bool:
     """Whether `touched` includes the declaration or anything belonging to it.
 
-    "Belonging to it" runs from the declaration down to the next doc comment,
-    which is where the following documented declaration begins. Anything past
-    that is someone else's.
+    Its territory runs from the declaration to whichever comes first: `limit`,
+    the next undocumented declaration clippy reported, or a doc comment, where
+    a documented one begins. Without both ends, an edit in one declaration
+    reads as an edit in every undocumented declaration above it, and the check
+    fails a change for something it did not touch.
     """
     if declaration in touched:
         return True
@@ -130,7 +133,7 @@ def covers(path: str, declaration: int, touched: set[int]) -> bool:
             lines = handle.read().split("\n")
     except OSError:
         return False
-    for number in range(declaration + 1, len(lines) + 1):
+    for number in range(declaration + 1, min(limit, len(lines) + 1)):
         if DOC_LINE.match(lines[number - 1]):
             return False
         if number in touched:
@@ -148,11 +151,20 @@ def main() -> int:
         print("Nothing changed; nothing to check.")
         return 0
 
-    offenders = [
-        (path, line, what)
-        for path, line, what in undocumented()
-        if covers(path, line, touched.get(path, set()))
-    ]
+    # Each declaration's territory ends where the next one starts, so they are
+    # grouped by file and walked in order.
+    by_file: dict[str, list[tuple[int, str]]] = {}
+    for path, line, what in undocumented():
+        by_file.setdefault(path, []).append((line, what))
+
+    offenders = []
+    for path, items in by_file.items():
+        items.sort()
+        lines = touched.get(path, set())
+        for index, (line, what) in enumerate(items):
+            limit = items[index + 1][0] if index + 1 < len(items) else sys.maxsize
+            if covers(path, line, limit, lines):
+                offenders.append((path, line, what))
 
     if not offenders:
         print(f"Every declaration touched since {args.base} is documented.")

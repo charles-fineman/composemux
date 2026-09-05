@@ -49,6 +49,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/test_check_docstrings.py
       - run: scripts/check-docstrings.py "origin/${{ github.base_ref }}"
 
   release-build:
