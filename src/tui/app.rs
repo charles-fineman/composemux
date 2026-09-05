@@ -706,10 +706,14 @@ impl App {
             return;
         }
 
-        // 3. Help popup swallows everything except its own navigation.
+        // 3. Help popup swallows everything except its own navigation -- and
+        // the quit it advertises. It lists "q or <ctrl>+c = Quit", so treating
+        // q as a dismiss key contradicted the popup's own text, and diverges
+        // from upstream, which reaches its global quit before its popup branch.
         if self.focus.current() == Focus::HelpPopup {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => self.focus.close_popup(),
+                KeyCode::Char('q') => self.exit = Some(ExitReason::Quit),
+                KeyCode::Esc | KeyCode::Char('?') => self.focus.close_popup(),
                 _ => {}
             }
             return;
@@ -1303,6 +1307,27 @@ mod tests {
         assert_eq!(app.focus(), Focus::HelpPopup);
         press(&mut app, KeyCode::Char('?'));
         assert_eq!(app.focus(), Focus::ServiceList);
+    }
+
+    #[test]
+    fn q_quits_from_the_help_popup_as_the_popup_says_it_does() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.focus(), Focus::HelpPopup);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.exit_reason(), Some(ExitReason::Quit));
+    }
+
+    #[test]
+    fn escape_still_only_closes_the_help_popup() {
+        let mut app = app_with(&["a"]);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::ServiceList);
+        assert!(
+            app.exit_reason().is_none(),
+            "esc dismisses, it does not quit"
+        );
     }
 
     #[test]
