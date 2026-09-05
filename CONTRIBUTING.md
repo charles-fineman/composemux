@@ -75,7 +75,13 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --no-default-features   # clipboard fallback is optional
-scripts/check-docstrings.py         # functions you touched need doc comments
+```
+
+One more runs on pull requests, on Ubuntu only, and is worth running before you
+push:
+
+```sh
+scripts/check-docstrings.py         # declarations you touched need doc comments
 ```
 
 ## Docstrings

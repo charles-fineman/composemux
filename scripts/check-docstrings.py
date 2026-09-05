@@ -56,7 +56,15 @@ def touched_lines(base: str) -> dict[str, set[int]]:
         for hunk in HUNK.finditer(diff):
             start = int(hunk.group(1))
             count = int(hunk.group(2) or 1)
-            lines.update(range(start, start + count))
+            if count:
+                lines.update(range(start, start + count))
+            else:
+                # A pure deletion: nothing on the new side, so the range would
+                # be empty and the change would count as touching nothing.
+                # Deleting a doc comment is exactly that shape, and it is the
+                # one edit that makes a surviving declaration undocumented, so
+                # take the lines either side of where the removal happened.
+                lines.update((start, start + 1))
         if lines:
             touched[path] = lines
     return touched
@@ -72,7 +80,11 @@ def undocumented() -> list[tuple[str, int, str]]:
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0 and not result.stdout:
+    if result.returncode != 0:
+        # Unconditionally, not only when stdout is empty: a build failure
+        # still emits JSON, so a run that found no missing-docs diagnostic
+        # because it never got as far as checking would otherwise report
+        # success.
         print(result.stderr, file=sys.stderr)
         raise SystemExit("cargo clippy failed; fix the build first")
 
