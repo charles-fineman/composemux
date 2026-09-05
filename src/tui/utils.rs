@@ -124,6 +124,18 @@ mod tests {
         }
     }
 
+    /// Every `ServiceStatus`, kept in one place next to the tests that sample
+    /// it: the property test draws from this rather than from an integer range,
+    /// so widening its coverage to a new variant means adding it here.
+    const ALL_STATUSES: [ServiceStatus; 6] = [
+        ServiceStatus::Running,
+        ServiceStatus::Success,
+        ServiceStatus::Failure,
+        ServiceStatus::Unhealthy,
+        ServiceStatus::Stopped,
+        ServiceStatus::NotStarted,
+    ];
+
     /// Like `timed`, for the scaled case where one name spans several rows.
     fn replica_of(name: &str, replica: u32, started_ms: i64) -> Service {
         Service {
@@ -207,26 +219,28 @@ mod tests {
         ];
         sort_services(&mut v);
         let names: Vec<_> = v.iter().map(|s| s.name.as_str()).collect();
+        // Active first -- sidecar is Unhealthy, which groups with Running by
+        // design -- then failed, then finished (Success and Stopped share a
+        // category), then never started; alphabetical inside each group.
         assert_eq!(
             names,
-            [
-                // Unhealthy is deliberately grouped with the active services.
-                "sidecar", "web",   // failed
-                "redis", // finished
-                "nginx", "postgres", // never started
-                "api", "cache",
-            ]
+            ["sidecar", "web", "redis", "nginx", "postgres", "api", "cache"]
         );
     }
 
     #[test]
     fn replicas_of_one_service_are_ordered_by_index() {
         // The higher replica started first, so the old start-time tie-break put
-        // web-2 above web-1 -- and the names tie, so nothing else orders these.
-        let mut v = vec![replica_of("web", 2, 1_000), replica_of("web", 1, 2_000)];
+        // api-2 above api-1. The second name keeps both axes in play: name has
+        // to outrank replica, or a scaled service's rows stop being adjacent.
+        let mut v = vec![
+            replica_of("api", 2, 1_000),
+            replica_of("web", 1, 2_000),
+            replica_of("api", 1, 3_000),
+        ];
         sort_services(&mut v);
         let keys: Vec<_> = v.iter().map(|s| (s.name.as_str(), s.replica)).collect();
-        assert_eq!(keys, [("web", 1), ("web", 2)]);
+        assert_eq!(keys, [("api", 1), ("api", 2), ("web", 1)]);
     }
 
     proptest! {
@@ -238,27 +252,23 @@ mod tests {
         /// the user's control, so re-dealing either must change nothing.
         #[test]
         fn neither_timestamps_nor_arrival_order_reach_the_screen(
-            statuses in prop::collection::vec(0usize..6, 1..8),
-            stamps_a in prop::collection::vec(0i64..1_000, 8),
-            stamps_b in prop::collection::vec(0i64..1_000, 8),
+            (statuses, stamps_a, stamps_b) in (1usize..8).prop_flat_map(|n| {
+                // All three are drawn at the same length, so widening the row
+                // count later cannot leave `deal` indexing off the end.
+                (
+                    prop::collection::vec(prop::sample::select(&ALL_STATUSES[..]), n),
+                    prop::collection::vec(0i64..1_000, n),
+                    prop::collection::vec(0i64..1_000, n),
+                )
+            }),
         ) {
-            let status_of = |i: usize| match i {
-                0 => ServiceStatus::Running,
-                1 => ServiceStatus::Success,
-                2 => ServiceStatus::Failure,
-                3 => ServiceStatus::Unhealthy,
-                4 => ServiceStatus::Stopped,
-                _ => ServiceStatus::NotStarted,
-            };
             // One distinct name per row, so (name, replica) is unique and the
             // ordering is total; only the timestamps and the deal differ.
             let deal = |stamps: &[i64], reversed: bool| {
                 let mut v: Vec<Service> = statuses
                     .iter()
                     .enumerate()
-                    .map(|(i, &s)| {
-                        timed(&format!("svc{i}"), status_of(s), stamps[i], Some(stamps[i]))
-                    })
+                    .map(|(i, &s)| timed(&format!("svc{i}"), s, stamps[i], Some(stamps[i])))
                     .collect();
                 if reversed {
                     v.reverse();
