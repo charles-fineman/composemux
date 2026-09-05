@@ -13,11 +13,20 @@ use docker::{DockerClient, LogSupervisor, SourceEvent};
 use futures::StreamExt;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tui::app::{Action, App, ExitReason, ServiceKey};
+
+// Only SIGINT has a windows counterpart (ctrl+c), so the other two would be
+// dead code there -- and CI runs clippy at `-D warnings` on windows too.
+#[cfg(unix)]
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
 
 /// Animation tick. Also paces the auto-exit countdown.
 const TICK: Duration = Duration::from_millis(100);
@@ -88,30 +97,53 @@ async fn run() -> Result<i32> {
         .or_else(project::detect)
         .context("could not determine a compose project name; pass --project")?;
 
-    let client = DockerClient::connect().await?;
-    let services = client.list_services(&project).await?;
-    if services.is_empty() {
-        let available = client.list_projects().await?;
-        if available.is_empty() {
-            bail!("no compose projects are running");
-        }
-        bail!(
-            "no services found for compose project '{project}'\navailable projects: {}",
-            available.join(", ")
-        );
-    }
-
     let cancel = CancellationToken::new();
-    install_signal_handlers(cancel.clone());
+    // -1 until a signal arrives, so a cancellation from any other source keeps
+    // its own exit reason.
+    let signal_exit = Arc::new(AtomicI32::new(-1));
+    // Installed before the first call to the daemon. Startup is not instant --
+    // it opens a connection, negotiates an API version and lists containers --
+    // and a daemon that is starting up or wedged can stall all three. Handling
+    // signals only after that left the slowest part of the program running
+    // under the default disposition.
+    install_signal_handlers(cancel.clone(), signal_exit.clone())?;
+
+    // Since tokio's handlers *replace* that default disposition, everything
+    // from here on has to be cancellable, or a signal would leave the process
+    // stalled against an unresponsive daemon with nothing left to kill it.
+    let startup = async {
+        let client = DockerClient::connect().await?;
+        let services = client.list_services(&project).await?;
+        if services.is_empty() {
+            let available = client.list_projects().await?;
+            if available.is_empty() {
+                bail!("no compose projects are running");
+            }
+            bail!(
+                "no services found for compose project '{project}'\navailable projects: {}",
+                available.join(", ")
+            );
+        }
+        Ok::<DockerClient, anyhow::Error>(client)
+    };
+    let client = tokio::select! {
+        // Biased, so a signal that lands as startup is failing still reports
+        // the signal. Under the default random poll order the startup branch
+        // could win when both are ready, and `result?` would return the
+        // startup error instead of the status the supervisor is waiting for.
+        biased;
+        _ = cancel.cancelled() => return Ok(exit_status(&signal_exit)),
+        result = startup => result?,
+    };
 
     // A full-screen UI is useless when output is piped, and would write escape
     // sequences into whatever is capturing it.
     if args.no_tui || !std::io::stdout().is_terminal() {
         fallback::run(&client, &project, cfg.tail, cancel).await?;
-        return Ok(0);
+        return Ok(exit_status(&signal_exit));
     }
 
-    run_tui(client, project, cfg, cancel).await
+    run_tui(client, project, cfg, cancel, signal_exit).await
 }
 
 async fn run_tui(
@@ -119,6 +151,7 @@ async fn run_tui(
     project: String,
     cfg: Config,
     cancel: CancellationToken,
+    signal_exit: Arc<AtomicI32>,
 ) -> Result<i32> {
     let client = Arc::new(client);
     let mut app = App::new(&project, &cfg);
@@ -126,7 +159,9 @@ async fn run_tui(
     let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(4096);
     let supervisor = LogSupervisor::new(&client, &project, cfg.tail, log_tx);
     let supervisor_cancel = cancel.clone();
-    tokio::spawn(async move { supervisor.run(supervisor_cancel).await });
+    spawn_supervised(cancel.clone(), async move {
+        supervisor.run(supervisor_cancel).await
+    });
 
     // Service status is polled rather than derived from events, so uptime and
     // health stay current even when nothing is happening.
@@ -155,7 +190,12 @@ async fn run_tui(
     tui::terminal::restore()?;
 
     let exit = result?;
-    Ok(exit.code())
+    // A signal outranks whatever the loop reported, so the status reflects how
+    // the process was actually asked to stop.
+    Ok(match signal_exit.load(Ordering::SeqCst) {
+        signo if signo > 0 => ExitReason::Signal(signo).code(),
+        _ => exit.code(),
+    })
 }
 
 fn spawn_refresher(
@@ -166,7 +206,8 @@ fn spawn_refresher(
     refresh: Arc<Notify>,
     cancel: CancellationToken,
 ) {
-    tokio::spawn(async move {
+    let watchdog = cancel.clone();
+    spawn_supervised(watchdog, async move {
         loop {
             if let Ok(mut services) = client.list_services(&project).await {
                 services.retain(|s| cfg.is_visible(&s.name));
@@ -304,29 +345,81 @@ fn handle_action(app: &mut App, area: ratatui::layout::Rect) -> Result<()> {
     Ok(())
 }
 
-/// Ctrl-C and SIGTERM both need the terminal restored before we exit, or the
-/// calling CLI inherits a raw-mode terminal.
-fn install_signal_handlers(cancel: CancellationToken) {
+/// Every terminating signal needs the terminal restored before we exit, or the
+/// calling script inherits a raw-mode terminal on the alternate screen.
+///
+/// `SIGINT` is trapped even though `ctrl+c` never produces one here -- raw mode
+/// suppresses `ISIG`, so it arrives as a key event. A `SIGINT` sent any other
+/// way (`kill -INT`, a process supervisor, a CI harness) would otherwise take
+/// the default disposition and skip restoration entirely.
+///
+/// The number is recorded so the exit status can follow `128 + signo`, letting
+/// a supervisor tell its own shutdown from a user quitting.
+/// The status to exit with, given whichever signal was recorded.
+///
+/// `128 + signo` is what a shell reports for a signalled child, so a
+/// supervisor can tell a terminating signal from a user pressing `q`.
+fn exit_status(signal_exit: &AtomicI32) -> i32 {
+    match signal_exit.load(Ordering::SeqCst) {
+        signo if signo > 0 => 128 + signo,
+        _ => 0,
+    }
+}
+
+/// Registers the terminating signals, then waits for one in the background.
+///
+/// Registration happens before this returns, not inside the spawned task.
+/// `tokio::spawn` only queues work: the receivers would not exist until the
+/// runtime first polled that task, and until they do the default disposition
+/// is still in force -- so a signal arriving in the gap would kill the process
+/// outright, which is the whole outcome this exists to avoid. The wait itself
+/// is what goes in the background.
+fn install_signal_handlers(cancel: CancellationToken, signal_exit: Arc<AtomicI32>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut int = signal(SignalKind::interrupt()).context("could not handle SIGINT")?;
+        let mut term = signal(SignalKind::terminate()).context("could not handle SIGTERM")?;
+        let mut hup = signal(SignalKind::hangup()).context("could not handle SIGHUP")?;
+        tokio::spawn(async move {
+            let signo = tokio::select! {
+                _ = int.recv() => SIGINT,
+                _ = term.recv() => SIGTERM,
+                _ = hup.recv() => SIGHUP,
+            };
+            signal_exit.store(signo, Ordering::SeqCst);
+            cancel.cancel();
+        });
+    }
+    #[cfg(windows)]
+    {
+        // The same eager registration: `tokio::signal::ctrl_c` is a future
+        // that registers on first poll, which is the race this avoids.
+        let mut ctrl_c = tokio::signal::windows::ctrl_c().context("could not handle ctrl+c")?;
+        tokio::spawn(async move {
+            let _ = ctrl_c.recv().await;
+            signal_exit.store(SIGINT, Ordering::SeqCst);
+            cancel.cancel();
+        });
+    }
+    // Anywhere else there is nothing to register, and the default disposition
+    // stands. Every target we ship is unix or windows.
+    Ok(())
+}
+
+/// Runs a background task, bringing the whole program down if it panics.
+///
+/// A panic inside a spawned task fires the process-wide panic hook -- which
+/// restores the terminal -- while the render loop keeps drawing onto what is now
+/// the primary screen in cooked mode, and never exits. Cancelling turns that
+/// into a deliberate shutdown.
+fn spawn_supervised<F>(cancel: CancellationToken, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(task);
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            tokio::select! {
-                _ = term.recv() => cancel.cancel(),
-                _ = hup.recv() => cancel.cancel(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+        if handle.await.is_err() {
             cancel.cancel();
         }
     });

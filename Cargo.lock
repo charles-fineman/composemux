@@ -412,6 +412,8 @@ dependencies = [
  "terminal-colorsaurus",
  "tokio",
  "tokio-util",
+ "unicode-segmentation",
+ "unicode-width",
  "vt100",
 ]
 

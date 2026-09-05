@@ -59,15 +59,20 @@ pub enum ExitReason {
     Quit,
     Interrupt,
     AutoExit,
+    /// Terminated by a signal, carrying its number so the exit status can
+    /// follow the `128 + signo` convention a supervisor expects.
+    Signal(i32),
 }
 
 impl ExitReason {
     /// Exit status handed back to the wrapping CLI.
     pub fn code(self) -> i32 {
         match self {
-            // 130 is the conventional status for death by SIGINT, letting a
-            // caller tell a deliberate quit from an interrupt.
+            // ctrl+c never reaches us as a signal -- raw mode suppresses ISIG,
+            // so it arrives as a key -- but a caller still expects the status a
+            // real SIGINT would have produced.
             ExitReason::Interrupt => 130,
+            ExitReason::Signal(signo) => 128 + signo,
             ExitReason::Quit | ExitReason::AutoExit => 0,
         }
     }
@@ -531,6 +536,23 @@ impl App {
         if self.has_visible_panes() {
             self.focus.set_base(Focus::Pane(0));
         }
+    }
+
+    /// Pane slots holding a service, in order.
+    ///
+    /// The layout allocates one rect per occupied slot, so a renderer has to map
+    /// rect position to slot through this rather than assuming they match.
+    /// Pinning only to pane 2 leaves slot 0 empty and produces a single rect.
+    pub fn occupied_panes(&self) -> Vec<usize> {
+        self.panes_with_content()
+    }
+
+    /// Looks a service up regardless of the filter.
+    ///
+    /// A pinned pane keeps streaming a service the filter has hidden, so its
+    /// header must not be resolved through the visible rows.
+    pub fn service_row(&self, key: &ServiceKey) -> Option<&Row> {
+        self.all.iter().find(|r| &r.key == key)
     }
 
     fn panes_with_content(&self) -> Vec<usize> {
@@ -1247,6 +1269,13 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert_eq!(app.exit_reason(), Some(ExitReason::Quit));
         assert_eq!(app.exit_reason().unwrap().code(), 0);
+    }
+
+    #[test]
+    fn a_signal_exit_follows_the_128_plus_signo_convention() {
+        assert_eq!(ExitReason::Signal(2).code(), 130); // SIGINT
+        assert_eq!(ExitReason::Signal(15).code(), 143); // SIGTERM
+        assert_eq!(ExitReason::Signal(1).code(), 129); // SIGHUP
     }
 
     #[test]
