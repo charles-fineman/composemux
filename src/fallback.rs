@@ -425,11 +425,15 @@ mod tests {
     }
 
     impl Write for Sink {
+        /// Keeps every byte, so a test can assert on what was written rather
+        /// than only that writing succeeded.
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.written.extend_from_slice(buf);
             Ok(buf.len())
         }
 
+        /// Counts rather than discards: whether the loop flushes is itself
+        /// under test, since a piped reader sees nothing until it does.
         fn flush(&mut self) -> io::Result<()> {
             self.flushes += 1;
             Ok(())
@@ -437,6 +441,7 @@ mod tests {
     }
 
     impl Sink {
+        /// What was written, split into lines for comparison.
         fn lines(&self) -> Vec<String> {
             String::from_utf8_lossy(&self.written)
                 .lines()
@@ -455,10 +460,14 @@ mod tests {
     }
 
     impl Stream {
+        /// Everything printed so far, in order.
         fn lines(&self) -> Vec<String> {
             self.out.lines()
         }
 
+        /// Feeds one container's output through the same call the run loop
+        /// makes, so interleaving two containers here interleaves them the
+        /// way the daemon would.
         fn emit(&mut self, service: &str, replica: u32, bytes: &[u8]) {
             handle_output(
                 &mut self.assemblers,
@@ -562,10 +571,13 @@ mod tests {
         struct Closed;
 
         impl Write for Closed {
+            /// Always fails, standing in for the reader having gone away --
+            /// `head` closing the pipe is the ordinary case here.
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
             }
 
+            /// Succeeds, so a failure can only have come from the write.
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
             }
@@ -596,11 +608,14 @@ mod tests {
         }
 
         impl Write for FlushFails {
+            /// Succeeds, so the error under test can only be the flush.
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 self.written.extend_from_slice(buf);
                 Ok(buf.len())
             }
 
+            /// Fails after the write already succeeded -- the case that gets
+            /// swallowed if the flush's result is discarded.
             fn flush(&mut self) -> io::Result<()> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
             }
