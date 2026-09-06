@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 12 left to document
 //! Which element has the keyboard.
 //!
 //! Ported from nx `packages/nx/src/native/tui/app.rs`

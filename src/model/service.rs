@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 16 left to document
 //! The domain model: a compose service and its runtime status.
 //!
 //! `ServiceStatus` mirrors nx's `TaskStatus` so that the status→colour and

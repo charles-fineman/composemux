@@ -77,6 +77,31 @@ cargo test
 cargo build --no-default-features   # clipboard fallback is optional
 ```
 
+## Docstrings
+
+Every item needs a doc comment, public and private alike. That takes two lints,
+both enabled at the crate root: `missing_docs` covers the public ones and
+`clippy::missing_docs_in_private_items` covers the rest, which in a binary
+crate is nearly everything. The `cargo clippy -- -D warnings` you already run
+enforces both, so there is no separate tool and nothing extra to remember.
+
+Files that predate the rule carry an allow at the top, with a count:
+
+```rust
+#![allow(clippy::missing_docs_in_private_items)] // 59 left to document
+```
+
+Deleting one of those lines, once its file is documented, is how the backlog
+gets paid down. Adding a new one is not on: a new file starts documented.
+
+Never put one in a `mod.rs`. An inner attribute there applies to the whole
+subtree, so it exempts every file under it -- including files nobody has
+written yet, which is how a rule like this quietly stops applying.
+
+Write why the item exists, not what it does -- and only what is true of it. An
+out-of-date comment is treated as a defect here, not a tidiness issue, so an
+accurate short line beats a thorough stale one.
+
 ## Tests
 
 The suite is the safety net that makes a port maintainable: it's what stops an

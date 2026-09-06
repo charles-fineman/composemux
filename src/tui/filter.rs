@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 11 left to document
 //! The service-list filter opened with `/`.
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/search_filter.rs`

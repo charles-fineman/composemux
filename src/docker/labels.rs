@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 3 left to document
 //! Compose v2 container labels.
 //!
 //! Declared here rather than pulled from `docker/compose` as a dependency:

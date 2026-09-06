@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 20 left to document
 //! Log streaming and container supervision.
 //!
 //! One task per container reads its log stream into a shared channel. A
