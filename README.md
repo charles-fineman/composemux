@@ -105,8 +105,8 @@ is.
 | `Home` / `End` | Jump to the start or end |
 | `c` | Copy the buffer to the clipboard |
 | `enter` | Full screen: this pane takes the frame, list and all |
-| `esc` | Leave full screen |
-| `esc` (again) | Back to the service list, if the list is showing |
+| `esc` | Leave full screen if it's on, otherwise back to the service list |
+| `esc` (again) | After full screen: back to the service list, if it's showing |
 
 **Anywhere:** `?` help · `q` quit · `ctrl+c` interrupt · `F10` toggle mouse
 capture.
