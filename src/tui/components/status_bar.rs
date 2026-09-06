@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 7 left to document
 //! The bottom bar: progress on the left, context in the middle, keys on the right.
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/status_bar.rs` and

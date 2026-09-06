@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 59 left to document
 //! Application state and key dispatch.
 //!
 //! Ported from nx `packages/nx/src/native/tui/app.rs`

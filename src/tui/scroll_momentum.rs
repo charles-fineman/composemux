@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 13 left to document
 //! Accelerating scroll, shared by the keyboard and the mouse wheel.
 //!
 //! Ported from nx `packages/nx/src/native/tui/scroll_momentum.rs`

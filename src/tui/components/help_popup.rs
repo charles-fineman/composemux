@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 1 left to document
 //! The `?` popup listing every binding.
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/help_popup.rs`

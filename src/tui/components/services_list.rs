@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 11 left to document
 //! The service list (nx's task list).
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/tasks_list.rs`

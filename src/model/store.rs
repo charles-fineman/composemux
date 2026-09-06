@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 13 left to document
 //! Per-service log buffer.
 //!
 //! Container output is fed straight into a `vt100` terminal emulator, the same
