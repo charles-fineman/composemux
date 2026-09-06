@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 25 left to document
 //! Frame geometry: where the service list, the output panes and the status bar go.
 //!
 //! Ported from nx `packages/nx/src/native/tui/components/layout_manager.rs`

@@ -1,0 +1,24 @@
+# Repository configuration for the CodeRabbit reviewer.
+#
+# `inheritance: true` is load-bearing and must stay. Configuration does not
+# merge by default: without it, this file *replaces* the organisation settings
+# for this repository, and every key it does not mention silently reverts to a
+# schema default -- the review profile, the other pre-merge checks, tools and
+# path filters included. With it, only the keys below change.
+inheritance: true
+
+reviews:
+  pre_merge_checks:
+    # Documentation is enforced by clippy::missing_docs_in_private_items at the
+    # crate root, which the `cargo clippy -- -D warnings` job already runs.
+    #
+    # That gate is broader than this check -- it covers fields, enum variants
+    # and constants, not only functions -- and, more to the point, it runs
+    # before a push. This one reports after one, and scopes changes by a rule
+    # that is not documented, so a contributor could not reproduce a failure
+    # locally. Two graders for one concern, and only one of them is reachable
+    # from a developer's machine, so the reachable one keeps the job.
+    docstrings:
+      # Quoted deliberately: unquoted `off` is a YAML 1.1 boolean, and this
+      # field takes the string.
+      mode: "off"

@@ -1,3 +1,4 @@
+#![allow(clippy::missing_docs_in_private_items)] // 9 left to document
 //! Configuration file and CLI arguments.
 //!
 //! The config file is optional. Unknown keys are rejected rather than ignored,
