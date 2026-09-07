@@ -423,6 +423,21 @@ fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>
         SourceEvent::Output {
             service,
             replica,
+            // Ignored on purpose. A pane's buffer is keyed on
+            // `(service, replica)` and is meant to outlive the container: that
+            // shared buffer is what lets a pane keep its history when compose
+            // recreates the container behind it. #46 turned down keying it on
+            // the ID, proposed as #36, for exactly that reason -- it would
+            // hand every recreate a fresh empty buffer and discard the history
+            // that surviving a recreate is the point of.
+            //
+            // Which is not to say this path is free of #50. It holds a partial
+            // line too, as a row its emulator's cursor is part way along
+            // rather than as a byte buffer, and a recreate splices into it the
+            // same way. Ending that row without discarding the buffer is a
+            // different mechanism in `LogStore`; #60 tracks it, and the field
+            // ignored here is the identity that fix would read.
+            container: _,
             bytes,
         } => app.ingest(ServiceKey::new(service, replica), &bytes),
         SourceEvent::Topology => refresh.notify_one(),
@@ -559,6 +574,7 @@ mod tests {
             SourceEvent::Output {
                 service: "api".into(),
                 replica: 1,
+                container: "api-1".into(),
                 bytes: b"hello\r\n".to_vec(),
             },
             &refresh,
