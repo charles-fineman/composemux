@@ -130,9 +130,9 @@ fn context_line(app: &App) -> Line<'static> {
     if let Some(outage) = app.daemon_outage() {
         // Two notes, because they send the user to different places: an
         // unreachable daemon is one to start, where one that is not answering
-        // is already running and will not be helped by restarting anything
-        // here. Calling the second "unreachable" would be untrue -- the
-        // connection was accepted.
+        // has taken the request and gone quiet, and is very likely running.
+        // Calling that one "unreachable" would send the user to check
+        // something that is probably fine.
         return Line::from(Span::styled(
             match outage {
                 Outage::Unreachable => "Docker daemon unreachable - retrying",

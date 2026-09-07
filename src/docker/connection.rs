@@ -23,17 +23,18 @@ const FAILURES_BEFORE_UNREACHABLE: u32 = 3;
 /// Why the daemon is not being heard from.
 ///
 /// Worth telling apart because the user acts on them differently: a socket
-/// that is not there is a daemon to start, where one that accepts a request
-/// and then goes quiet is a daemon that is running and wedged, and restarting
-/// the tool will not help. Saying "unreachable" about the second would be
-/// plainly untrue -- the connection was made.
+/// that refuses is a daemon to start, where one that takes the request and
+/// then goes quiet is a daemon that is very likely running and wedged, and
+/// restarting the tool will not help. Calling the second "unreachable" would
+/// send the user to check something that is probably fine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outage {
     /// The request itself failed: the socket was refused or cut, or the
     /// daemon answered with an error. Nothing came back.
     Unreachable,
-    /// The request was accepted and has been outstanding longer than the
-    /// poller is willing to wait for it.
+    /// The request has been outstanding longer than the poller is willing to
+    /// wait for it, without either answering or failing. The daemon may be
+    /// wedged, or merely slower than anything we would call healthy.
     NotAnswering,
 }
 

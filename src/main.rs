@@ -80,9 +80,11 @@ const MIN_REFRESH: Duration = Duration::from_millis(500);
 /// 200ms, worst single sample 7.1s. A 60-container project cost 0.8s, 1.4s and
 /// 3.0s. So ten seconds is already longer than any honest poll observed --
 /// and one overrun says nothing on its own, since `FAILURES_BEFORE_UNREACHABLE`
-/// wants three. The note therefore needs one request to have been outstanding
-/// for thirty seconds, which is fifteen missed refreshes and four times the
-/// slowest honest poll measured.
+/// wants three. So a daemon that goes quiet while it is being polled is not
+/// called out until one request has been outstanding for thirty seconds --
+/// fifteen missed refreshes, and four times the slowest honest poll measured.
+/// (A hang that follows failures already on the count is called out sooner,
+/// which is right: the daemon has been failing that whole time.)
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most log messages folded into one redraw. Without a cap, a service logging
 /// faster than we can render would keep the drain loop from ever returning, and
@@ -312,7 +314,9 @@ async fn refresh_loop<S: ServiceSource>(
             _ = cancel.cancelled() => return,
             waited = tokio::time::timeout(POLL_TIMEOUT, &mut inflight) => waited,
         };
-        let answered = waited.is_ok();
+        // Whether the request itself finished, which an error counts as and
+        // an overrun does not. Read after `waited` is consumed below.
+        let request_finished = waited.is_ok();
         let outcome = match waited {
             Ok(Ok(mut services)) => {
                 services.retain(|s| cfg.is_visible(&s.name));
@@ -338,7 +342,7 @@ async fn refresh_loop<S: ServiceSource>(
                 return;
             }
         }
-        if !answered {
+        if !request_finished {
             // The request is still out there. Go back to waiting on it rather
             // than resting, so the round that finally carries an answer is not
             // delayed by a rest the daemon has already made us take.
