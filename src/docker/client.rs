@@ -51,7 +51,8 @@ impl DockerClient {
     /// One construction rather than one per caller, because
     /// [`list_container_keys`](Self::list_container_keys) is only comparable
     /// with what [`list_services`](Self::list_services) reports if the two ask
-    /// the daemon the same question. Copies twenty lines apart drift.
+    /// the daemon the same question. Separate copies read as obviously alike
+    /// and sit far enough apart to stop being so without anyone noticing.
     fn project_containers(project: Option<&str>) -> ListContainersOptions {
         let label = match project {
             Some(project) => format!("{}={}", labels::PROJECT, project),
@@ -225,8 +226,10 @@ fn is_transient(summary: &ContainerSummary) -> bool {
 /// Whether a container is one compose created for a one-off `run` or a
 /// lifecycle hook. Both are ephemeral and would otherwise churn the sidebar.
 ///
-/// Module-local now that `container_key` is the one place the filter is
-/// applied on this file's behalf and on `LogSupervisor::resync`'s.
+/// Module-local again: `container_key` is now the only caller outside this
+/// file's own `is_transient`, so `LogSupervisor::resync` no longer reaches for
+/// it directly. Within this file it still has two application sites --
+/// `is_transient`, which `list_services` filters through, and `container_key`.
 fn is_transient_labels(labels_map: &HashMap<String, String>) -> bool {
     labels_map.get(labels::ONEOFF).is_some_and(|v| v == "True")
         || labels_map.contains_key(labels::HOOK)
