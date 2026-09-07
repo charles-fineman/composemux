@@ -150,7 +150,15 @@ impl DockerClient {
 /// Kept free of I/O for the same reason [`build_service`] is: the label
 /// mapping is the part that can be wrong, and it is worth reaching without a
 /// daemon.
-fn container_key(summary: &ContainerSummary) -> Option<(String, u32)> {
+///
+/// Shared with `LogSupervisor::resync` rather than written twice. The
+/// fallback's reclaim compares what this reports against the keys the log
+/// streams are delivered under, so the two have to agree exactly: a container
+/// one of them called replica 0 while the other called it 1 would look
+/// departed for the whole run, and its held line would be cut in half every
+/// time the reclaim came round. One definition is what makes that agreement
+/// structural instead of a convention nothing checks.
+pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)> {
     // Rejected the way `resync` and `build_service` reject it. Neither can do
     // anything with an entry that has no id, so one reported alive here would
     // be a key no log stream is ever delivered under.
@@ -216,7 +224,10 @@ fn is_transient(summary: &ContainerSummary) -> bool {
 
 /// Whether a container is one compose created for a one-off `run` or a
 /// lifecycle hook. Both are ephemeral and would otherwise churn the sidebar.
-pub fn is_transient_labels(labels_map: &HashMap<String, String>) -> bool {
+///
+/// Module-local now that `container_key` is the one place the filter is
+/// applied on this file's behalf and on `LogSupervisor::resync`'s.
+fn is_transient_labels(labels_map: &HashMap<String, String>) -> bool {
     labels_map.get(labels::ONEOFF).is_some_and(|v| v == "True")
         || labels_map.contains_key(labels::HOOK)
 }

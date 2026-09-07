@@ -1861,8 +1861,9 @@ mod tests {
 
     /// An empty map has nothing to reclaim whatever the answer would have
     /// been, so the listing is skipped rather than issued and discarded. The
-    /// supervisor sends a topology event as soon as it starts, before any
-    /// container has spoken, so this is the common case and not a corner.
+    /// supervisor sends a topology event as soon as it starts, before a
+    /// container has normally had time to speak, so this is the common case
+    /// and not a corner.
     #[tokio::test]
     async fn a_topology_event_with_nothing_held_does_not_list_the_daemon() {
         let (tx, mut rx) = mpsc::channel(8);
