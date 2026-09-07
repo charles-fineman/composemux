@@ -1,4 +1,3 @@
-#![allow(clippy::missing_docs_in_private_items)] // 2 left to document
 //! Plain streaming for when stdout isn't a terminal.
 //!
 //! The wrapping CLI may run in CI or with output piped, where a full-screen UI
@@ -43,6 +42,7 @@ const _: () = assert!(MAX_CHUNK_BYTES < MAX_PARTIAL);
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
 #[derive(Default)]
 struct LineAssembler {
+    /// Bytes of a line whose newline has not arrived yet.
     partial: Vec<u8>,
 }
 
@@ -85,6 +85,33 @@ impl LineAssembler {
         self.partial.extend_from_slice(rest);
         lines
     }
+
+    /// Takes the unterminated tail the assembler is holding, if there is one.
+    ///
+    /// `push` emits only on a newline, so a stream that stops mid-line leaves
+    /// its last bytes here with nothing left that could ever terminate them.
+    /// At that point the choice is between printing them and losing them, and
+    /// this exists so the caller can print them.
+    ///
+    /// Nothing is trimmed. `push` strips the terminator it *found*; there is
+    /// none here to strip, so a trailing `\r` is a byte the container actually
+    /// wrote and is kept -- the same rule the cap flush already follows.
+    fn finish(&mut self) -> Option<String> {
+        if self.partial.is_empty() {
+            return None;
+        }
+        let held = std::mem::take(&mut self.partial);
+        Some(String::from_utf8_lossy(&held).into_owned())
+    }
+}
+
+/// The `service-replica` label a line is prefixed with.
+///
+/// One place, because the shutdown drain has to reproduce exactly the prefix
+/// the same container's earlier lines were written under; two `format!` calls
+/// could drift apart and relabel a container's last line.
+fn container_label(service: &str, replica: u32) -> String {
+    format!("{service}-{replica}")
 }
 
 /// Pads service names so the prefixes line up, the way `docker compose logs`
@@ -92,6 +119,7 @@ impl LineAssembler {
 /// front; earlier lines keep the width they were written at.
 #[derive(Default)]
 struct Prefixes {
+    /// Widest service label seen so far, in terminal columns.
     width: usize,
 }
 
@@ -140,7 +168,7 @@ fn handle_output(
     // relabelled. The TUI can afford count-dependent names because it redraws
     // the whole list from the current topology on every frame; a log stream
     // has no way to revise what it has already emitted.
-    let label = format!("{service}-{replica}");
+    let label = container_label(&service, replica);
     let prefix = prefixes.format(&label);
     // Keyed by replica as well as name. Two containers of a scaled service are
     // two independent streams, and a shared assembler splices the tail one of
@@ -157,8 +185,42 @@ fn handle_output(
     out.flush()
 }
 
+/// Writes the unterminated tail each of `removed` was still holding, as a line
+/// under the same prefix that container's earlier lines used.
+///
+/// Takes assemblers that have already been taken out of the map, because every
+/// caller is getting rid of them: emitting a tail and leaving the entry behind
+/// would print the same bytes twice if the entry were ever drained again.
+///
+/// The order is the map's, which is to say none: `HashMap` reseeds its
+/// iteration order per map, so several containers caught mid-line would come
+/// out in a different order on every run and no test could pin the output.
+/// Sorting by `(service, replica)` makes a shutdown reproducible and puts a
+/// scaled service's replicas in index order.
+fn emit_held_tails(
+    mut removed: Vec<((String, u32), LineAssembler)>,
+    prefixes: &mut Prefixes,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    removed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for ((service, replica), mut assembler) in removed {
+        if let Some(tail) = assembler.finish() {
+            let prefix = prefixes.format(&container_label(&service, replica));
+            writeln!(out, "{prefix}{tail}")?;
+        }
+    }
+    // Flushed even when nothing was emitted, for the same reason
+    // `handle_output` does it: the guarantee belongs to the function rather
+    // than to whichever `Write` the caller happened to pass.
+    out.flush()
+}
+
 /// Prints events from `rx` until the channel closes, `cancel` fires, or a
 /// write fails.
+///
+/// On the two clean exits it drains what the assemblers are still holding, so
+/// the last thing a container wrote is printed even when it never sent a
+/// closing newline.
 ///
 /// Split from [`run`] so the loop can be driven by a plain channel and a
 /// `Vec<u8>`. What stays in `run` -- opening the channel and spawning the
@@ -195,7 +257,12 @@ async fn stream_events(
             }
         }
     }
-    Ok(())
+    // Both loop exits above are `break`, so they land here; a failed write
+    // leaves through the `?` and skips this. That is deliberate rather than
+    // incidental: the write failed because the reader is gone, so the drain
+    // could only fail again, and its error would either be discarded or
+    // displace the one that actually ended the run.
+    emit_held_tails(assemblers.into_iter().collect(), &mut prefixes, out)
 }
 
 /// Streams every service's logs to stdout, one prefixed line at a time, until
@@ -434,6 +501,27 @@ mod tests {
         assert_eq!(a.push(b"-end\n"), vec!["two-end"]);
     }
 
+    /// The tail is handed back exactly as it was written. `push` strips the
+    /// terminator it found; there is none here, so a byte that merely looks
+    /// like one is part of what the container wrote.
+    #[test]
+    fn finish_hands_back_the_held_tail_untrimmed() {
+        let mut a = LineAssembler::default();
+        assert!(a.push(b"50%\r").is_empty(), "no newline, so nothing yet");
+        assert_eq!(a.finish().as_deref(), Some("50%\r"));
+        assert_eq!(a.finish(), None, "the tail is taken, not copied");
+    }
+
+    /// Holding nothing has to stay nothing: a drain that emitted an empty
+    /// tail would end every clean shutdown with a blank prefixed line per
+    /// container that had ever spoken.
+    #[test]
+    fn finish_holds_nothing_after_a_complete_line() {
+        let mut a = LineAssembler::default();
+        assert_eq!(a.push(b"done\n"), vec!["done"]);
+        assert_eq!(a.finish(), None);
+    }
+
     /// Service names are ASCII in practice, but the padding should be honest
     /// about what it measures.
     #[test]
@@ -552,6 +640,39 @@ mod tests {
                 .lines()
                 .map(str::to_string)
                 .collect()
+        }
+    }
+
+    /// A `Sink` the test and the loop can hold at once, so a test can watch
+    /// what has been written while the loop is still running.
+    #[derive(Clone, Default)]
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Sink>>);
+
+    impl Write for SharedSink {
+        /// Delegates to the shared sink.
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("no test panics holding this")
+                .write(buf)
+        }
+
+        /// Delegates to the shared sink, whose flush count is what a test
+        /// waits on to know an event has been handled.
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().expect("no test panics holding this").flush()
+        }
+    }
+
+    impl SharedSink {
+        /// What has been written so far, split into lines.
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("no test panics holding this").lines()
+        }
+
+        /// How many flushes have happened so far.
+        fn flushes(&self) -> usize {
+            self.0.lock().expect("no test panics holding this").flushes
         }
     }
 
@@ -830,5 +951,189 @@ mod tests {
         .expect_err("a broken pipe should surface");
 
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// The last thing a container writes before the stream ends is usually
+    /// unterminated -- `Error: exiting` with no newline -- and `push` holds it
+    /// by design. Dropping the map on the way out took it with it.
+    #[tokio::test]
+    async fn a_held_tail_is_printed_when_the_channel_closes() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"Error: exiting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(out.lines(), vec!["web-1  | Error: exiting"]);
+    }
+
+    /// The same tail, on the Ctrl-C exit rather than the channel-close one --
+    /// which is the case the issue reports, and a separate `break`.
+    #[tokio::test]
+    async fn a_held_tail_is_printed_when_cancellation_ends_the_loop() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let out = SharedSink::default();
+
+        let task = {
+            let mut out = out.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { stream_events(&mut rx, &cancel, &mut out).await })
+        };
+
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"Error: exiting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+
+        // The event completes no line, so the flush is the only sign it has
+        // been handled. Cancelling before it lands would leave the bytes in
+        // the channel rather than in an assembler, and test nothing.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while out.flushes() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the loop never handled the event");
+
+        assert!(
+            !tx.is_closed(),
+            "the sender was open, so only cancel can end the loop"
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancellation did not stop the loop")
+            .expect("the loop panicked")
+            .expect("writing to a Vec cannot fail");
+
+        assert_eq!(out.lines(), vec!["web-1  | Error: exiting"]);
+    }
+
+    /// Several containers caught mid-line at once have to come out in a fixed
+    /// order. `HashMap` reseeds its iteration order per map, so an unsorted
+    /// drain would order these differently on nearly every run; repeating the
+    /// whole scenario turns that from a rare flake into a certain failure.
+    #[tokio::test]
+    async fn held_tails_are_drained_in_a_stable_order() {
+        let expected = vec![
+            "api-1  | a",
+            "api-2  | b",
+            "db-1   | c",
+            "web-1  | d",
+            "web-2  | e",
+        ];
+
+        for _ in 0..50 {
+            let (tx, mut rx) = mpsc::channel(16);
+            // Sent in an order that is neither the sorted one nor its reverse.
+            for (service, replica, byte) in [
+                ("web", 2u32, "e"),
+                ("api", 1, "a"),
+                ("db", 1, "c"),
+                ("web", 1, "d"),
+                ("api", 2, "b"),
+            ] {
+                tx.send(SourceEvent::Output {
+                    service: service.to_string(),
+                    replica,
+                    bytes: byte.as_bytes().to_vec(),
+                })
+                .await
+                .expect("the receiver is alive");
+            }
+            drop(tx);
+
+            let mut out = Sink::default();
+            let cancel = CancellationToken::new();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                stream_events(&mut rx, &cancel, &mut out),
+            )
+            .await
+            .expect("the loop did not stop when the last sender was dropped")
+            .expect("writing to a Vec cannot fail");
+
+            assert_eq!(out.lines(), expected, "the drain order moved between runs");
+        }
+    }
+
+    /// A sink that fails every write and counts the attempts, so a test can
+    /// tell one failed write from a drain that tried again after it.
+    #[derive(Default)]
+    struct CountingClosed {
+        /// How many writes have been attempted.
+        attempts: usize,
+    }
+
+    impl Write for CountingClosed {
+        /// Counts the attempt, then fails the way a closed pipe does.
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader gone"))
+        }
+
+        /// Succeeds, so a failure can only have come from a write.
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The write-failure exit must not drain. The reader has gone, so every
+    /// drained line would fail too, and that second error would either be
+    /// discarded or displace the one that actually ended the run.
+    #[tokio::test]
+    async fn a_failed_write_does_not_go_on_to_drain() {
+        let (tx, mut rx) = mpsc::channel(4);
+        // Held back, so it writes nothing yet but leaves a tail to drain.
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"held".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        // Completes a line, so this is the write that fails.
+        tx.send(SourceEvent::Output {
+            service: "api".to_string(),
+            replica: 1,
+            bytes: b"a line\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+
+        let mut out = CountingClosed::default();
+        let cancel = CancellationToken::new();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, &mut out),
+        )
+        .await
+        .expect("the loop did not stop on a write failure")
+        .expect_err("a broken pipe should surface");
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            out.attempts, 1,
+            "the drain wrote again after the reader had gone"
+        );
     }
 }
