@@ -1194,7 +1194,51 @@ mod tests {
         );
     }
 
-    /// A released store keeps ingesting, and the point is that what it ingests
+    /// A service that has produced nothing still runs an emulator at the
+    /// default geometry and still pays for it. Releasing has to reach those
+    /// too, or the idle floor -- one 24x80 grid per silent service -- never
+    /// comes down, which is most of what a large stack costs before anyone
+    /// opens a pane at all.
+    #[test]
+    fn a_store_that_has_never_had_output_still_releases() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        assert_eq!(s.screen().size(), (INITIAL_ROWS, INITIAL_COLS));
+
+        s.release();
+
+        assert_eq!(s.screen().size(), (MIN_ROWS, MIN_COLS));
+    }
+
+    /// A released store is still the live buffer for its service: output keeps
+    /// arriving while no pane shows it, and all of it has to be there when the
+    /// pane comes back. So the retention budget has to stay sized for the pane
+    /// the store will return to, not for the minimal grid it is wearing in the
+    /// meantime -- a release that reset it would trim history away in the gap
+    /// between one poll and the next.
+    #[test]
+    fn output_arriving_while_released_is_retained_for_the_pane_it_returns_to() {
+        let mut s = LogStore::new(2);
+        s.resize(20, 40);
+        s.process(b"before\r\n");
+
+        s.release();
+        for i in 0..30 {
+            s.process(format!("while closed {i}\r\n").as_bytes());
+        }
+        s.resize(20, 40);
+
+        // Counted over the whole retained buffer rather than the visible rows:
+        // the budget is what is under test, and a pane's worth of rows would
+        // pass on a buffer trimmed to just under one screen.
+        let text = s.all_text();
+        let kept = text.lines().filter(|l| l.contains("while closed")).count();
+        assert!(
+            kept >= 15,
+            "only {kept} lines survived the closed period, of 30:\n{text}"
+        );
+    }
+
+    /// A released store keeps ingesting, and the point is that what it ingests    /// A released store keeps ingesting, and the point is that what it ingests
     /// stops costing anything until the service is looked at again. Released
     /// with its scrollback budget intact it would quietly refill -- 1000 rows
     /// at any width is hundreds of kilobytes, most of the saving handed back.
