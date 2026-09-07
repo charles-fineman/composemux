@@ -267,7 +267,7 @@ impl LogStore {
     /// Drops the emulator, keeping the bytes needed to rebuild it.
     ///
     /// A filled grid is `(scrollback + rows) x cols` cells of 32 bytes each --
-    /// 2.5 MB at the 24x80 default, 5.8 MB at 50x200, 15.5 MB at 60x500 --
+    /// 2.5 MB at the 24x80 default, 6.4 MB at 50x200, 16.2 MB at 60x500 --
     /// while the raw bytes it was built from are 75-220 kB for typical log
     /// lines. A service no pane is showing is holding the larger figure for a
     /// grid nothing reads, so this releases it and leaves `resize` to replay.
