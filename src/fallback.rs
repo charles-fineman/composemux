@@ -43,13 +43,19 @@ const _: () = assert!(MAX_CHUNK_BYTES < MAX_PARTIAL);
 /// Shortest gap between two attempts to reclaim assemblers.
 ///
 /// A topology event arrives on every container health check, not only when the
-/// container set changes, and each attempt costs a container list plus an
-/// inspect per container. Reclaiming is housekeeping: nothing is waiting on
-/// it, and until it happens the map is bounded by services times peak replica
-/// count. This path exists for CI and piped output, where the daemon has
-/// better things to answer than a poll per health check, so the reclaim runs
-/// at a leisurely rate rather than on every event.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+/// container set changes: `event_decision` classifies `health_status` as
+/// `NotifyOnly`, which sends one. Listing on each of those would put a Docker
+/// round trip on a path that until now made no daemon calls at all, and this
+/// one exists for CI and piped output.
+///
+/// Half a second, matching the floor the TUI's poller runs to. That poller
+/// lists unconditionally on a timer *and* inspects every container it finds;
+/// this lists only, and only when a topology event arrives, so it cannot be
+/// the heavier of the two. Going slower would be worse than it looks: a
+/// compose recreate finishes in well under a second, and a floor above that
+/// would step over the window in which a departed container is the one thing
+/// the listing would have reported.
+const PRUNE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
 #[derive(Default)]
@@ -119,9 +125,11 @@ impl LineAssembler {
 
 /// The `service-replica` label a line is prefixed with.
 ///
-/// One place, because the shutdown drain has to reproduce exactly the prefix
+/// One place, because the shutdown drain has to reproduce exactly the label
 /// the same container's earlier lines were written under; two `format!` calls
-/// could drift apart and relabel a container's last line.
+/// could drift apart and relabel a container's last line. The *prefix* is not
+/// reproduced and cannot be: `Prefixes` widens the column as names arrive, so
+/// a drained tail is padded to whatever width has accumulated by then.
 fn container_label(service: &str, replica: u32) -> String {
     format!("{service}-{replica}")
 }
@@ -214,7 +222,7 @@ fn emit_held_tails(
     prefixes: &mut Prefixes,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    removed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    removed.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     for ((service, replica), mut assembler) in removed {
         if let Some(tail) = assembler.finish() {
             let prefix = prefixes.format(&container_label(&service, replica));
@@ -237,9 +245,15 @@ fn emit_held_tails(
 ///
 /// A departed container's tail is printed rather than discarded, because
 /// discarding it is the very bug the shutdown drain exists to fix. Printing it
-/// here is safe because the stream is over by then: `list_services` lists
-/// stopped containers too, so a key leaves `live` only once the container has
-/// been removed, and nothing can arrive afterwards to complete the line.
+/// here is safe because the stream is effectively over by then: the listing
+/// reports stopped containers too, so a key leaves `live` only once the
+/// container has been removed, by which point its log file is gone.
+///
+/// Not quite an absolute. The topology event comes from the supervisor task
+/// while output comes from per-container tasks holding their own senders, so
+/// a final chunk that had been read but not yet sent can still arrive after
+/// the reclaim. It starts a fresh assembler and prints as a second line: one
+/// line split in two, no bytes lost, in a window microseconds wide.
 ///
 /// Synchronous and given the live set rather than the client, so the daemon
 /// call stays in the caller. Everything that can go wrong with the map itself
@@ -250,15 +264,14 @@ fn prune_assemblers(
     live: &HashSet<(String, u32)>,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let departed: Vec<(String, u32)> = assemblers
-        .keys()
-        .filter(|key| !live.contains(*key))
-        .cloned()
-        .collect();
-    let removed: Vec<((String, u32), LineAssembler)> = departed
-        .into_iter()
-        .filter_map(|key| assemblers.remove_entry(&key))
-        .collect();
+    let mut removed: Vec<((String, u32), LineAssembler)> = Vec::new();
+    assemblers.retain(|key, assembler| {
+        if live.contains(key) {
+            return true;
+        }
+        removed.push((key.clone(), std::mem::take(assembler)));
+        false
+    });
     if removed.is_empty() {
         // Nothing to say, so nothing to flush. A topology event arrives on
         // every health check and the usual answer is that every container is
@@ -275,8 +288,9 @@ fn prune_assemblers(
 /// On the two clean exits it drains what the assemblers are still holding, so
 /// the last thing a container wrote is printed even when it never sent a
 /// closing newline. `live_containers` reports the containers that still exist,
-/// or `None` if it could not find out; it is called on topology events to
-/// reclaim the assemblers of containers that are gone.
+/// or `None` if it could not find out. It is called to reclaim the assemblers
+/// of containers that are gone -- on topology events, but at most once every
+/// [`PRUNE_INTERVAL`] and never while nothing is held.
 ///
 /// Split from [`run`] so the loop can be driven by a plain channel and a
 /// `Vec<u8>`. What stays in `run` -- opening the channel and spawning the
@@ -295,8 +309,8 @@ where
 {
     let mut assemblers: HashMap<(String, u32), LineAssembler> = HashMap::new();
     let mut prefixes = Prefixes::default();
-    // Due immediately, so the supervisor's opening topology event reclaims
-    // anything left by a container that died before we attached.
+    // Due immediately, so the interval starts at the first topology event
+    // rather than being waited out before the first listing.
     let mut next_prune = tokio::time::Instant::now();
 
     loop {
@@ -324,7 +338,11 @@ where
                     // whole write path reachable from a test.
                     SourceEvent::Topology => {
                         let now = tokio::time::Instant::now();
-                        if now >= next_prune {
+                        // An empty map has nothing to reclaim whatever the
+                        // answer would have been, so asking is pure cost. It
+                        // is empty at the supervisor's opening event, which
+                        // is the one topology event guaranteed to arrive.
+                        if !assemblers.is_empty() && now >= next_prune {
                             // Moved on before the listing rather than after
                             // it, so a daemon that is refusing to answer is
                             // asked at the same leisurely rate as one that is.
@@ -351,7 +369,7 @@ where
             }
         }
     }
-    // Both loop exits above are `break`, so they land here; a failed write
+    // Every exit above is a `break`, so they all land here; a failed write
     // leaves through the `?` and skips this. That is deliberate rather than
     // incidental: the write failed because the reader is gone, so the drain
     // could only fail again, and its error would either be discarded or
@@ -386,11 +404,7 @@ pub async fn run(
         || async {
             // `None` on failure rather than an empty set: a listing that did
             // not answer must not be read as every container having gone.
-            client
-                .list_services(project)
-                .await
-                .ok()
-                .map(|services| services.into_iter().map(|s| (s.name, s.replica)).collect())
+            client.list_container_keys(project).await.ok()
         },
         &mut std::io::stdout(),
     )
@@ -751,8 +765,8 @@ mod tests {
         }
     }
 
-    /// A listing that never answers, so no pruning happens: for the tests
-    /// where topology is not what is under test.
+    /// A listing that fails, so no pruning happens: for the tests where
+    /// topology is not what is under test.
     async fn listing_unavailable() -> Option<HashSet<(String, u32)>> {
         None
     }
@@ -1380,12 +1394,13 @@ mod tests {
         }
     }
 
-    /// The reclaim hangs off topology, not off output: a container that is
-    /// gone gives up its held tail when the next topology event arrives,
-    /// rather than at the end of the run with everything else.
+    /// A container that is gone gives up its held tail when the topology
+    /// event arrives, rather than at the end of the run with everything else.
     ///
     /// The assertion is on the order. A drain at shutdown prints the same
     /// line, just later, so only what comes after it can tell the two apart.
+    /// What the reclaim hangs off is pinned separately, by
+    /// `output_alone_never_lists_the_daemon`.
     #[tokio::test]
     async fn a_topology_event_reclaims_a_departed_container() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -1479,7 +1494,9 @@ mod tests {
         tokio::time::pause();
 
         let (tx, mut rx) = mpsc::channel(16);
-        let listings = Listings::live(&[]);
+        // `api-1` stays alive throughout, so the map is never empty and never
+        // reclaimed: the only thing varying here is how often it is asked.
+        let listings = Listings::live(&[("api", 1)]);
         let out = SharedSink::default();
         let cancel = CancellationToken::new();
 
@@ -1492,6 +1509,15 @@ mod tests {
             })
         };
 
+        // Something has to be held before the topology events, or the empty-map
+        // gate would skip every listing and the count would say nothing.
+        tx.send(SourceEvent::Output {
+            service: "api".to_string(),
+            replica: 1,
+            bytes: b"seed\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
         for _ in 0..5 {
             tx.send(SourceEvent::Topology)
                 .await
@@ -1506,13 +1532,18 @@ mod tests {
         })
         .await
         .expect("the receiver is alive");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while out.lines().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the loop never handled the marker");
+        // Budgeted rather than timed. The clock is paused and this spin keeps
+        // the runtime busy, so it never goes idle, the virtual clock never
+        // auto-advances, and a `timeout` here could never fire -- a regression
+        // would hang the suite instead of failing it. A `sleep` would fire the
+        // timeout but would also advance the clock past `PRUNE_INTERVAL`,
+        // destroying the very thing being measured.
+        let mut budget = 10_000;
+        while out.lines().len() < 2 {
+            budget -= 1;
+            assert!(budget > 0, "the loop never handled the marker");
+            tokio::task::yield_now().await;
+        }
         assert_eq!(listings.calls(), 1, "one listing per topology event");
 
         // Past the interval, the next event lists again.
@@ -1588,5 +1619,267 @@ mod tests {
             vec!["web-1  | Error: exiting"],
             "the drain has to run on this exit too"
         );
+    }
+
+    /// A drained tail has to appear under the same column its container's
+    /// earlier lines used, so the drain is handed the loop's `Prefixes`
+    /// rather than a fresh one. A drain that started its own column would
+    /// print a run's last lines out of alignment with everything above them.
+    ///
+    /// Every other drain test uses labels of one width, where a fresh column
+    /// is indistinguishable from the shared one. This one does not.
+    #[tokio::test]
+    async fn a_drained_tail_keeps_the_column_the_run_was_written_at() {
+        let (tx, mut rx) = mpsc::channel(8);
+        // Held back, so it emits nothing -- but the name is known by then, and
+        // it is the longest, so the column is already wide when `db` speaks.
+        tx.send(SourceEvent::Output {
+            service: "gateway".to_string(),
+            replica: 12,
+            bytes: b"boot".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        tx.send(SourceEvent::Output {
+            service: "db".to_string(),
+            replica: 1,
+            bytes: b"ready\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        tx.send(SourceEvent::Output {
+            service: "db".to_string(),
+            replica: 1,
+            bytes: b"Error: exiting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, listing_unavailable, &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(
+            out.lines(),
+            vec![
+                "db-1        | ready",
+                "db-1        | Error: exiting",
+                "gateway-12  | boot",
+            ],
+            "the drain printed a tail out of alignment with the lines above it"
+        );
+    }
+
+    /// The drain writes, so the drain can fail. A reader that goes away
+    /// between the last event and the exit is the same broken pipe the loop
+    /// reports for any other write, and swallowing it would end the run `Ok`
+    /// while `run` documents a failed write as one of its three endings.
+    #[tokio::test]
+    async fn a_write_failure_in_the_shutdown_drain_is_returned() {
+        let (tx, mut rx) = mpsc::channel(4);
+        // Held back, so nothing is written until the drain runs.
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"Error: exiting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        let mut out = CountingClosed::default();
+        let cancel = CancellationToken::new();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, listing_unavailable, &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect_err("the drain's broken pipe should surface");
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(out.attempts, 1, "only the drained tail is written here");
+    }
+
+    /// The reclaim writes too, and its failure has to end the loop rather than
+    /// be dropped on the floor: the reader has gone, so the alternative is
+    /// writing to a dead pipe for the rest of the run.
+    #[tokio::test]
+    async fn a_write_failure_while_reclaiming_ends_the_loop() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"Error: exiting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        // `web-1` is gone, so this reclaims it and writes its tail.
+        tx.send(SourceEvent::Topology)
+            .await
+            .expect("the receiver is alive");
+        // Must never be reached: the write above already failed.
+        tx.send(SourceEvent::Output {
+            service: "api".to_string(),
+            replica: 1,
+            bytes: b"still here\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        let listings = Listings::live(&[("api", 1)]);
+        let mut out = CountingClosed::default();
+        let cancel = CancellationToken::new();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, || listings.list(), &mut out),
+        )
+        .await
+        .expect("the loop did not stop on a failed write")
+        .expect_err("the reclaim's broken pipe should surface");
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            out.attempts, 1,
+            "the loop went on writing after the reader had gone"
+        );
+    }
+
+    /// The drain flushes even having printed nothing, so the guarantee belongs
+    /// to the function rather than to whichever `Write` the caller passed.
+    /// `stream_events` takes an `impl Write`, and a buffered one would hold
+    /// the run's last line until something else happened to flush it.
+    #[test]
+    fn the_drain_flushes_even_with_nothing_to_print() {
+        let mut out = Sink::default();
+
+        emit_held_tails(Vec::new(), &mut Prefixes::default(), &mut out)
+            .expect("writing to a Vec cannot fail");
+
+        assert!(out.written.is_empty());
+        assert_eq!(out.flushes, 1, "the drain left the sink unflushed");
+    }
+
+    /// The interval runs from when a listing was asked for, not from when it
+    /// answered. Measuring it from the answer would back a slow -- or hanging
+    /// -- daemon off further than a quick one, which is backwards.
+    #[tokio::test]
+    async fn a_slow_listing_does_not_push_the_next_one_further_out() {
+        // Frozen, so the only time that passes is the listing's own.
+        tokio::time::pause();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        // Held, so the empty-map gate does not skip the listings.
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"held".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        // Two events, and each listing takes exactly one interval to answer,
+        // so the second is handled at the moment the interval comes round.
+        for _ in 0..2 {
+            tx.send(SourceEvent::Topology)
+                .await
+                .expect("the receiver is alive");
+        }
+        drop(tx);
+
+        let listings = Listings::live(&[("web", 1)]);
+        let slow = listings.clone();
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            stream_events(
+                &mut rx,
+                &cancel,
+                || {
+                    let slow = slow.clone();
+                    async move {
+                        let answer = slow.list().await;
+                        tokio::time::sleep(PRUNE_INTERVAL).await;
+                        answer
+                    }
+                },
+                &mut out,
+            ),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(
+            listings.calls(),
+            2,
+            "the interval was measured from the answer rather than the question"
+        );
+    }
+
+    /// Output is not the trigger. Reclaiming hangs off topology because that
+    /// is what says a container is gone, and asking the daemon per chunk of
+    /// log output would put a round trip on the hot path.
+    #[tokio::test]
+    async fn output_alone_never_lists_the_daemon() {
+        let (tx, mut rx) = mpsc::channel(8);
+        for bytes in [b"one\n".to_vec(), b"two".to_vec()] {
+            tx.send(SourceEvent::Output {
+                service: "web".to_string(),
+                replica: 1,
+                bytes,
+            })
+            .await
+            .expect("the receiver is alive");
+        }
+        drop(tx);
+
+        let listings = Listings::live(&[]);
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, || listings.list(), &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(listings.calls(), 0, "output asked the daemon a question");
+        assert_eq!(out.lines(), vec!["web-1  | one", "web-1  | two"]);
+    }
+
+    /// An empty map has nothing to reclaim whatever the answer would have
+    /// been, so the listing is skipped rather than issued and discarded. The
+    /// supervisor sends a topology event as soon as it starts, before any
+    /// container has spoken, so this is the common case and not a corner.
+    #[tokio::test]
+    async fn a_topology_event_with_nothing_held_does_not_list_the_daemon() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(SourceEvent::Topology)
+            .await
+            .expect("the receiver is alive");
+        drop(tx);
+
+        let listings = Listings::live(&[]);
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, || listings.list(), &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(listings.calls(), 0, "listed an empty map");
     }
 }

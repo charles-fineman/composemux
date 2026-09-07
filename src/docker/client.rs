@@ -11,7 +11,7 @@ use bollard::query_parameters::{InspectContainerOptions, ListContainersOptionsBu
 use bollard::Docker;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Inspect calls issued at once when refreshing the service list. Compose
 /// projects are small, but one round-trip per container in series is noticeably
@@ -81,6 +81,42 @@ impl DockerClient {
         Ok(services)
     }
 
+    /// The `(service, replica)` of every container in the project.
+    ///
+    /// [`list_services`](Self::list_services) inspects each container to fill
+    /// in status, health and timings. A caller that only needs to know which
+    /// containers exist would pay a round trip apiece for fields it throws
+    /// away, so this reads the identity off the list entry's labels and stops
+    /// there.
+    ///
+    /// Those are the same labels, filtered the same way, that
+    /// `LogSupervisor::resync` uses to decide what to attach to. Deriving the
+    /// two alike is what makes this answer comparable with the keys the log
+    /// streams are actually delivered under.
+    ///
+    /// `all(true)`, so a container that has stopped but has not been removed
+    /// is still reported. A key disappears from here only once the container
+    /// is gone for good.
+    pub async fn list_container_keys(&self, project: &str) -> Result<HashSet<(String, u32)>> {
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("{}={}", labels::PROJECT, project)],
+        );
+        let options = ListContainersOptionsBuilder::default()
+            .all(true)
+            .filters(&filters)
+            .build();
+
+        let summaries = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("could not list containers")?;
+
+        Ok(summaries.iter().filter_map(container_key).collect())
+    }
+
     /// Distinct compose project names visible to the daemon. Used to give a
     /// useful error when the requested project isn't running.
     pub async fn list_projects(&self) -> Result<Vec<String>> {
@@ -100,6 +136,26 @@ impl DockerClient {
         names.dedup();
         Ok(names)
     }
+}
+
+/// The `(service, replica)` a list entry belongs to, or `None` if it is not a
+/// container this tool follows.
+///
+/// Kept free of I/O for the same reason [`build_service`] is: the label
+/// mapping is the part that can be wrong, and it is worth reaching without a
+/// daemon.
+fn container_key(summary: &ContainerSummary) -> Option<(String, u32)> {
+    let labels_map = summary.labels.as_ref()?;
+    if is_transient_labels(labels_map) {
+        return None;
+    }
+    // Compose omits the number on an unscaled service, which is replica 1 --
+    // the same default `LogSupervisor::resync` applies to the same label.
+    let replica = labels_map
+        .get(labels::CONTAINER_NUMBER)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1);
+    Some((labels_map.get(labels::SERVICE)?.clone(), replica))
 }
 
 /// Builds a `Service` from a list entry and the container's inspected state.
@@ -271,6 +327,46 @@ mod tests {
     fn a_container_without_an_id_is_skipped() {
         let s = summary(&[(labels::SERVICE, "api")], false);
         assert!(build_service(&s, None).is_none());
+    }
+
+    /// The key has to name the container the log streams are keyed on, which
+    /// is the service plus the replica. The service alone would collapse a
+    /// scaled service's containers into one.
+    #[test]
+    fn container_key_reads_the_service_and_the_replica() {
+        assert_eq!(
+            container_key(&compose_summary()),
+            Some(("api".to_string(), 2))
+        );
+    }
+
+    /// The same default `build_service` and `LogSupervisor::resync` apply to
+    /// the same label, and the three have to agree: a container this called
+    /// replica 0 while its log stream called it 1 would look departed for the
+    /// whole run.
+    #[test]
+    fn a_key_without_a_container_number_is_the_first_replica() {
+        let s = summary(&[(labels::SERVICE, "api")], true);
+        assert_eq!(container_key(&s), Some(("api".to_string(), 1)));
+    }
+
+    /// One-off and hook containers are filtered out of the listing the log
+    /// streams are planned from, so they have to be filtered out of this one
+    /// too. Filtering in only one of the two is how the sets drift apart.
+    #[test]
+    fn a_transient_container_has_no_key() {
+        let oneoff = summary(&[(labels::SERVICE, "api"), (labels::ONEOFF, "True")], true);
+        assert!(container_key(&oneoff).is_none());
+        let hook = summary(&[(labels::SERVICE, "api"), (labels::HOOK, "start")], true);
+        assert!(container_key(&hook).is_none());
+    }
+
+    /// A container with no service label is not part of the project's graph,
+    /// so a key for it could never match anything the streams deliver.
+    #[test]
+    fn a_container_without_a_service_label_has_no_key() {
+        let s = summary(&[(labels::PROJECT, "demo")], true);
+        assert!(container_key(&s).is_none());
     }
 
     #[test]
