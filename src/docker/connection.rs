@@ -7,22 +7,31 @@
 
 /// Consecutive failed polls before the daemon is called unreachable.
 ///
-/// The service poller rests between 0.5s and 2s per round (`MIN_REFRESH` to
-/// `REFRESH` in `main`), so three consecutive failures put the note on screen
-/// somewhere between one and six seconds after the daemon stops answering.
-/// That is quick enough to answer "is this thing stuck?" while still costing
-/// two more failures than a single dropped request, which is the case the
-/// debounce exists for: one transient error must never flash a note that the
-/// next poll immediately takes back.
+/// Three, so that the note costs two more failures than a single dropped
+/// request. That one case is what the debounce exists for: a transient error
+/// must never flash a note the next poll immediately takes back.
+///
+/// What that costs in latency depends on how the daemon fails. Against one
+/// that refuses connections outright, each poll returns at once and the round
+/// is paced by the poller's own rest of 0.5s to 2s (`MIN_REFRESH` to `REFRESH`
+/// in `main`), so the note lands within about six seconds; measured against a
+/// cut socket it took 2.7s. Against a daemon that accepts and then never
+/// answers, the poll blocks on bollard's own request timeout instead and the
+/// note is far later -- see the note on [`ConnectionHealth`].
 const FAILURES_BEFORE_UNREACHABLE: u32 = 3;
 
-/// Consecutive failures of the periodic service poll.
+/// Tracks whether the daemon is still answering the periodic service poll.
 ///
-/// Deliberately counts polls rather than measuring elapsed time. The poll is
-/// the only regular round trip we make, so a run of failures is exactly the
-/// evidence that the daemon is not answering — where a wall-clock window would
-/// also fire during a long single request that is still in flight and may yet
-/// succeed.
+/// It counts completed polls rather than measuring elapsed time, because a
+/// run of failures is unambiguous where a wall-clock window is not: a window
+/// would also fire part way through a single slow request that may yet
+/// succeed, which is a different thing from an outage.
+///
+/// The cost of that choice is that a daemon which accepts a connection and
+/// then never answers is not noticed until the request itself gives up, which
+/// against bollard's default timeout is minutes rather than seconds. That is a
+/// real gap and not merely a tradeoff -- #48 tracks bounding the poll so a
+/// hung daemon counts as a failed one.
 #[derive(Debug, Default)]
 pub struct ConnectionHealth {
     /// Failed polls since the last success. Saturates rather than wrapping, so
@@ -91,7 +100,19 @@ mod tests {
     /// is degraded, not gone, and the note would otherwise blink on and off.
     #[test]
     fn a_success_between_failures_starts_the_count_again() {
+        // Strict alternation first, which is the case the name describes: any
+        // number of these must never reach the threshold.
         let mut health = ConnectionHealth::default();
+        for _ in 0..20 {
+            health.record_failure();
+            health.record_success();
+            assert!(
+                !health.is_unreachable(),
+                "an answered poll is not an outage"
+            );
+        }
+        // Then a run stopped one short, resumed after a success, which is the
+        // near miss an off-by-one would let through.
         for _ in 1..FAILURES_BEFORE_UNREACHABLE {
             health.record_failure();
         }
@@ -103,6 +124,22 @@ mod tests {
             !health.is_unreachable(),
             "the run was broken by a success, so it must start again"
         );
+    }
+
+    /// The other tests derive their loop bounds from the constant, so they
+    /// hold for whatever it is set to. This one is written out longhand,
+    /// because the value itself is a promise about how long the screen may
+    /// stay silent, and changing it should have to be deliberate.
+    #[test]
+    fn the_threshold_is_three_failures_exactly() {
+        assert_eq!(FAILURES_BEFORE_UNREACHABLE, 3);
+        let mut health = ConnectionHealth::default();
+        health.record_failure();
+        assert!(!health.is_unreachable(), "one failure");
+        health.record_failure();
+        assert!(!health.is_unreachable(), "two failures");
+        health.record_failure();
+        assert!(health.is_unreachable(), "three failures");
     }
 
     #[test]

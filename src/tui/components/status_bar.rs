@@ -169,9 +169,9 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         .saturating_sub(status_width + BOTTOM_SPACING + RIGHT_MARGIN);
     // The middle slot takes its natural width before the hints do, and only
     // the essential hints are held back for it, exactly as nx orders the two
-    // in `render_single_line`. Letting the hints go first starved the slot to
-    // a couple of columns at ordinary widths -- 22 at 120 -- which truncated
-    // every message it has ever carried.
+    // in `render_single_line`. Letting the hints go first starved the slot:
+    // 24 columns at 120, and 4 at both 80 and 100, which truncated every
+    // message it has ever carried.
     //
     // Floor the budget at the minimum hint width, but never above the space
     // that actually exists, or the hints would overflow instead of degrading.
@@ -405,6 +405,10 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("Docker daemon unreachable"), "got {text:?}");
+        assert!(
+            !text.contains("hidden"),
+            "the slot holds one message, not both: {text:?}"
+        );
     }
 
     /// The countdown keeps the slot: it is the only warning that the app is
@@ -435,6 +439,10 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("closing in"), "got {text:?}");
+        assert!(
+            !text.contains("Docker daemon"),
+            "the slot holds one message, not both: {text:?}"
+        );
     }
 
     #[test]

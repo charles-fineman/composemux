@@ -263,6 +263,13 @@ fn spawn_refresher(
                 services.retain(|s| cfg.is_visible(&s.name));
                 services
             });
+            if let Err(err) = &polled {
+                // The bar can only say *that* the daemon stopped answering.
+                // Why is what the supervisor already writes here for its own
+                // failures, and this is the only place to look when the note
+                // will not clear.
+                docker::log_debug(&format!("service poll failed: {err}"));
+            }
             if let Some(poll) = poll_outcome(polled, &mut health) {
                 if tx.send(poll).await.is_err() {
                     return;
@@ -357,8 +364,11 @@ async fn event_loop(
 
             polled = svc_rx.recv() => {
                 if let Some(poll) = polled {
-                    // Pins need a populated list, so they wait for a poll that
-                    // actually brought services back.
+                    // Pins wait for a poll the daemon answered, which is what
+                    // the old code waited for too. An answered poll carrying
+                    // no services still counts: a project really can have
+                    // none, and holding the pins back forever would be worse
+                    // than applying them to an empty list.
                     if apply_poll(app, poll) && !pinned_applied {
                         pinned_applied = true;
                         app.apply_startup_pins();
@@ -619,6 +629,19 @@ mod tests {
         assert!(!apply_poll(&mut app, Poll::Unreachable), "no services came");
         assert!(!app.daemon_reachable());
         assert_eq!(app.rows().len(), 1, "the last known services must remain");
+    }
+
+    /// The boundary the pin comment turns on: an answered poll that happens
+    /// to carry nothing is still an answered poll.
+    #[test]
+    fn an_answered_but_empty_poll_still_counts_as_the_daemon_answering() {
+        let mut app = app_with_service("api");
+        apply_poll(&mut app, Poll::Unreachable);
+        assert!(
+            apply_poll(&mut app, Poll::Services(Vec::new())),
+            "an empty list is an answer, not a silence"
+        );
+        assert!(app.daemon_reachable());
     }
 
     #[test]
