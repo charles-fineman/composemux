@@ -52,10 +52,15 @@ const _: () = assert!(MAX_CHUNK_BYTES < MAX_PARTIAL);
 /// Half a second, matching the floor the TUI's poller runs to. That poller
 /// lists unconditionally on a timer *and* inspects every container it finds;
 /// this lists only, and only when a topology event arrives, so it cannot be
-/// the heavier of the two. Going slower would be worse than it looks: a
-/// compose recreate finishes in well under a second, and a floor above that
-/// would step over the window in which a departed container is the one thing
-/// the listing would have reported.
+/// the heavier of the two. A compose recreate finishes in well under a second,
+/// so a floor above that would step over the window in which a departed
+/// container is the one thing the listing would have reported.
+///
+/// What stepping over it costs is a delay and not a wrong line: the
+/// replacement's first chunk ends the dead container's held line where it
+/// stands, in `LineAssembler::adopt`, whether or not a listing has noticed
+/// anything. A replacement that comes up silently is the case that still waits
+/// on this interval.
 const PRUNE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
@@ -1046,6 +1051,30 @@ mod tests {
         );
     }
 
+    /// Two replicas recreated at once, which is what `compose up` does to a
+    /// scaled service. Each entry has to end its own tail and adopt its own
+    /// replacement: an identity remembered per map entry rather than per map,
+    /// which nothing else here would catch.
+    #[test]
+    fn replicas_recreated_together_neither_cross_nor_inherit() {
+        let mut s = Stream::default();
+
+        s.emit_from("web-1-first", "web", 1, b"one held");
+        s.emit_from("web-2-first", "web", 2, b"two held");
+        s.emit_from("web-1-second", "web", 1, b"one new\n");
+        s.emit_from("web-2-second", "web", 2, b"two new\n");
+
+        assert_eq!(
+            s.lines(),
+            vec![
+                "web-1  | one held",
+                "web-1  | one new",
+                "web-2  | two held",
+                "web-2  | two new",
+            ]
+        );
+    }
+
     /// The other half of the same rule: output really is joined across chunks
     /// while the container stays put. Splitting on every chunk instead of on a
     /// change of identity would pass the recreate test above and break every
@@ -1705,6 +1734,49 @@ mod tests {
             listings.calls(),
             1,
             "the topology event should still have been answered with a listing"
+        );
+    }
+
+    /// A recreate whose replacement is itself still mid-line when the run
+    /// ends, so the two tails leave by different doors: the dead container's
+    /// on the replacement's first chunk, the replacement's own on the shutdown
+    /// drain. Nothing else pins the pair together, and before this they were
+    /// one line printed once, at shutdown.
+    #[tokio::test]
+    async fn a_recreate_before_the_drain_leaves_two_tails_rather_than_one() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            container: "web-1-first".to_string(),
+            bytes: b"old tail".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            container: "web-1-second".to_string(),
+            bytes: b"new tail".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, listing_unavailable, &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(
+            out.lines(),
+            vec!["web-1  | old tail", "web-1  | new tail"],
+            "the drain printed the two containers' tails as one line"
         );
     }
 

@@ -72,7 +72,9 @@ pub(crate) const MAX_CHUNK_BYTES: usize = 64 * 1024;
 pub enum SourceEvent {
     /// Raw output from one service's container.
     Output {
+        /// Compose service name, as the output is labelled with.
         service: String,
+        /// The container's `com.docker.compose.container-number`.
         replica: u32,
         /// ID of the container these bytes were read from.
         ///
@@ -84,6 +86,7 @@ pub enum SourceEvent {
         /// tell whose they are; the ID travels with the output rather than
         /// alongside it, so it cannot be raced by a separate notification.
         container: String,
+        /// One piece of a log frame, no larger than [`MAX_CHUNK_BYTES`].
         bytes: Vec<u8>,
     },
     /// Container topology or status changed; the UI should re-read services.
