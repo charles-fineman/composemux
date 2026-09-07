@@ -4,6 +4,7 @@
 //! Ported from nx `packages/nx/src/native/tui/components/status_bar.rs` and
 //! `help_text.rs` (MIT, (c) 2017-2026 Narwhal Technologies Inc.)
 
+use crate::docker::Outage;
 use crate::model::ServiceStatus;
 use crate::tui::app::App;
 use crate::tui::filter::FilterState;
@@ -126,9 +127,17 @@ fn context_line(app: &App) -> Line<'static> {
     // retype, and below the countdown, which is the sole warning that the app
     // is about to close itself. Warning rather than error: the supervisor and
     // the poller both keep retrying, so this is a condition being handled.
-    if !app.daemon_reachable() {
+    if let Some(outage) = app.daemon_outage() {
+        // Two notes, because they send the user to different places: an
+        // unreachable daemon is one to start, where one that is not answering
+        // has taken the request and gone quiet, and is very likely running.
+        // Calling that one "unreachable" would send the user to check
+        // something that is probably fine.
         return Line::from(Span::styled(
-            "Docker daemon unreachable - retrying",
+            match outage {
+                Outage::Unreachable => "Docker daemon unreachable - retrying",
+                Outage::NotAnswering => "Docker daemon not answering - retrying",
+            },
             Style::default().fg(THEME.warning),
         ));
     }
@@ -340,7 +349,7 @@ mod tests {
     #[test]
     fn an_unreachable_daemon_is_named_in_the_context_slot() {
         let mut app = app_with(&["a"]);
-        app.set_daemon_reachable(false);
+        app.set_daemon_outage(Some(Outage::Unreachable));
         let text: String = context_line(&app)
             .spans
             .iter()
@@ -357,7 +366,7 @@ mod tests {
     #[test]
     fn the_note_says_the_connection_is_being_retried() {
         let mut app = app_with(&["a"]);
-        app.set_daemon_reachable(false);
+        app.set_daemon_outage(Some(Outage::Unreachable));
         let text: String = context_line(&app)
             .spans
             .iter()
@@ -366,11 +375,33 @@ mod tests {
         assert!(text.contains("retrying"), "got {text:?}");
     }
 
+    /// #52: a daemon that accepted the connection and then went quiet is
+    /// reachable, so the note must not say otherwise. It is a different
+    /// problem with a different remedy.
+    #[test]
+    fn a_daemon_that_is_merely_not_answering_is_not_called_unreachable() {
+        let mut app = app_with(&["a"]);
+        app.set_daemon_outage(Some(Outage::NotAnswering));
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("Docker daemon not answering") && text.contains("retrying"),
+            "got {text:?}"
+        );
+        assert!(
+            !text.contains("unreachable"),
+            "the connection was made, so the bar must not say it was not: {text:?}"
+        );
+    }
+
     #[test]
     fn the_note_goes_away_when_the_daemon_answers_again() {
         let mut app = app_with(&["a"]);
-        app.set_daemon_reachable(false);
-        app.set_daemon_reachable(true);
+        app.set_daemon_outage(Some(Outage::Unreachable));
+        app.set_daemon_outage(None);
         let text: String = context_line(&app)
             .spans
             .iter()
@@ -398,7 +429,7 @@ mod tests {
             );
         }
         assert_eq!(app.filter().state(), FilterState::Persisted);
-        app.set_daemon_reachable(false);
+        app.set_daemon_outage(Some(Outage::Unreachable));
         let text: String = context_line(&app)
             .spans
             .iter()
@@ -430,7 +461,7 @@ mod tests {
                 })
                 .collect(),
         );
-        app.set_daemon_reachable(false);
+        app.set_daemon_outage(Some(Outage::Unreachable));
         // Only meaningful if a countdown is actually running.
         assert!(app.countdown_remaining().is_some());
         let text: String = context_line(&app)

@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn a_lost_daemon_is_reported_on_the_rendered_frame() {
         let mut app = app();
-        app.set_daemon_reachable(false);
+        app.set_daemon_outage(Some(crate::docker::Outage::Unreachable));
         for width in [64, 80, 100, 120, 200] {
             let text = render_to_text(&app, width, 40);
             assert!(
@@ -227,7 +227,7 @@ mod tests {
     /// The complaint in #19 is that a frozen screen is indistinguishable from
     /// a quiet one, so a healthy daemon must add nothing at all.
     ///
-    /// It deliberately never calls `set_daemon_reachable`, so it also pins the
+    /// It deliberately never calls `set_daemon_outage`, so it also pins the
     /// starting state: the very first frame is drawn before any poll has run,
     /// and it must not accuse a daemon nobody has spoken to yet.
     #[test]
