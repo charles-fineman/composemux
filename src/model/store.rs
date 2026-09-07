@@ -84,6 +84,15 @@ pub struct LogStore {
     pen: Vec<u8>,
     /// True once any output at all has been received.
     has_output: bool,
+    /// Whether the emulator is the placeholder a release left behind rather
+    /// than this store's screen.
+    ///
+    /// While it is set, `process` keeps `raw` and skips the parser: a released
+    /// grid is one nothing is allowed to read until `resize` replays `raw` into
+    /// it, so parsing into it is work done for nobody. Distinct from
+    /// `replay_pending`, which says only that the next resize must not
+    /// short-circuit on an unchanged size.
+    released: bool,
 }
 
 impl LogStore {
@@ -98,6 +107,7 @@ impl LogStore {
             pen: Vec::new(),
             replay_pending: false,
             has_output: false,
+            released: false,
         }
     }
 
@@ -106,10 +116,40 @@ impl LogStore {
     }
 
     pub fn screen(&self) -> &vt100::Screen {
+        self.live_screen()
+    }
+
+    /// The screen, for a caller entitled to read it.
+    ///
+    /// The assertion pins the invariant the release rests on.
+    /// `release_offscreen_stores` releases every store no pane slot holds, and
+    /// a released store's grid is empty until `resize` replays `raw` into it --
+    /// so a reader that reaches a store by any route other than `App::pane_key`
+    /// draws a blank pane instead of the service's output. Skipping the parse
+    /// is what turned that from wasted work into a wrong pane, so every read
+    /// goes through here and a stray one fails in any debug build, the test
+    /// suite included, rather than quietly on a user's screen.
+    fn live_screen(&self) -> &vt100::Screen {
+        debug_assert!(
+            !self.released,
+            "read the screen of a released store: readers must resolve through \
+             `App::pane_key`, the set `release_offscreen_stores` leaves alone"
+        );
         self.parser.screen()
     }
 
-    /// Feeds raw container output to the emulator.
+    /// The screen, for a caller entitled to move its scroll offset. Held to the
+    /// same rule as `live_screen`, and for the same reason.
+    fn live_screen_mut(&mut self) -> &mut vt100::Screen {
+        debug_assert!(
+            !self.released,
+            "moved the scroll offset of a released store: readers must resolve \
+             through `App::pane_key`, the set `release_offscreen_stores` leaves alone"
+        );
+        self.parser.screen_mut()
+    }
+
+    /// Feeds raw container output to the emulator, or past it while released.
     ///
     /// A view at offset 0 keeps tailing; a view scrolled up stays on the content
     /// it is showing. Both come from `vt100`, which advances the scroll offset
@@ -127,7 +167,14 @@ impl LogStore {
         }
         let normalised = self.normalise_newlines(bytes);
         self.retain(&normalised);
-        self.parser.process(&normalised);
+        // Everything a replay needs was just updated -- `raw`, `pen`,
+        // `pending_cr`, and `has_output` below -- so while the emulator is a
+        // released placeholder the parse is pure cost: nothing may read that
+        // grid, and the resize that ends the release rebuilds it from `raw`
+        // regardless of what was fed to it in the meantime.
+        if !self.released {
+            self.parser.process(&normalised);
+        }
         self.has_output = true;
     }
 
@@ -227,6 +274,9 @@ impl LogStore {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(MIN_ROWS);
         let cols = cols.max(MIN_COLS);
+        // Straight to the parser rather than through `live_screen`: this is the
+        // one place entitled to look at a released grid, because ending the
+        // release is what it is for.
         let (cur_rows, cur_cols) = self.parser.screen().size();
 
         // A pending replay has to defeat this, or a resize back to a size that
@@ -241,6 +291,14 @@ impl LogStore {
         let old_offset = self.parser.screen().scrollback();
 
         if self.raw.is_empty() && self.has_output {
+            // Not reachable for a released store: `release` refuses this state,
+            // and `raw` never empties again once it has been filled. Asserted
+            // rather than argued, because the screen kept here is the released
+            // placeholder if it ever is.
+            debug_assert!(
+                !self.released,
+                "a released store reached the branch that keeps its grid"
+            );
             // Rebuilding from nothing would blank a pane that has content.
             // Keep what is on screen and try again on the next resize.
             self.parser.screen_mut().set_size(rows, cols);
@@ -252,6 +310,12 @@ impl LogStore {
             self.parser = rebuilt;
             self.replay_pending = false;
         }
+        // The rebuild is the only branch a released store can reach, but the
+        // clear covers both, on the other branch's own terms: the screen it
+        // keeps is one the pane goes on rendering, so a flag left set there
+        // would stop `process` feeding a grid that is on screen, and every
+        // read of it would trip `live_screen`'s assertion.
+        self.released = false;
 
         // Losing height moves the bottom of the window up under a scrolled-up
         // reader, so pull the offset back by the rows lost. Anything else keeps
@@ -285,6 +349,13 @@ impl LogStore {
     /// the cost from "when the pane changes size" to "whenever the pane
     /// closes".
     ///
+    /// What stops is the feed into this store's own grid, not the ingest.
+    /// Output keeps arriving for a closed pane and keeps being retained, and
+    /// `retain` still runs the bytes that age out of `raw` through a scratch
+    /// emulator to carry `pen` forward -- so an off-screen service still costs
+    /// the bytes, the line accounting and that scratch parse. What it stops
+    /// paying for is a parse into a grid nothing will read.
+    ///
     /// Scroll position does not survive, and should not: the offset counts rows
     /// back from the bottom, and output kept arriving while the pane was
     /// closed, so the row it named is no longer the row the reader left.
@@ -296,12 +367,20 @@ impl LogStore {
     /// Clearing it happens to be invisible today, but only because a doubled
     /// carriage return is; that is a fact about the emulator, not a licence.
     pub fn release(&mut self) {
+        // Housekeeping runs on every service poll, so most calls land on a
+        // store that is already released. Nothing has been parsed into the
+        // placeholder since -- that is the point of it -- so building a second
+        // one would allocate an identical empty grid every few seconds.
+        if self.released {
+            return;
+        }
         // Rebuilding from nothing would blank a pane that has content, which is
         // the same hazard `resize` keeps the screen for rather than replaying.
         if self.raw.is_empty() && self.has_output {
             return;
         }
         self.parser = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+        self.released = true;
         // A pane floored at the minimum geometry would otherwise short-circuit
         // the resize and render this empty grid as the service's output.
         self.replay_pending = true;
@@ -309,26 +388,26 @@ impl LogStore {
 
     /// Rows scrolled back from the bottom. `0` means tailing.
     pub fn scroll_offset(&self) -> usize {
-        self.parser.screen().scrollback()
+        self.live_screen().scrollback()
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
         let target = self.scroll_offset().saturating_add(lines as usize);
-        self.parser.screen_mut().set_scrollback(target);
+        self.live_screen_mut().set_scrollback(target);
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
         let target = self.scroll_offset().saturating_sub(lines as usize);
-        self.parser.screen_mut().set_scrollback(target);
+        self.live_screen_mut().set_scrollback(target);
     }
 
     pub fn scroll_to_top(&mut self) {
         // vt100 clamps to the number of retained rows.
-        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.live_screen_mut().set_scrollback(usize::MAX);
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.parser.screen_mut().set_scrollback(0);
+        self.live_screen_mut().set_scrollback(0);
     }
 
     /// The full retained buffer as plain text, for clipboard copy.
@@ -339,15 +418,15 @@ impl LogStore {
     /// scrollback depth is not an exact multiple of the pane height.
     pub fn all_text(&mut self) -> String {
         let saved = self.scroll_offset();
-        let (rows, cols) = self.parser.screen().size();
+        let (rows, cols) = self.live_screen().size();
 
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        let mut offset = self.parser.screen().scrollback();
+        self.live_screen_mut().set_scrollback(usize::MAX);
+        let mut offset = self.live_screen().scrollback();
 
         let mut lines: Vec<String> = Vec::new();
         loop {
-            self.parser.screen_mut().set_scrollback(offset);
-            let window = self.parser.screen().rows(0, cols);
+            self.live_screen_mut().set_scrollback(offset);
+            let window = self.live_screen().rows(0, cols);
             if offset == 0 {
                 lines.extend(window);
                 break;
@@ -357,7 +436,7 @@ impl LogStore {
             offset -= advance;
         }
 
-        self.parser.screen_mut().set_scrollback(saved);
+        self.live_screen_mut().set_scrollback(saved);
 
         while lines.last().is_some_and(|l| l.trim().is_empty()) {
             lines.pop();
@@ -376,8 +455,18 @@ impl LogStore {
     /// program needs the text materialised.
     #[cfg(test)]
     pub fn visible_lines(&self) -> Vec<String> {
-        let (_, cols) = self.parser.screen().size();
-        self.parser.screen().rows(0, cols).collect()
+        let (_, cols) = self.live_screen().size();
+        self.live_screen().rows(0, cols).collect()
+    }
+
+    /// The parser's grid whatever state it is in, released included.
+    ///
+    /// Test-only, and the one deliberate exception to `live_screen`'s rule: the
+    /// tests that prove a store *was* released have to look at the grid the
+    /// release left behind. Nothing in the running program may.
+    #[cfg(test)]
+    pub fn released_grid(&self) -> &vt100::Screen {
+        self.parser.screen()
     }
 }
 
@@ -1120,8 +1209,11 @@ mod tests {
 
         s.release();
 
+        // Through the released-grid peephole: `screen` is now the accessor a
+        // pane reads through, and reading it here would trip the assertion that
+        // keeps a released store off a user's screen.
         assert_eq!(
-            s.screen().size(),
+            s.released_grid().size(),
             (MIN_ROWS, MIN_COLS),
             "the emulator was kept at its pane size"
         );
@@ -1163,6 +1255,17 @@ mod tests {
         s.resize(MIN_ROWS, MIN_COLS);
 
         assert_eq!(non_empty(&s), before, "the pane came back empty");
+
+        // The same resize is where the release has to end, not just where the
+        // replay happens: a store that came back with its history but kept
+        // skipping the parse would show nothing new until the pane next
+        // changed size. This is the geometry where that is easiest to miss,
+        // because the resize that has to end the release changes nothing else.
+        s.process(b"and more\r\n");
+        assert!(
+            non_empty(&s).iter().any(|l| l == "and more"),
+            "a reopened store never resumed parsing"
+        );
     }
 
     /// Rewrapping on resize is the behaviour several merged fixes exist to
@@ -1208,7 +1311,7 @@ mod tests {
 
         s.release();
 
-        assert_eq!(s.screen().size(), (MIN_ROWS, MIN_COLS));
+        assert_eq!(s.released_grid().size(), (MIN_ROWS, MIN_COLS));
     }
 
     /// A released store is still the live buffer for its service: output keeps
@@ -1247,23 +1350,185 @@ mod tests {
     }
 
     /// A released store keeps ingesting, and the point is that what it ingests
-    /// stops costing anything until the service is looked at again. Released
-    /// with its scrollback budget intact it would quietly refill -- 1000 rows
-    /// at any width is hundreds of kilobytes, most of the saving handed back.
+    /// stops costing anything until the service is looked at again. The
+    /// emulator is where that cost was: every byte was parsed into a grid the
+    /// next resize throws away, and a scrollback budget left intact would have
+    /// let it refill besides.
+    ///
+    /// So the assertion is on the grid rather than on its scroll depth: a
+    /// released emulator that is fed nothing at all can neither accumulate
+    /// scrollback nor spend anything parsing, which is the stronger of the two
+    /// properties and the one this change is for. It has to look at the grid
+    /// through the released-grid peephole, because reading a released store
+    /// through `screen` is the mistake the whole thing is guarding against.
+    ///
+    /// The scrollback budget the placeholder is built with is deliberately not
+    /// asserted any more, and cannot be: `vt100` allocates scrollback rows as
+    /// they arrive, so a grid nothing is parsed into costs nothing whatever
+    /// that budget says, and the old check reached it through a `scroll_to_top`
+    /// that is itself now a read of a released store.
     #[test]
-    fn a_released_store_does_not_refill_a_scrollback() {
+    fn a_released_store_parses_nothing_while_off_screen() {
         let mut s = store_with(200);
         s.release();
         for i in 0..500 {
             s.process(format!("after {i}\r\n").as_bytes());
         }
 
+        let grid = s.released_grid().contents();
+        assert!(
+            grid.trim().is_empty(),
+            "the released emulator parsed output nothing can read:\n{grid}"
+        );
+    }
+
+    /// The skip is only sound while nothing reads a released store's screen,
+    /// and that is not a property of this file: it holds because every reader
+    /// resolves a store through `App::pane_key`, which is exactly the set
+    /// `release_offscreen_stores` leaves alone. A reader added later that goes
+    /// straight to `stores` would compile, pass review, and draw an empty pane.
+    ///
+    /// So the rule is asserted where it can be enforced -- on the read itself,
+    /// which no new reader can avoid -- rather than restated in a comment.
+    ///
+    /// Through `screen`, which is what `log_pane` blits a pane from. Reached
+    /// through `visible_lines` instead this passed while `screen` was routed
+    /// around the guard entirely, because `visible_lines` is `#[cfg(test)]` and
+    /// draws nothing.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "read the screen")]
+    fn reading_a_released_store_trips_an_assertion() {
+        let mut s = store_with(200);
+        s.release();
+
+        let _ = s.screen();
+    }
+
+    /// Moving the offset reaches the grid through `live_screen_mut`, a second
+    /// door with its own assertion: a pane that resolved its store correctly
+    /// for the cells but not for the scrollbar would be just as wrong.
+    ///
+    /// `scroll_to_top` rather than `scroll_up`, which reads the current offset
+    /// first and so trips the *read* assertion before it ever reaches the
+    /// second door -- written with `scroll_up` this test passed with
+    /// `live_screen_mut`'s assertion deleted. The expected message names the
+    /// door for the same reason: "released store" appears in both.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "moved the scroll offset")]
+    fn scrolling_a_released_store_trips_an_assertion() {
+        let mut s = store_with(200);
+        s.release();
+
         s.scroll_to_top();
+    }
+
+    /// The release has to end where the grid is rebuilt, or a reopened pane
+    /// shows its replayed history and then nothing further until it next
+    /// changes size. Before this test
+    /// and the line `a_release_is_replayed_even_back_to_the_minimum_size` now
+    /// writes after its own reopen, nothing pinned that: with the assertions
+    /// compiled out -- which is every release build -- a store that came back
+    /// and never resumed parsing was caught by no behaviour at all.
+    #[test]
+    fn a_reopened_store_parses_again() {
+        let mut s = store_with(200);
+        s.release();
+        s.resize(10, 40);
+
+        s.process(b"after the reopen\r\n");
+
+        let rows = non_empty(&s);
+        assert!(
+            rows.iter().any(|l| l == "after the reopen"),
+            "a reopened store never resumed parsing:\n{rows:#?}"
+        );
+    }
+
+    /// A service that has said nothing yet is released too, so the skip covers
+    /// its first output as well: those bytes reach `raw`, the line count and
+    /// the carry, but not the emulator, and the replay is the only thing that
+    /// can ever put them on a screen.
+    #[test]
+    fn the_first_output_after_a_release_survives_the_reopen() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.release();
+
+        s.process(b"first words\r\n");
+
+        // The premise, not just the conclusion: without this the test would
+        // still pass in a world where a store that has never had output is
+        // never released in the first place.
+        assert!(
+            !s.released_grid().contents().contains("first words"),
+            "the store parsed its first output while released"
+        );
+
+        s.resize(10, 40);
+
+        let rows = non_empty(&s);
+        assert!(
+            rows.iter().any(|l| l == "first words"),
+            "the first output a released store took in was lost:\n{rows:#?}"
+        );
+    }
+
+    /// Skipping the parse must cost the reopened pane nothing. A store that was
+    /// released, kept taking output for the whole time it was closed, and was
+    /// then put back in a pane has to show exactly what a store that never left
+    /// its pane shows -- same rows, same styling.
+    ///
+    /// The input is picked for the state the emulator is no longer there to
+    /// hold: a colour set before the release and left on, which comes back only
+    /// if the replay reproduces it, and a `\r\n` cut in half by the release,
+    /// which is where `pending_cr` has to keep carrying across a boundary the
+    /// parser no longer sees.
+    ///
+    /// `raw` is compared as well as the rendered screen, because the rendering
+    /// alone would not notice a lost carry: the newline would be normalised a
+    /// second time and the doubled carriage return absorbed by the emulator.
+    /// The bytes are the level at which "the release changed the ingest" is
+    /// visible at all.
+    #[test]
+    fn output_arriving_while_released_reopens_identically() {
+        let feed = |s: &mut LogStore, from: usize| {
+            for i in from..from + 20 {
+                s.process(format!("line {i}\r\n").as_bytes());
+            }
+        };
+        // Escaped rather than compared as bytes: the difference this is here to
+        // catch is a stray control character, and a `Vec<u8>` mismatch prints
+        // several hundred decimal numbers to hide it in.
+        let raw_of = |s: &LogStore| String::from_utf8_lossy(&s.raw).escape_debug().to_string();
+
+        let mut released = LogStore::new(DEFAULT_SCROLLBACK);
+        let mut kept = LogStore::new(DEFAULT_SCROLLBACK);
+        for s in [&mut released, &mut kept] {
+            s.resize(10, 40);
+            s.process(b"\x1b[31mred from here on\r\n");
+            feed(s, 0);
+            // Leave the stream mid-CRLF, so the release lands between a
+            // carriage return and the newline that belongs to it.
+            s.process(b"line 20\r");
+        }
+
+        released.release();
+        for s in [&mut released, &mut kept] {
+            s.process(b"\n");
+            feed(s, 21);
+        }
+        released.resize(10, 40);
 
         assert_eq!(
-            s.scroll_offset(),
-            0,
-            "the released emulator accumulated scrollback while off-screen"
+            raw_of(&released),
+            raw_of(&kept),
+            "the release changed what the store took in, not just what it parsed"
+        );
+        assert_eq!(
+            released.screen().contents_formatted(),
+            kept.screen().contents_formatted(),
+            "a reopened pane differs from one that never closed"
         );
     }
 
