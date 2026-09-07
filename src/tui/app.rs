@@ -124,6 +124,9 @@ pub struct App {
     /// Cleared once the user presses anything, cancelling auto-exit.
     user_interacted: bool,
     auto_exit_after: Option<Duration>,
+    /// Whether the stack was down as of the last service list, judged before
+    /// replaced containers are collapsed away.
+    stack_finished: bool,
     all_finished_since: Option<Instant>,
     status_message: Option<(String, Instant)>,
     /// Advanced by `tick` and `handle_key`, so countdown state is testable
@@ -156,6 +159,7 @@ impl App {
             exit: None,
             user_interacted: false,
             auto_exit_after: config.auto_exit.seconds().map(Duration::from_secs),
+            stack_finished: false,
             all_finished_since: None,
             status_message: None,
             clock: Instant::now(),
@@ -285,6 +289,16 @@ impl App {
 
     /// Replaces the known service list, preserving selection and pins.
     pub fn set_services(&mut self, mut services: Vec<Service>) {
+        // Before the collapse, not after. A replacement compose has created but
+        // not yet started is dropped by it, and judging completion on what is
+        // left would see only the finished original and call the stack down --
+        // starting the auto-exit countdown in the middle of a recreate. We exit
+        // 0 when it elapses, and the wrapping CLI takes that as its cue to stop
+        // the project, so the cost of being wrong here is the whole stack.
+        self.stack_finished = !services.is_empty()
+            && services.iter().all(|s| s.status.is_finished())
+            && !services.iter().any(|s| s.status == ServiceStatus::Failure);
+
         collapse_replaced_containers(&mut services);
         sort_services(&mut services);
 
@@ -370,12 +384,7 @@ impl App {
     /// over, and closing would let the wrapping CLI tear the project down before
     /// anyone read the crash.
     fn stack_exited_cleanly(&self) -> bool {
-        !self.all.is_empty()
-            && self.all.iter().all(|r| r.service.status.is_finished())
-            && !self
-                .all
-                .iter()
-                .any(|r| r.service.status == ServiceStatus::Failure)
+        self.stack_finished
     }
 
     /// Starts (or cancels) the auto-exit countdown when the stack goes down.
@@ -944,6 +953,47 @@ mod tests {
     use crate::config::DEFAULT_AUTO_EXIT_SECONDS;
     use crate::model::Health;
     use chrono::TimeZone;
+
+    /// A recreate must not look like a stack that has gone down.
+    ///
+    /// The collapse drops the replacement compose has created but not yet
+    /// started, so judging completion after it would see one finished row and
+    /// start the auto-exit countdown. That countdown exits 0, and the wrapping
+    /// CLI stops the project on our exit, so getting this wrong takes the
+    /// stack down in the middle of bringing it up.
+    #[test]
+    fn a_pending_replacement_does_not_look_like_a_finished_stack() {
+        let cfg = Config::default();
+        let mut app = App::new("demo", &cfg);
+        let mut original = svc_replica("web", 1, ServiceStatus::Success);
+        original.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        original.finished_at = Some(chrono::Utc::now());
+        let replacement = svc_replica("web", 1, ServiceStatus::NotStarted);
+
+        app.set_services(vec![original, replacement]);
+
+        assert_eq!(
+            app.rows().len(),
+            1,
+            "the collapse should still show one row"
+        );
+        assert!(
+            !app.stack_exited_cleanly(),
+            "a container still waiting to start is not a stack that has exited"
+        );
+    }
+
+    /// The counterpart: once nothing is pending, the countdown must still run.
+    #[test]
+    fn a_genuinely_finished_stack_still_counts_as_exited() {
+        let cfg = Config::default();
+        let mut app = App::new("demo", &cfg);
+        app.set_services(vec![
+            svc_replica("web", 1, ServiceStatus::Success),
+            svc_replica("db", 1, ServiceStatus::Success),
+        ]);
+        assert!(app.stack_exited_cleanly());
+    }
 
     fn svc(name: &str, status: ServiceStatus) -> Service {
         Service {
