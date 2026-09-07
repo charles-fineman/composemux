@@ -34,7 +34,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use config::Config;
 use crossterm::event::{Event, EventStream, KeyEventKind};
-use docker::{DockerClient, LogSupervisor, SourceEvent};
+use docker::{ConnectionHealth, DockerClient, LogSupervisor, SourceEvent};
 use futures::StreamExt;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -68,6 +68,19 @@ const MIN_REFRESH: Duration = Duration::from_millis(500);
 /// faster than we can render would keep the drain loop from ever returning, and
 /// the UI would stop responding to keys.
 const MAX_DRAIN_PER_FRAME: usize = 512;
+
+/// What one round of the service poll has to tell the UI.
+///
+/// A poll that fails without the daemon having failed often enough to count as
+/// an outage yields nothing at all: the app keeps the statuses it has, exactly
+/// as it did before, and a single dropped request never reaches the screen.
+#[derive(Debug)]
+enum Poll {
+    /// The daemon answered, with the project's services as it sees them.
+    Services(Vec<model::Service>),
+    /// The daemon has been failing to answer for long enough to say so.
+    Unreachable,
+}
 
 /// Command-line arguments, which override anything in the config file.
 #[derive(Parser, Debug)]
@@ -197,7 +210,7 @@ async fn run_tui(
 
     // Service status is polled rather than derived from events, so uptime and
     // health stay current even when nothing is happening.
-    let (svc_tx, mut svc_rx) = mpsc::channel::<Vec<model::Service>>(4);
+    let (svc_tx, mut svc_rx) = mpsc::channel::<Poll>(4);
     let refresh = Arc::new(Notify::new());
     spawn_refresher(
         client.clone(),
@@ -236,16 +249,22 @@ fn spawn_refresher(
     client: Arc<DockerClient>,
     project: String,
     cfg: Config,
-    tx: mpsc::Sender<Vec<model::Service>>,
+    tx: mpsc::Sender<Poll>,
     refresh: Arc<Notify>,
     cancel: CancellationToken,
 ) {
     let watchdog = cancel.clone();
     spawn_supervised(watchdog, async move {
+        // The poll is the only round trip we make on a fixed cadence, which is
+        // what makes it the place to notice the daemon going away.
+        let mut health = ConnectionHealth::default();
         loop {
-            if let Ok(mut services) = client.list_services(&project).await {
+            let polled = client.list_services(&project).await.map(|mut services| {
                 services.retain(|s| cfg.is_visible(&s.name));
-                if tx.send(services).await.is_err() {
+                services
+            });
+            if let Some(poll) = poll_outcome(polled, &mut health) {
+                if tx.send(poll).await.is_err() {
                     return;
                 }
             }
@@ -269,7 +288,7 @@ async fn event_loop(
     terminal: &mut tui::terminal::Tui,
     app: &mut App,
     log_rx: &mut mpsc::Receiver<SourceEvent>,
-    svc_rx: &mut mpsc::Receiver<Vec<model::Service>>,
+    svc_rx: &mut mpsc::Receiver<Poll>,
     refresh: &Arc<Notify>,
     cancel: &CancellationToken,
 ) -> Result<ExitReason> {
@@ -336,10 +355,11 @@ async fn event_loop(
                 }
             }
 
-            services = svc_rx.recv() => {
-                if let Some(services) = services {
-                    app.set_services(services);
-                    if !pinned_applied {
+            polled = svc_rx.recv() => {
+                if let Some(poll) = polled {
+                    // Pins need a populated list, so they wait for a poll that
+                    // actually brought services back.
+                    if apply_poll(app, poll) && !pinned_applied {
                         pinned_applied = true;
                         app.apply_startup_pins();
                     }
@@ -347,6 +367,42 @@ async fn event_loop(
             }
 
             _ = ticker.tick() => app.tick(Instant::now()),
+        }
+    }
+}
+
+/// Folds one poll result into the connection health, returning what the UI
+/// needs to hear about it, if anything.
+fn poll_outcome(
+    result: Result<Vec<model::Service>>,
+    health: &mut ConnectionHealth,
+) -> Option<Poll> {
+    match result {
+        Ok(services) => {
+            health.record_success();
+            Some(Poll::Services(services))
+        }
+        Err(_) => {
+            health.record_failure();
+            health.is_unreachable().then_some(Poll::Unreachable)
+        }
+    }
+}
+
+/// Folds one poll outcome into the app, reporting whether services arrived.
+fn apply_poll(app: &mut App, poll: Poll) -> bool {
+    match poll {
+        Poll::Services(services) => {
+            // Any answered poll ends an outage, so the note clears itself as
+            // soon as the daemon is back rather than waiting for a topology
+            // event that a quiet stack may never produce.
+            app.set_daemon_reachable(true);
+            app.set_services(services);
+            true
+        }
+        Poll::Unreachable => {
+            app.set_daemon_reachable(false);
+            false
         }
     }
 }
@@ -510,6 +566,78 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), refresh.notified())
             .await
             .expect("the refresher should have been notified");
+    }
+
+    /// The UI is only told about an outage once the debounce has decided it is
+    /// one; before that a failed poll changes nothing on screen.
+    #[test]
+    fn a_failed_poll_says_nothing_until_the_debounce_agrees() {
+        let mut health = ConnectionHealth::default();
+        assert!(
+            poll_outcome(Err(anyhow::anyhow!("no such file")), &mut health).is_none(),
+            "one dropped request must not reach the UI"
+        );
+    }
+
+    #[test]
+    fn a_sustained_outage_is_reported_as_unreachable() {
+        let mut health = ConnectionHealth::default();
+        let mut sent = None;
+        for _ in 0..10 {
+            if let Some(poll) = poll_outcome(Err(anyhow::anyhow!("no such file")), &mut health) {
+                sent = Some(poll);
+                break;
+            }
+        }
+        assert!(
+            matches!(sent, Some(Poll::Unreachable)),
+            "a daemon that never answers must eventually be reported"
+        );
+    }
+
+    /// A poll that succeeds has to clear the health, or the next single
+    /// failure would be treated as the tail of the previous outage.
+    #[test]
+    fn an_answered_poll_resets_the_failure_run() {
+        let mut health = ConnectionHealth::default();
+        for _ in 0..10 {
+            poll_outcome(Err(anyhow::anyhow!("no such file")), &mut health);
+        }
+        assert!(matches!(
+            poll_outcome(Ok(Vec::new()), &mut health),
+            Some(Poll::Services(_))
+        ));
+        assert!(
+            poll_outcome(Err(anyhow::anyhow!("no such file")), &mut health).is_none(),
+            "the run must start again after a success"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_poll_marks_the_app_and_brings_no_services() {
+        let mut app = app_with_service("api");
+        assert!(!apply_poll(&mut app, Poll::Unreachable), "no services came");
+        assert!(!app.daemon_reachable());
+        assert_eq!(app.rows().len(), 1, "the last known services must remain");
+    }
+
+    #[test]
+    fn services_arriving_clear_the_unreachable_mark() {
+        let mut app = app_with_service("api");
+        apply_poll(&mut app, Poll::Unreachable);
+        assert!(apply_poll(
+            &mut app,
+            Poll::Services(vec![Service {
+                name: "api".to_string(),
+                replica: 1,
+                status: ServiceStatus::Running,
+                health: Health::None,
+                exit_code: None,
+                started_at: None,
+                finished_at: None,
+            }])
+        ));
+        assert!(app.daemon_reachable(), "recovery must clear the mark");
     }
 
     fn press(app: &mut App, code: crossterm::event::KeyCode) {
