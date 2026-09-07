@@ -242,8 +242,8 @@ limitation you meet. A Compose version that omitted it on a scaled service
 would give every replica the same identity: a row each in the sidebar for as
 long as they're running, all carrying the same name, and one log buffer behind
 them all, holding their output interleaved with no way to separate them.
-There's nothing to configure at this end; composemux needs a Compose that sets
-the label.
+There's nothing to configure at this end, and nothing to fix for an unscaled
+service — only a scaled one needs a Compose that sets the label.
 [#51](https://github.com/sofired/composemux/issues/51) has the detail.
 
 ## Contributing
