@@ -72,8 +72,9 @@ pub struct LogStore {
     /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
     /// across chunks isn't mistaken for a bare newline.
     pending_cr: bool,
-    /// Set when a replay had to be skipped, so the next resize retries instead
-    /// of short-circuiting on a size that was applied without one.
+    /// Set when the parser holds a size it was never given content at -- a
+    /// replay that had to be skipped, or an emulator released while off-screen
+    /// -- so the next resize replays instead of short-circuiting on the size.
     replay_pending: bool,
     /// The styling active where `raw` begins.
     ///
@@ -261,6 +262,49 @@ impl LogStore {
             old_offset
         };
         self.parser.screen_mut().set_scrollback(target);
+    }
+
+    /// Drops the emulator, keeping the bytes needed to rebuild it.
+    ///
+    /// A filled grid is `(scrollback + rows) x cols` cells of 32 bytes each --
+    /// 2.5 MB at the 24x80 default, 6.4 MB at 50x200, 16.2 MB at 60x500 --
+    /// while the raw bytes it was built from are 75-220 kB for typical log
+    /// lines. A service no pane is showing is holding the larger figure for a
+    /// grid nothing reads, so this releases it and leaves `resize` to replay.
+    ///
+    /// The replay is the same work a first view already does -- a store is
+    /// created at the default geometry and `resize` replays it the moment it
+    /// lands in a pane of any other size -- but it is done once per view
+    /// rather than once per session.
+    ///
+    /// What comes back is what a `resize` would have rebuilt, which is all of
+    /// the history while the *line* budget is what binds. Under `MAX_RAW_BYTES`
+    /// it is less: escape-heavy output spends raw bytes without spending
+    /// emulator rows, so `raw` falls short of `keep_lines` and the replay
+    /// cannot refill the grid. A resize has always paid that; releasing moves
+    /// the cost from "when the pane changes size" to "whenever the pane
+    /// closes".
+    ///
+    /// Scroll position does not survive, and should not: the offset counts rows
+    /// back from the bottom, and output kept arriving while the pane was
+    /// closed, so the row it named is no longer the row the reader left.
+    ///
+    /// Everything else is left alone, `pending_cr` included. The byte stream
+    /// feeding `raw` is continuous across a release -- a chunk boundary can
+    /// still fall between a `\r` and its `\n` -- so the carry is mid-stream
+    /// state a release has no business in, exactly as `pen` and `lines` are.
+    /// Clearing it happens to be invisible today, but only because a doubled
+    /// carriage return is; that is a fact about the emulator, not a licence.
+    pub fn release(&mut self) {
+        // Rebuilding from nothing would blank a pane that has content, which is
+        // the same hazard `resize` keeps the screen for rather than replaying.
+        if self.raw.is_empty() && self.has_output {
+            return;
+        }
+        self.parser = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+        // A pane floored at the minimum geometry would otherwise short-circuit
+        // the resize and render this empty grid as the service's output.
+        self.replay_pending = true;
     }
 
     /// Rows scrolled back from the bottom. `0` means tailing.
@@ -1058,6 +1102,302 @@ mod tests {
         assert!(text.contains("line 0"), "expected scrollback in the copy");
         assert!(text.contains("line 39"), "expected the newest line too");
         assert!(tailing(&s), "copying must not disturb the scroll position");
+    }
+
+    // ---- releasing an off-screen emulator ----
+
+    /// The point of releasing is that the grid goes away, and a grid is the
+    /// only part of a store big enough to be worth releasing. Asserting on the
+    /// emulated size is the observable stand-in for the allocation: a `10x40`
+    /// grid *would* reach 1.3 MB of cells once its 1000-row scrollback filled,
+    /// while a `3x20` one with no scrollback cannot pass 2 kB. Rows are
+    /// allocated as output arrives, so this 200-line store is far short of that
+    /// ceiling -- what is released is the geometry, not the figure.
+    #[test]
+    fn releasing_shrinks_the_grid_to_nothing() {
+        let mut s = store_with(200);
+        assert_eq!(s.screen().size(), (10, 40));
+
+        s.release();
+
+        assert_eq!(
+            s.screen().size(),
+            (MIN_ROWS, MIN_COLS),
+            "the emulator was kept at its pane size"
+        );
+    }
+
+    /// Releasing is only safe because the raw bytes outlive the grid. A store
+    /// that came back short of what it had would be trading a memory bug for a
+    /// data-loss one.
+    #[test]
+    fn a_released_store_comes_back_with_the_same_content() {
+        let mut s = store_with(200);
+        let before = non_empty(&s);
+        let deep = {
+            let mut probe = store_with(200);
+            probe.scroll_to_top();
+            non_empty(&probe)
+        };
+
+        s.release();
+        s.resize(10, 40);
+
+        assert_eq!(non_empty(&s), before, "the visible rows changed");
+        s.scroll_to_top();
+        assert_eq!(non_empty(&s), deep, "the scrollback did not come back");
+    }
+
+    /// A pane floored at the emulator's own minimum is a real geometry -- a
+    /// terminal barely large enough to draw one. Rebuilding has to happen on
+    /// the size comparison alone being unable to tell "released" from
+    /// "already this size", or that pane renders an empty grid.
+    #[test]
+    fn a_release_is_replayed_even_back_to_the_minimum_size() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(MIN_ROWS, MIN_COLS);
+        s.process(b"hello\r\n");
+        let before = non_empty(&s);
+
+        s.release();
+        s.resize(MIN_ROWS, MIN_COLS);
+
+        assert_eq!(non_empty(&s), before, "the pane came back empty");
+    }
+
+    /// Rewrapping on resize is the behaviour several merged fixes exist to
+    /// protect, and a release must route through it rather than around it: a
+    /// store released at one width and reopened at another has to look exactly
+    /// like one that was only ever resized.
+    #[test]
+    fn a_released_store_still_rewraps_at_the_width_it_reopens_at() {
+        let line = "x".repeat(70);
+        let mut released = LogStore::new(DEFAULT_SCROLLBACK);
+        released.resize(10, 80);
+        let mut resized = LogStore::new(DEFAULT_SCROLLBACK);
+        resized.resize(10, 80);
+        for i in 0..40 {
+            let bytes = format!("\x1b[3{}m{i:03} {line}\r\n", 1 + i % 7);
+            released.process(bytes.as_bytes());
+            resized.process(bytes.as_bytes());
+        }
+
+        released.release();
+        released.resize(10, 30);
+        resized.resize(10, 30);
+
+        assert_eq!(non_empty(&released), non_empty(&resized));
+        // Formatted contents, not plain rows: the SGR codes live in `raw` and
+        // are re-parsed by the replay, so a release that mangled the styling
+        // rather than the text would read as identical rows.
+        assert_eq!(
+            released.screen().contents_formatted(),
+            resized.screen().contents_formatted()
+        );
+    }
+
+    /// A service that has produced nothing still runs an emulator at the
+    /// default geometry and still pays for it. Releasing has to reach those
+    /// too, or the idle floor -- one 24x80 grid per silent service -- never
+    /// comes down, which is most of what a large stack costs before anyone
+    /// opens a pane at all.
+    #[test]
+    fn a_store_that_has_never_had_output_still_releases() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        assert_eq!(s.screen().size(), (INITIAL_ROWS, INITIAL_COLS));
+
+        s.release();
+
+        assert_eq!(s.screen().size(), (MIN_ROWS, MIN_COLS));
+    }
+
+    /// A released store is still the live buffer for its service: output keeps
+    /// arriving while no pane shows it, and all of it has to be there when the
+    /// pane comes back. So the retention budget has to stay sized for the pane
+    /// the store will return to, not for the minimal grid it is wearing in the
+    /// meantime -- a release that reset it would trim history away in the gap
+    /// between one poll and the next.
+    #[test]
+    fn output_arriving_while_released_is_retained_for_the_pane_it_returns_to() {
+        let mut s = LogStore::new(2);
+        s.resize(20, 40);
+        s.process(b"before\r\n");
+
+        s.release();
+        for i in 0..30 {
+            s.process(format!("while closed {i}\r\n").as_bytes());
+        }
+        s.resize(20, 40);
+
+        // Counted over the whole retained buffer rather than the visible rows:
+        // the budget is what is under test, and a pane's worth of rows would
+        // pass on a buffer trimmed to just under one screen.
+        //
+        // The budget here is `keep_lines_for(2, 20)`, so 22 lines, one of which
+        // is "before" -- about 21 survive. A budget reset to the released
+        // geometry would be `keep_lines_for(2, 3)`, so 5. The threshold sits in
+        // that gap rather than on either edge, so neither trimming jitter nor a
+        // near-miss decides the result.
+        let text = s.all_text();
+        let kept = text.lines().filter(|l| l.contains("while closed")).count();
+        assert!(
+            kept >= 15,
+            "only {kept} lines survived the closed period, of 30:\n{text}"
+        );
+    }
+
+    /// A released store keeps ingesting, and the point is that what it ingests
+    /// stops costing anything until the service is looked at again. Released
+    /// with its scrollback budget intact it would quietly refill -- 1000 rows
+    /// at any width is hundreds of kilobytes, most of the saving handed back.
+    #[test]
+    fn a_released_store_does_not_refill_a_scrollback() {
+        let mut s = store_with(200);
+        s.release();
+        for i in 0..500 {
+            s.process(format!("after {i}\r\n").as_bytes());
+        }
+
+        s.scroll_to_top();
+
+        assert_eq!(
+            s.scroll_offset(),
+            0,
+            "the released emulator accumulated scrollback while off-screen"
+        );
+    }
+
+    /// Trimming drops the bytes that set the styling still in force, which is
+    /// why `LogStore` carries it in `pen` at all. A release that lost the pen
+    /// would replay the retained lines in default colours, so a service that
+    /// sets a colour once and leaves it on would come back white.
+    #[test]
+    fn the_carried_pen_survives_a_release() {
+        let build = || {
+            let mut s = LogStore::new(2);
+            s.resize(4, 20);
+            for i in 0..40 {
+                let bytes = if i == 0 {
+                    format!("\x1b[31mline {i}\r\n")
+                } else {
+                    format!("line {i}\r\n")
+                };
+                s.process(bytes.as_bytes());
+            }
+            s
+        };
+        let mut released = build();
+        let resized = build();
+        assert!(
+            !released.pen.is_empty(),
+            "the test is not exercising a trim, so it proves nothing"
+        );
+
+        released.release();
+        released.resize(4, 20);
+
+        assert_eq!(
+            released.screen().contents_formatted(),
+            resized.screen().contents_formatted(),
+            "the styling carried across the trim was lost"
+        );
+    }
+
+    /// The one thing a release costs that a closed pane did not cost before.
+    ///
+    /// While the line budget binds, a replay is lossless. Under `MAX_RAW_BYTES`
+    /// it is not: escape-heavy output spends raw bytes without spending
+    /// emulator rows, so `raw` falls short of `keep_lines` and the replay
+    /// cannot refill the grid. A resize has always paid that -- but before
+    /// releasing existed, reopening a pane at an unchanged size short-circuited
+    /// `resize` and paid nothing, so the shortfall was only ever charged when a
+    /// pane actually changed size. It is now charged whenever a pane closes.
+    ///
+    /// This asserts the loss deliberately, at an unchanged geometry where there
+    /// used to be none. It is accepted because the alternative is holding the
+    /// grid for a service nobody is looking at, and because the content that
+    /// triggers it is already past the ceiling the buffer exists to enforce.
+    /// The test is here so that it cannot silently deepen.
+    #[test]
+    fn under_the_byte_ceiling_a_release_costs_history_a_reopen_used_to_keep() {
+        // Carriage-return padding: each one costs a byte and no row, and leaves
+        // the text before it on screen. That is the shape that drives `raw`
+        // past the byte ceiling while the line budget stays untouched -- the
+        // same asymmetry escape-heavy output has, without the parser cost of
+        // eight megabytes of escape sequences.
+        //
+        // Fed as one write, not six hundred: past the ceiling every write
+        // rescans the whole buffer for its trim point, so writing line by line
+        // costs hundreds of eight-megabyte scans and minutes of runtime for the
+        // same end state.
+        let payload = {
+            let padding = "\r".repeat(15_000);
+            let mut v = Vec::new();
+            for i in 0..600 {
+                v.extend_from_slice(format!("line {i}{padding}\r\n").as_bytes());
+            }
+            v
+        };
+        let build = || {
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(10, 40);
+            s.process(&payload);
+            s
+        };
+        let oldest = |s: &mut LogStore| {
+            let text = s.all_text();
+            text.lines()
+                .find_map(|l| l.trim().strip_prefix("line ").map(str::to_string))
+                .and_then(|n| n.parse::<usize>().ok())
+                .expect("some retained line")
+        };
+
+        let mut reopened = build();
+        let mut released = build();
+        // The premise: the *byte* ceiling is what trimmed, not the line budget.
+        // Fewer lines retained than the budget allows is what proves it.
+        assert!(
+            reopened.lines < reopened.keep_lines,
+            "the byte ceiling never bound: {} lines against a budget of {}",
+            reopened.lines,
+            reopened.keep_lines
+        );
+        let live = oldest(&mut reopened);
+
+        // Before this change, reopening at an unchanged size cost nothing,
+        // because `resize` short-circuited on the size it already had.
+        reopened.resize(10, 40);
+        assert_eq!(
+            oldest(&mut reopened),
+            live,
+            "an unchanged resize lost history"
+        );
+
+        released.release();
+        released.resize(10, 40);
+
+        assert!(
+            oldest(&mut released) > live,
+            "expected the byte ceiling to cost history across a release"
+        );
+    }
+
+    /// A store with output it cannot reproduce must keep the grid it has.
+    ///
+    /// No public sequence reaches this: `trim_point` never cuts the whole
+    /// buffer away, so `raw` is non-empty whenever `has_output` is. The guard
+    /// is insurance mirroring the one in `resize`, and the test has to reach
+    /// past the API to exercise it -- releasing such a store would blank a pane
+    /// permanently, which is worth a branch that costs nothing.
+    #[test]
+    fn a_store_that_cannot_be_rebuilt_keeps_its_grid() {
+        let mut s = store_with(200);
+        s.raw.clear();
+
+        s.release();
+
+        assert_eq!(s.screen().size(), (10, 40));
+        assert!(!non_empty(&s).is_empty(), "the pane was blanked");
     }
 }
 

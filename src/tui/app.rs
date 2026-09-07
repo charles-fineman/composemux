@@ -344,6 +344,7 @@ impl App {
 
         self.reapply_filter();
         self.prune_stores();
+        self.release_offscreen_stores();
         self.note_finished_state();
     }
 
@@ -355,6 +356,38 @@ impl App {
         let pinned: Vec<ServiceKey> = self.panes.iter().flatten().cloned().collect();
         self.stores
             .retain(|key, _| live.contains(key) || pinned.contains(key));
+    }
+
+    /// Releases the emulator of every service no pane slot holds.
+    ///
+    /// `prune_stores` above only frees a store whose container is gone. A live
+    /// service that was browsed once and left keeps a megabytes-wide `vt100`
+    /// grid for a pane that closed, so the working set of a long session trends
+    /// toward every service ever viewed rather than the two on screen. The raw
+    /// bytes stay, and `resize` rebuilds the grid when the service is next put
+    /// in a pane.
+    ///
+    /// Read through `pane_key` rather than `panes`, because in spacebar mode
+    /// pane 0 follows the selection and holds no pinned entry -- keyed off
+    /// `panes` this would release the store the user is looking at, on every
+    /// refresh.
+    ///
+    /// That `pane_key` set is the invariant the whole thing rests on: anything
+    /// reading a store's screen, text or scroll offset has to resolve through
+    /// `pane_key` too, or it will find a released store and render an empty
+    /// grid. Every reader does today.
+    ///
+    /// Full screen is the deliberate exception. It hides the sibling pane, but
+    /// the slot still holds it, so its emulator survives -- keeping a hidden
+    /// pane's scroll position costs one grid and is what returning to it
+    /// expects.
+    fn release_offscreen_stores(&mut self) {
+        let shown: Vec<ServiceKey> = (0..MAX_PANES).filter_map(|i| self.pane_key(i)).collect();
+        for (key, store) in self.stores.iter_mut() {
+            if !shown.contains(key) {
+                store.release();
+            }
+        }
     }
 
     /// Recomputes the visible rows, keeping the selection anchored per the
@@ -2140,6 +2173,222 @@ mod tests {
             .iter()
             .any(|l| l.contains("hello from a")));
         assert!(app.store(&ServiceKey::new("b", 1)).is_none());
+    }
+
+    // ---- releasing off-screen emulators ----
+
+    /// The periodic service-list poll, which is what drives the housekeeping.
+    fn refresh(app: &mut App, names: &[&str]) {
+        app.set_services(
+            names
+                .iter()
+                .map(|n| svc(n, ServiceStatus::Running))
+                .collect(),
+        );
+    }
+
+    /// More output than a pane holds, so a released store has scrollback to
+    /// restore and not merely a screen.
+    fn fill(app: &mut App, key: &ServiceKey, lines: usize) {
+        for i in 0..lines {
+            app.ingest(key.clone(), format!("line {i}\r\n").as_bytes());
+        }
+    }
+
+    /// A live service whose pane closed used to keep the grid it was last
+    /// rendered at forever, so a session that browsed most of a stack ended up
+    /// holding one pane-sized emulator per service. The pane size is the
+    /// observable stand-in for the allocation.
+    #[test]
+    fn a_service_that_leaves_every_pane_releases_its_emulator() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+        assert_eq!(app.store(&a).unwrap().screen().size(), (10, 40));
+
+        // Pin b over the top of a, so a is live but in no pane.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+
+        // The exact floor, not merely "smaller": a partial shrink would satisfy
+        // a loose bound without releasing anything. `(3, 20)` is `MIN_ROWS` and
+        // `MIN_COLS`, which are private to `model::store` and cannot be named
+        // from here.
+        assert_eq!(
+            app.store(&a).unwrap().screen().size(),
+            (3, 20),
+            "a service in no pane kept its pane-sized emulator"
+        );
+    }
+
+    /// Releasing is only worth doing if reopening puts the output back. This is
+    /// the whole wiring -- release on refresh, rebuild on the next resize --
+    /// rather than `LogStore` on its own.
+    #[test]
+    fn reopening_a_released_service_puts_its_output_back() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+        let before = app.store(&a).unwrap().visible_lines();
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        assert_eq!(app.store(&a).unwrap().visible_lines(), before);
+    }
+
+    /// In spacebar mode the pane follows the selection while `panes` still
+    /// holds whatever was selected when space was pressed. Keyed off `panes`,
+    /// the housekeeping would release the store being rendered and replay it on
+    /// every poll -- so this is aimed at the field, not at the feature.
+    #[test]
+    fn the_service_a_spacebar_pane_follows_keeps_its_emulator() {
+        let mut app = app_with(&["a", "b"]);
+        let b = ServiceKey::new("b", 1);
+        fill(&mut app, &b, 200);
+
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('j'));
+        app.resize_panes(&[(0, 10, 40)]);
+        assert_eq!(app.pane_key(0), Some(b.clone()));
+        assert_eq!(app.store(&b).unwrap().screen().size(), (10, 40));
+
+        refresh(&mut app, &["a", "b"]);
+
+        assert_eq!(
+            app.store(&b).unwrap().screen().size(),
+            (10, 40),
+            "the store on screen was released out from under the pane"
+        );
+    }
+
+    /// A reopened service must render its logs, not the empty-buffer notice.
+    /// `log_pane` switches the whole pane on `has_output`, so a release that
+    /// dropped the flag would draw "Waiting for output..." over a fully
+    /// restored scrollback until the next byte happened to arrive.
+    #[test]
+    fn a_reopened_service_still_reports_that_it_has_output() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        assert!(
+            app.store(&a).unwrap().has_output(),
+            "the pane would draw the waiting-for-output notice over real logs"
+        );
+    }
+
+    /// Scroll position deliberately does not survive a close and reopen. A
+    /// reader who had scrolled up used to come back to the same row and now
+    /// comes back tailing. The offset counts rows back from the bottom, and
+    /// output kept arriving while the pane was closed, so restoring the number
+    /// would restore a different row than the one they left.
+    #[test]
+    fn reopening_a_service_comes_back_tailing_rather_than_where_it_was_left() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Enter);
+        app.resize_panes(&[(0, 10, 40)]);
+        press_ctrl(&mut app, KeyCode::Char('u'));
+        assert!(
+            app.store(&a).unwrap().scroll_offset() > 0,
+            "the test needs a scrolled-up pane to prove anything"
+        );
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        assert_eq!(
+            app.store(&a).unwrap().scroll_offset(),
+            0,
+            "a reopened pane should be tailing, not restoring a stale row"
+        );
+    }
+
+    /// Full screen hides the sibling pane without vacating its slot, so the
+    /// housekeeping leaves its emulator alone and returning to it finds the
+    /// pane as it was. This is the one case where a service no pane is showing
+    /// deliberately keeps its grid.
+    #[test]
+    fn a_pane_hidden_by_full_screen_keeps_its_emulator() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('2'));
+        app.resize_panes(&[(0, 10, 40), (1, 10, 40)]);
+        assert_eq!(app.store(&a).unwrap().screen().size(), (10, 40));
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.full_screen_pane(),
+            Some(1),
+            "expected pane 2 full screen"
+        );
+
+        refresh(&mut app, &["a", "b"]);
+
+        assert_eq!(
+            app.store(&a).unwrap().screen().size(),
+            (10, 40),
+            "the pane hidden behind full screen lost its emulator"
+        );
+    }
+
+    /// The scan asks `pane_key` for every slot, not just the first. One that
+    /// stopped at slot 0 would release the store behind pane 2 on every poll
+    /// while the user was reading it -- the same defect as reading `panes`,
+    /// just one slot further along.
+    #[test]
+    fn a_service_pinned_to_the_second_pane_keeps_its_emulator() {
+        let mut app = app_with(&["a", "b"]);
+        let b = ServiceKey::new("b", 1);
+        fill(&mut app, &b, 200);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.pane_key(1), Some(b.clone()));
+        app.resize_panes(&[(1, 10, 40)]);
+        assert_eq!(app.store(&b).unwrap().screen().size(), (10, 40));
+
+        refresh(&mut app, &["a", "b"]);
+
+        assert_eq!(
+            app.store(&b).unwrap().screen().size(),
+            (10, 40),
+            "the store behind pane 2 was released while it was on screen"
+        );
     }
 
     #[test]
