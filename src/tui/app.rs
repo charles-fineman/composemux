@@ -325,7 +325,7 @@ impl App {
             .retain(|key, _| live.contains(key) || pinned.contains(key));
     }
 
-    /// Releases the emulator of every service no pane is showing.
+    /// Releases the emulator of every service no pane slot holds.
     ///
     /// `prune_stores` above only frees a store whose container is gone. A live
     /// service that was browsed once and left keeps a megabytes-wide `vt100`
@@ -338,6 +338,16 @@ impl App {
     /// pane 0 follows the selection and holds no pinned entry -- keyed off
     /// `panes` this would release the store the user is looking at, on every
     /// refresh.
+    ///
+    /// That `pane_key` set is the invariant the whole thing rests on: anything
+    /// reading a store's screen, text or scroll offset has to resolve through
+    /// `pane_key` too, or it will find a released store and render an empty
+    /// grid. Every reader does today.
+    ///
+    /// Full screen is the deliberate exception. It hides the sibling pane, but
+    /// the slot still holds it, so its emulator survives -- keeping a hidden
+    /// pane's scroll position costs one grid and is what returning to it
+    /// expects.
     fn release_offscreen_stores(&mut self) {
         let shown: Vec<ServiceKey> = (0..MAX_PANES).filter_map(|i| self.pane_key(i)).collect();
         for (key, store) in self.stores.iter_mut() {
@@ -1999,8 +2009,13 @@ mod tests {
         press(&mut app, KeyCode::Char('1'));
         refresh(&mut app, &["a", "b"]);
 
-        assert!(
-            app.store(&a).unwrap().screen().size().1 < 40,
+        // The exact floor, not merely "smaller": a partial shrink would satisfy
+        // a loose bound without releasing anything. `(3, 20)` is `MIN_ROWS` and
+        // `MIN_COLS`, which are private to `model::store` and cannot be named
+        // from here.
+        assert_eq!(
+            app.store(&a).unwrap().screen().size(),
+            (3, 20),
             "a service in no pane kept its pane-sized emulator"
         );
     }
@@ -2051,6 +2066,31 @@ mod tests {
             app.store(&b).unwrap().screen().size(),
             (10, 40),
             "the store on screen was released out from under the pane"
+        );
+    }
+
+    /// A reopened service must render its logs, not the empty-buffer notice.
+    /// `log_pane` switches the whole pane on `has_output`, so a release that
+    /// dropped the flag would draw "Waiting for output..." over a fully
+    /// restored scrollback until the next byte happened to arrive.
+    #[test]
+    fn a_reopened_service_still_reports_that_it_has_output() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        assert!(
+            app.store(&a).unwrap().has_output(),
+            "the pane would draw the waiting-for-output notice over real logs"
         );
     }
 

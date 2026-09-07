@@ -272,9 +272,18 @@ impl LogStore {
     /// lines. A service no pane is showing is holding the larger figure for a
     /// grid nothing reads, so this releases it and leaves `resize` to replay.
     ///
-    /// The replay is not new work. A store is created at the default geometry
-    /// and `resize` already replays it the first time it lands in a pane of any
-    /// other size; this only makes every view a first view.
+    /// The replay is the same work a first view already does -- a store is
+    /// created at the default geometry and `resize` replays it the moment it
+    /// lands in a pane of any other size -- but it is done once per view
+    /// rather than once per session.
+    ///
+    /// What comes back is what a `resize` would have rebuilt, which is all of
+    /// the history while the *line* budget is what binds. Under `MAX_RAW_BYTES`
+    /// it is less: escape-heavy output spends raw bytes without spending
+    /// emulator rows, so `raw` falls short of `keep_lines` and the replay
+    /// cannot refill the grid. A resize has always paid that; releasing moves
+    /// the cost from "when the pane changes size" to "whenever the pane
+    /// closes".
     ///
     /// Scroll position does not survive, and should not: the offset counts rows
     /// back from the bottom, and output kept arriving while the pane was
@@ -1235,9 +1244,13 @@ mod tests {
         );
     }
 
-    /// A store with output it cannot reproduce must keep the grid it has. The
-    /// pane is showing content that exists nowhere else, and releasing would
-    /// blank it permanently -- the same case `resize` refuses to replay.
+    /// A store with output it cannot reproduce must keep the grid it has.
+    ///
+    /// No public sequence reaches this: `trim_point` never cuts the whole
+    /// buffer away, so `raw` is non-empty whenever `has_output` is. The guard
+    /// is insurance mirroring the one in `resize`, and the test has to reach
+    /// past the API to exercise it -- releasing such a store would blank a pane
+    /// permanently, which is worth a branch that costs nothing.
     #[test]
     fn a_store_that_cannot_be_rebuilt_keeps_its_grid() {
         let mut s = store_with(200);
