@@ -171,11 +171,11 @@ pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)>
     // every service container it creates -- unscaled services and
     // `container_name:` overrides alike. What it leaves unlabelled is a
     // `docker compose run` one-off, which `is_transient_labels` has already
-    // rejected three lines above, so against that compose this default is
-    // never reached -- and it is that filter, not the label, that makes it so.
-    // The default stands for a compose that omits the label on a service
-    // container. Reading the index out of the container name is the
-    // alternative #51 raises, and it is declined here:
+    // rejected above. So against that compose the default is unreachable, and
+    // it is that filter rather than the label that keeps it so. The default
+    // stands for a compose that omits the label on a service container.
+    // Reading the index out of the container name is the alternative #51
+    // raises, and it is declined here:
     // `<project>-<service>-<n>` is not a shape every container has, since a
     // `container_name:` override replaces the whole name, so that fallback
     // would sometimes read an index out of a name carrying none.
