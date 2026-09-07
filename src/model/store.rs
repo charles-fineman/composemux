@@ -1230,6 +1230,12 @@ mod tests {
         // Counted over the whole retained buffer rather than the visible rows:
         // the budget is what is under test, and a pane's worth of rows would
         // pass on a buffer trimmed to just under one screen.
+        //
+        // The budget here is `keep_lines_for(2, 20)`, so 22 lines, one of which
+        // is "before" -- about 21 survive. A budget reset to the released
+        // geometry would be `keep_lines_for(2, 3)`, so 5. The threshold sits in
+        // that gap rather than on either edge, so neither trimming jitter nor a
+        // near-miss decides the result.
         let text = s.all_text();
         let kept = text.lines().filter(|l| l.contains("while closed")).count();
         assert!(
@@ -1238,7 +1244,7 @@ mod tests {
         );
     }
 
-    /// A released store keeps ingesting, and the point is that what it ingests    /// A released store keeps ingesting, and the point is that what it ingests
+    /// A released store keeps ingesting, and the point is that what it ingests
     /// stops costing anything until the service is looked at again. Released
     /// with its scrollback budget intact it would quietly refill -- 1000 rows
     /// at any width is hundreds of kilobytes, most of the saving handed back.
@@ -1292,6 +1298,85 @@ mod tests {
             released.screen().contents_formatted(),
             resized.screen().contents_formatted(),
             "the styling carried across the trim was lost"
+        );
+    }
+
+    /// The one thing a release costs that a closed pane did not cost before.
+    ///
+    /// While the line budget binds, a replay is lossless. Under `MAX_RAW_BYTES`
+    /// it is not: escape-heavy output spends raw bytes without spending
+    /// emulator rows, so `raw` falls short of `keep_lines` and the replay
+    /// cannot refill the grid. A resize has always paid that -- but before
+    /// releasing existed, reopening a pane at an unchanged size short-circuited
+    /// `resize` and paid nothing, so the shortfall was only ever charged when a
+    /// pane actually changed size. It is now charged whenever a pane closes.
+    ///
+    /// This asserts the loss deliberately, at an unchanged geometry where there
+    /// used to be none. It is accepted because the alternative is holding the
+    /// grid for a service nobody is looking at, and because the content that
+    /// triggers it is already past the ceiling the buffer exists to enforce.
+    /// The test is here so that it cannot silently deepen.
+    #[test]
+    fn under_the_byte_ceiling_a_release_costs_history_a_reopen_used_to_keep() {
+        // Carriage-return padding: each one costs a byte and no row, and leaves
+        // the text before it on screen. That is the shape that drives `raw`
+        // past the byte ceiling while the line budget stays untouched -- the
+        // same asymmetry escape-heavy output has, without the parser cost of
+        // eight megabytes of escape sequences.
+        //
+        // Fed as one write, not six hundred: past the ceiling every write
+        // rescans the whole buffer for its trim point, so writing line by line
+        // costs hundreds of eight-megabyte scans and minutes of runtime for the
+        // same end state.
+        let payload = {
+            let padding = "\r".repeat(15_000);
+            let mut v = Vec::new();
+            for i in 0..600 {
+                v.extend_from_slice(format!("line {i}{padding}\r\n").as_bytes());
+            }
+            v
+        };
+        let build = || {
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(10, 40);
+            s.process(&payload);
+            s
+        };
+        let oldest = |s: &mut LogStore| {
+            let text = s.all_text();
+            text.lines()
+                .find_map(|l| l.trim().strip_prefix("line ").map(str::to_string))
+                .and_then(|n| n.parse::<usize>().ok())
+                .expect("some retained line")
+        };
+
+        let mut reopened = build();
+        let mut released = build();
+        // The premise: the *byte* ceiling is what trimmed, not the line budget.
+        // Fewer lines retained than the budget allows is what proves it.
+        assert!(
+            reopened.lines < reopened.keep_lines,
+            "the byte ceiling never bound: {} lines against a budget of {}",
+            reopened.lines,
+            reopened.keep_lines
+        );
+        let live = oldest(&mut reopened);
+
+        // Before this change, reopening at an unchanged size cost nothing,
+        // because `resize` short-circuited on the size it already had.
+        reopened.resize(10, 40);
+        assert_eq!(
+            oldest(&mut reopened),
+            live,
+            "an unchanged resize lost history"
+        );
+
+        released.release();
+        released.resize(10, 40);
+
+        assert!(
+            oldest(&mut released) > live,
+            "expected the byte ceiling to cost history across a release"
         );
     }
 
