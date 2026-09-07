@@ -105,11 +105,16 @@ mod tests {
         let mut health = ConnectionHealth::default();
         for _ in 0..20 {
             health.record_failure();
-            health.record_success();
+            // Sampled here rather than after the success, because here is
+            // where the production code looks: `poll_outcome` records a
+            // failure and reads this in the same breath, so this is the state
+            // that decides whether the note flashes. After a success the count
+            // is trivially zero and the assertion would prove nothing.
             assert!(
                 !health.is_unreachable(),
                 "an answered poll is not an outage"
             );
+            health.record_success();
         }
         // Then a run stopped one short, resumed after a success, which is the
         // near miss an off-by-one would let through.
