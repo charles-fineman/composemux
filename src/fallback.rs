@@ -135,11 +135,11 @@ impl LineAssembler {
     /// line neither container wrote.
     ///
     /// The identity travels with the bytes, so the split happens on the
-    /// replacement's very first chunk. Nothing here waits on a listing, a
-    /// topology event or a timer, which is what makes it exact rather than a
-    /// race the recreate window can win: the reclaim in `prune_assemblers`
-    /// still reclaims the *entry*, but it cannot be relied on to be the thing
-    /// that breaks the splice.
+    /// replacement's very first chunk, without waiting on a listing, a
+    /// topology event or a timer. That is not the more reliable of two
+    /// routes: the reclaim in `prune_assemblers` never reaches a recreate at
+    /// all, because the key stays in the listing right through one.
+    /// [`PRUNE_INTERVAL`] carries the measurement.
     ///
     /// Returning the tail rather than printing it keeps this method free of
     /// the prefix column, and the caller emits it immediately before the new
