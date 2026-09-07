@@ -114,7 +114,7 @@ pub fn sort_services(services: &mut [Service]) {
 /// never has two live members, and one that does is a collision this pass did
 /// not come for: a compose that omits `container-number` on a scaled service
 /// (#51) defaults every replica to `1`, and collapsing there would leave one row
-/// while `LogSupervisor`, which derives the replica index independently, went on
+/// while `LogSupervisor`, whose streams are keyed on that same pair, went on
 /// streaming all of them into it. The extra rows are the only sign in the UI
 /// that the extra containers exist, so they stay.
 pub fn collapse_replaced_containers(services: &mut Vec<Service>) {
