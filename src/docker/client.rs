@@ -7,11 +7,13 @@ use anyhow::{Context, Result};
 use bollard::models::{
     ContainerState, ContainerStateStatusEnum, ContainerSummary, HealthStatusEnum,
 };
-use bollard::query_parameters::{InspectContainerOptions, ListContainersOptionsBuilder};
+use bollard::query_parameters::{
+    InspectContainerOptions, ListContainersOptions, ListContainersOptionsBuilder,
+};
 use bollard::Docker;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Inspect calls issued at once when refreshing the service list. Compose
 /// projects are small, but one round-trip per container in series is noticeably
@@ -40,24 +42,38 @@ impl DockerClient {
         &self.docker
     }
 
+    /// List options for every container carrying the compose project label,
+    /// running or not.
+    ///
+    /// `Some(project)` narrows to that project; `None` matches any value of
+    /// the label, which is how the project names themselves are discovered.
+    ///
+    /// One construction rather than one per caller, because
+    /// [`list_container_keys`](Self::list_container_keys) is only comparable
+    /// with what [`list_services`](Self::list_services) reports if the two ask
+    /// the daemon the same question. Separate copies read as obviously alike
+    /// and sit far enough apart to stop being so without anyone noticing.
+    fn project_containers(project: Option<&str>) -> ListContainersOptions {
+        let label = match project {
+            Some(project) => format!("{}={}", labels::PROJECT, project),
+            None => labels::PROJECT.to_string(),
+        };
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![label]);
+        ListContainersOptionsBuilder::default()
+            .all(true)
+            .filters(&filters)
+            .build()
+    }
+
     /// Every container belonging to `project`, one `Service` per container.
     ///
     /// One-off (`compose run`) and lifecycle-hook containers are excluded: they
     /// are transient and would otherwise churn the sidebar.
     pub async fn list_services(&self, project: &str) -> Result<Vec<Service>> {
-        let mut filters = HashMap::new();
-        filters.insert(
-            "label".to_string(),
-            vec![format!("{}={}", labels::PROJECT, project)],
-        );
-        let options = ListContainersOptionsBuilder::default()
-            .all(true)
-            .filters(&filters)
-            .build();
-
         let summaries = self
             .docker
-            .list_containers(Some(options))
+            .list_containers(Some(Self::project_containers(Some(project))))
             .await
             .context("could not list containers")?;
 
@@ -81,17 +97,44 @@ impl DockerClient {
         Ok(services)
     }
 
+    /// The `(service, replica)` of every container in the project.
+    ///
+    /// One-off (`compose run`) and lifecycle-hook containers are excluded, the
+    /// same way `LogSupervisor::resync` excludes them from what it attaches
+    /// to. A key that no log stream can ever be delivered under would look
+    /// like a container that is alive and silent.
+    ///
+    /// [`list_services`](Self::list_services) inspects each container to fill
+    /// in status, health and timings. A caller that only needs to know which
+    /// containers exist would pay a round trip apiece for fields it throws
+    /// away, so this reads the identity off the list entry's labels and stops
+    /// there.
+    ///
+    /// Those are the same labels, filtered the same way, that
+    /// `LogSupervisor::resync` uses to decide what to attach to. Deriving the
+    /// two alike is what makes this answer comparable with the keys the log
+    /// streams are actually delivered under.
+    ///
+    /// `all(true)`, so a container that has stopped but has not been removed
+    /// is still reported. A key disappears from here only once the container
+    /// is gone for good.
+    pub async fn list_container_keys(&self, project: &str) -> Result<HashSet<(String, u32)>> {
+        let summaries = self
+            .docker
+            .list_containers(Some(Self::project_containers(Some(project))))
+            .await
+            .context("could not list containers")?;
+
+        Ok(summaries.iter().filter_map(container_key).collect())
+    }
+
     /// Distinct compose project names visible to the daemon. Used to give a
     /// useful error when the requested project isn't running.
     pub async fn list_projects(&self) -> Result<Vec<String>> {
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![labels::PROJECT.to_string()]);
-        let options = ListContainersOptionsBuilder::default()
-            .all(true)
-            .filters(&filters)
-            .build();
-
-        let summaries = self.docker.list_containers(Some(options)).await?;
+        let summaries = self
+            .docker
+            .list_containers(Some(Self::project_containers(None)))
+            .await?;
         let mut names: Vec<String> = summaries
             .iter()
             .filter_map(|s| s.labels.as_ref()?.get(labels::PROJECT).cloned())
@@ -102,19 +145,50 @@ impl DockerClient {
     }
 }
 
-/// Builds a `Service` from a list entry and the container's inspected state.
+/// The `(service, replica)` a list entry belongs to, or `None` if it is not a
+/// container this tool follows.
 ///
-/// Kept free of I/O so the label and status mapping can be tested directly.
-fn build_service(summary: &ContainerSummary, state: Option<&ContainerState>) -> Option<Service> {
+/// Kept free of I/O for the same reason [`build_service`] is: the mapping is
+/// the part that can be wrong, and it is worth reaching without a daemon.
+///
+/// Shared with `LogSupervisor::resync` rather than written twice. The
+/// fallback's reclaim compares what this reports against the keys the log
+/// streams are delivered under, so the two have to agree exactly: a container
+/// one of them called replica 0 while the other called it 1 would look
+/// departed for the whole run, and its held line would be cut in half every
+/// time the reclaim came round. One definition is what makes that agreement
+/// structural instead of a convention nothing checks.
+pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)> {
+    // Rejected the way `resync` and `build_service` reject it. Neither can do
+    // anything with an entry that has no id, so one reported alive here would
+    // be a key no log stream is ever delivered under.
+    summary.id.as_ref()?;
     let labels_map = summary.labels.as_ref()?;
-    let name = labels_map.get(labels::SERVICE)?.clone();
-    // An unscaled service has no container-number label on some compose
-    // versions; treat it as the first (and only) replica.
+    if is_transient_labels(labels_map) {
+        return None;
+    }
+    // Compose omits the number on an unscaled service, which is replica 1 --
+    // the same default `LogSupervisor::resync` applies to the same label.
     let replica = labels_map
         .get(labels::CONTAINER_NUMBER)
         .and_then(|n| n.parse().ok())
         .unwrap_or(1);
-    summary.id.as_ref()?;
+    Some((labels_map.get(labels::SERVICE)?.clone(), replica))
+}
+
+/// Builds a `Service` from a list entry and the container's inspected state.
+///
+/// Kept free of I/O so the status mapping can be tested directly.
+///
+/// The identity comes from [`container_key`] rather than a second reading of
+/// the same two labels. The sidebar and the fallback's reclaim have to name a
+/// container alike, and the container-number default is exactly the kind of
+/// rule that drifts once it is written twice. Reusing the key also brings its
+/// transient filter along, which narrows nothing in practice:
+/// [`list_services`](DockerClient::list_services), the only caller, already
+/// drops one-off and hook containers before this, so as not to inspect them.
+fn build_service(summary: &ContainerSummary, state: Option<&ContainerState>) -> Option<Service> {
+    let (name, replica) = container_key(summary)?;
 
     let exit_code = state.and_then(|s| s.exit_code);
     let started_at = state
@@ -150,7 +224,12 @@ fn is_transient(summary: &ContainerSummary) -> bool {
 
 /// Whether a container is one compose created for a one-off `run` or a
 /// lifecycle hook. Both are ephemeral and would otherwise churn the sidebar.
-pub fn is_transient_labels(labels_map: &HashMap<String, String>) -> bool {
+///
+/// Module-local again: `container_key` is now the only caller outside this
+/// file's own `is_transient`, so `LogSupervisor::resync` no longer reaches for
+/// it directly. Within this file it still has two application sites --
+/// `is_transient`, which `list_services` filters through, and `container_key`.
+fn is_transient_labels(labels_map: &HashMap<String, String>) -> bool {
     labels_map.get(labels::ONEOFF).is_some_and(|v| v == "True")
         || labels_map.contains_key(labels::HOOK)
 }
@@ -271,6 +350,95 @@ mod tests {
     fn a_container_without_an_id_is_skipped() {
         let s = summary(&[(labels::SERVICE, "api")], false);
         assert!(build_service(&s, None).is_none());
+    }
+
+    /// The one construction three listings share, so their answers stay
+    /// comparable. Narrowing to the project is the point of the `Some` case:
+    /// without it a second compose project on the same daemon would report
+    /// containers this one never streams, and every assembler would look
+    /// alive.
+    #[test]
+    fn project_options_narrow_to_one_project() {
+        let options = DockerClient::project_containers(Some("demo"));
+        assert!(options.all, "a stopped container has to still be listed");
+        assert_eq!(
+            options.filters.expect("a label filter")["label"],
+            vec![format!("{}=demo", labels::PROJECT)]
+        );
+    }
+
+    /// `None` matches any value of the label, which is how the project names
+    /// themselves are discovered -- a filter naming one project could not.
+    #[test]
+    fn project_options_without_a_project_match_any_project() {
+        let options = DockerClient::project_containers(None);
+        assert!(options.all);
+        assert_eq!(
+            options.filters.expect("a label filter")["label"],
+            vec![labels::PROJECT.to_string()]
+        );
+    }
+
+    /// The key has to name the container the log streams are keyed on, which
+    /// is the service plus the replica. The service alone would collapse a
+    /// scaled service's containers into one.
+    #[test]
+    fn container_key_reads_the_service_and_the_replica() {
+        assert_eq!(
+            container_key(&compose_summary()),
+            Some(("api".to_string(), 2))
+        );
+    }
+
+    /// The same default `build_service` and `LogSupervisor::resync` apply to
+    /// the same label, and the three have to agree: a container this called
+    /// replica 0 while its log stream called it 1 would look departed for the
+    /// whole run.
+    #[test]
+    fn a_key_without_a_container_number_is_the_first_replica() {
+        let s = summary(&[(labels::SERVICE, "api")], true);
+        assert_eq!(container_key(&s), Some(("api".to_string(), 1)));
+    }
+
+    /// One-off and hook containers are filtered out of the listing the log
+    /// streams are planned from, so they have to be filtered out of this one
+    /// too. Filtering in only one of the two is how the sets drift apart.
+    #[test]
+    fn a_transient_container_has_no_key() {
+        let oneoff = summary(&[(labels::SERVICE, "api"), (labels::ONEOFF, "True")], true);
+        assert!(container_key(&oneoff).is_none());
+        let hook = summary(&[(labels::SERVICE, "api"), (labels::HOOK, "start")], true);
+        assert!(container_key(&hook).is_none());
+    }
+
+    /// The identity is read once, in `container_key`, so that the sidebar and
+    /// the fallback's reclaim cannot name the same container differently.
+    /// This pins the one thing that reuse shows through: a transient
+    /// container has no key, so it can no longer become a `Service` even
+    /// where a caller forgot to filter it out first.
+    #[test]
+    fn a_transient_container_is_not_a_service() {
+        let oneoff = summary(&[(labels::SERVICE, "api"), (labels::ONEOFF, "True")], true);
+        assert!(build_service(&oneoff, None).is_none());
+        let hook = summary(&[(labels::SERVICE, "api"), (labels::HOOK, "start")], true);
+        assert!(build_service(&hook, None).is_none());
+    }
+
+    /// A container with no service label is not part of the project's graph,
+    /// so a key for it could never match anything the streams deliver.
+    #[test]
+    fn a_container_without_a_service_label_has_no_key() {
+        let s = summary(&[(labels::PROJECT, "demo")], true);
+        assert!(container_key(&s).is_none());
+    }
+
+    /// The same rejection `resync` and `build_service` make. An entry with no
+    /// id is one neither of them will attach to, so reporting it alive would
+    /// hold an assembler open against a container that never speaks.
+    #[test]
+    fn a_container_without_an_id_has_no_key() {
+        let s = summary(&[(labels::SERVICE, "api")], false);
+        assert!(container_key(&s).is_none());
     }
 
     #[test]
