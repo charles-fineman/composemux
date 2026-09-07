@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use bollard::models::{
     ContainerState, ContainerStateStatusEnum, ContainerSummary, HealthStatusEnum,
 };
-use bollard::query_parameters::{InspectContainerOptions, ListContainersOptionsBuilder};
+use bollard::query_parameters::{
+    InspectContainerOptions, ListContainersOptions, ListContainersOptionsBuilder,
+};
 use bollard::Docker;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -40,24 +42,37 @@ impl DockerClient {
         &self.docker
     }
 
+    /// List options for every container carrying the compose project label,
+    /// running or not.
+    ///
+    /// `Some(project)` narrows to that project; `None` matches any value of
+    /// the label, which is how the project names themselves are discovered.
+    ///
+    /// One construction rather than one per caller, because
+    /// [`list_container_keys`](Self::list_container_keys) is only comparable
+    /// with what [`list_services`](Self::list_services) reports if the two ask
+    /// the daemon the same question. Copies twenty lines apart drift.
+    fn project_containers(project: Option<&str>) -> ListContainersOptions {
+        let label = match project {
+            Some(project) => format!("{}={}", labels::PROJECT, project),
+            None => labels::PROJECT.to_string(),
+        };
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![label]);
+        ListContainersOptionsBuilder::default()
+            .all(true)
+            .filters(&filters)
+            .build()
+    }
+
     /// Every container belonging to `project`, one `Service` per container.
     ///
     /// One-off (`compose run`) and lifecycle-hook containers are excluded: they
     /// are transient and would otherwise churn the sidebar.
     pub async fn list_services(&self, project: &str) -> Result<Vec<Service>> {
-        let mut filters = HashMap::new();
-        filters.insert(
-            "label".to_string(),
-            vec![format!("{}={}", labels::PROJECT, project)],
-        );
-        let options = ListContainersOptionsBuilder::default()
-            .all(true)
-            .filters(&filters)
-            .build();
-
         let summaries = self
             .docker
-            .list_containers(Some(options))
+            .list_containers(Some(Self::project_containers(Some(project))))
             .await
             .context("could not list containers")?;
 
@@ -83,6 +98,11 @@ impl DockerClient {
 
     /// The `(service, replica)` of every container in the project.
     ///
+    /// One-off (`compose run`) and lifecycle-hook containers are excluded, the
+    /// same way `LogSupervisor::resync` excludes them from what it attaches
+    /// to. A key that no log stream can ever be delivered under would look
+    /// like a container that is alive and silent.
+    ///
     /// [`list_services`](Self::list_services) inspects each container to fill
     /// in status, health and timings. A caller that only needs to know which
     /// containers exist would pay a round trip apiece for fields it throws
@@ -98,19 +118,9 @@ impl DockerClient {
     /// is still reported. A key disappears from here only once the container
     /// is gone for good.
     pub async fn list_container_keys(&self, project: &str) -> Result<HashSet<(String, u32)>> {
-        let mut filters = HashMap::new();
-        filters.insert(
-            "label".to_string(),
-            vec![format!("{}={}", labels::PROJECT, project)],
-        );
-        let options = ListContainersOptionsBuilder::default()
-            .all(true)
-            .filters(&filters)
-            .build();
-
         let summaries = self
             .docker
-            .list_containers(Some(options))
+            .list_containers(Some(Self::project_containers(Some(project))))
             .await
             .context("could not list containers")?;
 
@@ -120,14 +130,10 @@ impl DockerClient {
     /// Distinct compose project names visible to the daemon. Used to give a
     /// useful error when the requested project isn't running.
     pub async fn list_projects(&self) -> Result<Vec<String>> {
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![labels::PROJECT.to_string()]);
-        let options = ListContainersOptionsBuilder::default()
-            .all(true)
-            .filters(&filters)
-            .build();
-
-        let summaries = self.docker.list_containers(Some(options)).await?;
+        let summaries = self
+            .docker
+            .list_containers(Some(Self::project_containers(None)))
+            .await?;
         let mut names: Vec<String> = summaries
             .iter()
             .filter_map(|s| s.labels.as_ref()?.get(labels::PROJECT).cloned())
@@ -145,6 +151,10 @@ impl DockerClient {
 /// mapping is the part that can be wrong, and it is worth reaching without a
 /// daemon.
 fn container_key(summary: &ContainerSummary) -> Option<(String, u32)> {
+    // Rejected the way `resync` and `build_service` reject it. Neither can do
+    // anything with an entry that has no id, so one reported alive here would
+    // be a key no log stream is ever delivered under.
+    summary.id.as_ref()?;
     let labels_map = summary.labels.as_ref()?;
     if is_transient_labels(labels_map) {
         return None;
@@ -329,6 +339,33 @@ mod tests {
         assert!(build_service(&s, None).is_none());
     }
 
+    /// The one construction three listings share, so their answers stay
+    /// comparable. Narrowing to the project is the point of the `Some` case:
+    /// without it a second compose project on the same daemon would report
+    /// containers this one never streams, and every assembler would look
+    /// alive.
+    #[test]
+    fn project_options_narrow_to_one_project() {
+        let options = DockerClient::project_containers(Some("demo"));
+        assert!(options.all, "a stopped container has to still be listed");
+        assert_eq!(
+            options.filters.expect("a label filter")["label"],
+            vec![format!("{}=demo", labels::PROJECT)]
+        );
+    }
+
+    /// `None` matches any value of the label, which is how the project names
+    /// themselves are discovered -- a filter naming one project could not.
+    #[test]
+    fn project_options_without_a_project_match_any_project() {
+        let options = DockerClient::project_containers(None);
+        assert!(options.all);
+        assert_eq!(
+            options.filters.expect("a label filter")["label"],
+            vec![labels::PROJECT.to_string()]
+        );
+    }
+
     /// The key has to name the container the log streams are keyed on, which
     /// is the service plus the replica. The service alone would collapse a
     /// scaled service's containers into one.
@@ -366,6 +403,15 @@ mod tests {
     #[test]
     fn a_container_without_a_service_label_has_no_key() {
         let s = summary(&[(labels::PROJECT, "demo")], true);
+        assert!(container_key(&s).is_none());
+    }
+
+    /// The same rejection `resync` and `build_service` make. An entry with no
+    /// id is one neither of them will attach to, so reporting it alive would
+    /// hold an assembler open against a container that never speaks.
+    #[test]
+    fn a_container_without_an_id_has_no_key() {
+        let s = summary(&[(labels::SERVICE, "api")], false);
         assert!(container_key(&s).is_none());
     }
 

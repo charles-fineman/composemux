@@ -206,7 +206,9 @@ fn handle_output(
 }
 
 /// Writes the unterminated tail each of `removed` was still holding, as a line
-/// under the same prefix that container's earlier lines used.
+/// under the same label that container's earlier lines used, in the loop's
+/// column rather than one of its own -- the width it lands at is whatever has
+/// accumulated by then, which is what keeps it aligned with the lines above.
 ///
 /// Takes assemblers that have already been taken out of the map, because every
 /// caller is getting rid of them: emitting a tail and leaving the entry behind
