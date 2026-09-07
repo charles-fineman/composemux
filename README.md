@@ -194,6 +194,13 @@ the finest resolution the Engine API offers here. A couple of already-visible
 lines can reappear as a result. That's the deliberate trade: a duplicated line
 beats a missing one.
 
+If the daemon goes away entirely, composemux keeps retrying rather than
+exiting, and the status bar says `Docker daemon unreachable - retrying` so a
+frozen screen can't be mistaken for a quiet stack. Statuses and logs stay at
+their last known values until it answers again, at which point the note clears
+on its own. It takes a short run of failed polls to appear, so a single dropped
+request never flashes it.
+
 Everything then goes through a `vt100` terminal emulator before it reaches the
 screen, which is why colour, cursor movement and progress bars behave rather
 than smearing themselves across the UI. It's also a safety property — container

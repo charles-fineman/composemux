@@ -122,6 +122,16 @@ fn context_line(app: &App) -> Line<'static> {
             Style::default().fg(THEME.warning),
         ));
     }
+    // Above the filter, which only restates something the user typed and can
+    // retype, and below the countdown, which is the sole warning that the app
+    // is about to close itself. Warning rather than error: the supervisor and
+    // the poller both keep retrying, so this is a condition being handled.
+    if !app.daemon_reachable() {
+        return Line::from(Span::styled(
+            "Docker daemon unreachable - retrying",
+            Style::default().fg(THEME.warning),
+        ));
+    }
     match app.filter().state() {
         FilterState::Editing => Line::from(vec![
             Span::styled(
@@ -153,12 +163,22 @@ fn context_line(app: &App) -> Line<'static> {
 pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let status = status_line(app);
     let status_width = (status.width() as u16).clamp(1, STATUS_MIN_WIDTH);
-    // Floor the budget at the minimum hint width, but never above the space
-    // that actually exists, or the hints would overflow instead of degrading.
+    let context = context_line(app);
     let available = area
         .width
         .saturating_sub(status_width + BOTTOM_SPACING + RIGHT_MARGIN);
-    let help_budget = available.max(MIN_HELP_WIDTH).min(available.max(1));
+    // The middle slot takes its natural width before the hints do, and only
+    // the essential hints are held back for it, exactly as nx orders the two
+    // in `render_single_line`. Letting the hints go first starved the slot:
+    // 24 columns at 120, and 4 at both 80 and 100, which truncated every
+    // message it has ever carried.
+    //
+    // Floor the budget at the minimum hint width, but never above the space
+    // that actually exists, or the hints would overflow instead of degrading.
+    let help_budget = available
+        .saturating_sub(context.width() as u16)
+        .max(MIN_HELP_WIDTH)
+        .min(available.max(1));
     let help = help_line(app, help_budget);
     let help_width = help.width() as u16;
 
@@ -173,7 +193,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         .split(area);
 
     Widget::render(Paragraph::new(status), chunks[0], buf);
-    Widget::render(Paragraph::new(context_line(app)), chunks[2], buf);
+    Widget::render(Paragraph::new(context), chunks[2], buf);
     Widget::render(Paragraph::new(help).right_aligned(), chunks[3], buf);
 }
 
@@ -313,6 +333,116 @@ mod tests {
             .collect();
         assert!(text.starts_with("/a"), "got {text}");
         assert!(text.contains("filtered out"));
+    }
+
+    /// The whole of #19: a frozen screen and a spinning throbber look exactly
+    /// like a quiet stack, so the bar has to say which it is.
+    #[test]
+    fn an_unreachable_daemon_is_named_in_the_context_slot() {
+        let mut app = app_with(&["a"]);
+        app.set_daemon_reachable(false);
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("Docker daemon unreachable"),
+            "the bar must name the daemon, got {text:?}"
+        );
+    }
+
+    /// It has to say it is still trying, or the only reasonable reading is
+    /// that the tool has given up and should be restarted.
+    #[test]
+    fn the_note_says_the_connection_is_being_retried() {
+        let mut app = app_with(&["a"]);
+        app.set_daemon_reachable(false);
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("retrying"), "got {text:?}");
+    }
+
+    #[test]
+    fn the_note_goes_away_when_the_daemon_answers_again() {
+        let mut app = app_with(&["a"]);
+        app.set_daemon_reachable(false);
+        app.set_daemon_reachable(true);
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            !text.contains("Docker daemon"),
+            "recovery must clear the note, got {text:?}"
+        );
+    }
+
+    /// A persisted filter is a reminder of something the user typed and can
+    /// retype; an outage is news. The outage takes the slot.
+    #[test]
+    fn an_unreachable_daemon_outranks_a_persisted_filter() {
+        let mut app = app_with(&["api", "worker"]);
+        for code in [
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyCode::Enter,
+        ] {
+            app.handle_key(
+                crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+                std::time::Instant::now(),
+            );
+        }
+        assert_eq!(app.filter().state(), FilterState::Persisted);
+        app.set_daemon_reachable(false);
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("Docker daemon unreachable"), "got {text:?}");
+        assert!(
+            !text.contains("hidden"),
+            "the slot holds one message, not both: {text:?}"
+        );
+    }
+
+    /// The countdown keeps the slot: it is the only warning that the app is
+    /// about to close itself, and it expires on its own in seconds.
+    #[test]
+    fn the_auto_exit_countdown_outranks_the_daemon_note() {
+        let mut app = App::new("demo", &Config::default());
+        app.set_services(
+            ["a"]
+                .iter()
+                .map(|n| Service {
+                    name: n.to_string(),
+                    replica: 1,
+                    status: ServiceStatus::Success,
+                    health: Health::None,
+                    exit_code: Some(0),
+                    started_at: None,
+                    finished_at: None,
+                })
+                .collect(),
+        );
+        app.set_daemon_reachable(false);
+        // Only meaningful if a countdown is actually running.
+        assert!(app.countdown_remaining().is_some());
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("closing in"), "got {text:?}");
+        assert!(
+            !text.contains("Docker daemon"),
+            "the slot holds one message, not both: {text:?}"
+        );
     }
 
     #[test]

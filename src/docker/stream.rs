@@ -6,7 +6,7 @@
 //! therefore get a *new* container ID) are reattached, and containers created
 //! after startup are picked up.
 
-use crate::docker::client::is_transient_labels;
+use crate::docker::client::container_key;
 use crate::docker::labels;
 use crate::docker::DockerClient;
 use anyhow::Result;
@@ -258,17 +258,15 @@ impl LogSupervisor {
         let seen: Vec<ContainerDesc> = containers
             .iter()
             .filter_map(|c| {
-                let labels_map = c.labels.as_ref()?;
-                if is_transient_labels(labels_map) {
-                    return None;
-                }
+                // The identity comes from `container_key` rather than being
+                // read off the labels again here. What this attaches to is
+                // what the fallback's reclaim compares its listing against, so
+                // a second derivation is a second thing to keep in step.
+                let (service, replica) = container_key(c)?;
                 Some(ContainerDesc {
                     id: c.id.clone()?,
-                    service: labels_map.get(labels::SERVICE)?.clone(),
-                    replica: labels_map
-                        .get(labels::CONTAINER_NUMBER)
-                        .and_then(|n| n.parse().ok())
-                        .unwrap_or(1),
+                    service,
+                    replica,
                     running: matches!(
                         c.state,
                         Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
@@ -494,7 +492,7 @@ fn now_seconds() -> i64 {
 
 /// Diagnostics go to a file rather than stderr: the alternate screen is active,
 /// so printing would corrupt the display.
-fn log_debug(message: &str) {
+pub(crate) fn log_debug(message: &str) {
     if std::env::var_os("COMPOSEMUX_DEBUG").is_none() {
         return;
     }
