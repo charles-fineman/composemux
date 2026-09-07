@@ -813,7 +813,10 @@ mod tests {
     /// checked without a terminal or a pipe.
     #[derive(Default)]
     struct Sink {
+        /// Every byte written, kept rather than discarded so a test can
+        /// assert on the output and not merely on the call succeeding.
         written: Vec<u8>,
+        /// How many times the sink has been flushed.
         flushes: usize,
     }
 
@@ -901,8 +904,12 @@ mod tests {
     /// containers through the same maps the way the loop does.
     #[derive(Default)]
     struct Stream {
+        /// One assembler per `(service, replica)`, keyed as the run loop
+        /// keys its own.
         assemblers: HashMap<(String, u32), LineAssembler>,
+        /// The prefix column, which widens as longer service names appear.
         prefixes: Prefixes,
+        /// Where the prefixed lines land.
         out: Sink,
     }
 

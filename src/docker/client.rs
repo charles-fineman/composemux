@@ -148,9 +148,8 @@ impl DockerClient {
 /// The `(service, replica)` a list entry belongs to, or `None` if it is not a
 /// container this tool follows.
 ///
-/// Kept free of I/O for the same reason [`build_service`] is: the label
-/// mapping is the part that can be wrong, and it is worth reaching without a
-/// daemon.
+/// Kept free of I/O for the same reason [`build_service`] is: the mapping is
+/// the part that can be wrong, and it is worth reaching without a daemon.
 ///
 /// Shared with `LogSupervisor::resync` rather than written twice. The
 /// fallback's reclaim compares what this reports against the keys the log
@@ -179,17 +178,17 @@ pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)>
 
 /// Builds a `Service` from a list entry and the container's inspected state.
 ///
-/// Kept free of I/O so the label and status mapping can be tested directly.
+/// Kept free of I/O so the status mapping can be tested directly.
+///
+/// The identity comes from [`container_key`] rather than a second reading of
+/// the same two labels. The sidebar and the fallback's reclaim have to name a
+/// container alike, and the container-number default is exactly the kind of
+/// rule that drifts once it is written twice. Reusing the key also brings its
+/// transient filter along, which narrows nothing in practice:
+/// [`list_services`](DockerClient::list_services), the only caller, already
+/// drops one-off and hook containers before this, so as not to inspect them.
 fn build_service(summary: &ContainerSummary, state: Option<&ContainerState>) -> Option<Service> {
-    let labels_map = summary.labels.as_ref()?;
-    let name = labels_map.get(labels::SERVICE)?.clone();
-    // An unscaled service has no container-number label on some compose
-    // versions; treat it as the first (and only) replica.
-    let replica = labels_map
-        .get(labels::CONTAINER_NUMBER)
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(1);
-    summary.id.as_ref()?;
+    let (name, replica) = container_key(summary)?;
 
     let exit_code = state.and_then(|s| s.exit_code);
     let started_at = state
@@ -410,6 +409,19 @@ mod tests {
         assert!(container_key(&oneoff).is_none());
         let hook = summary(&[(labels::SERVICE, "api"), (labels::HOOK, "start")], true);
         assert!(container_key(&hook).is_none());
+    }
+
+    /// The identity is read once, in `container_key`, so that the sidebar and
+    /// the fallback's reclaim cannot name the same container differently.
+    /// This pins the one thing that reuse shows through: a transient
+    /// container has no key, so it can no longer become a `Service` even
+    /// where a caller forgot to filter it out first.
+    #[test]
+    fn a_transient_container_is_not_a_service() {
+        let oneoff = summary(&[(labels::SERVICE, "api"), (labels::ONEOFF, "True")], true);
+        assert!(build_service(&oneoff, None).is_none());
+        let hook = summary(&[(labels::SERVICE, "api"), (labels::HOOK, "start")], true);
+        assert!(build_service(&hook, None).is_none());
     }
 
     /// A container with no service label is not part of the project's graph,
