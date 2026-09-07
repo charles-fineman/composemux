@@ -9,6 +9,7 @@ use crate::docker::{DockerClient, LogSupervisor, SourceEvent};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -284,6 +285,45 @@ fn prune_assemblers(
     emit_held_tails(removed, prefixes, out)
 }
 
+/// Asks `live_containers` which containers still exist and reclaims the
+/// assemblers of those that do not.
+///
+/// Races the listing against `cancel` and reports `Break` if cancellation won.
+/// The listing talks to the daemon and can take a while; without the race a
+/// Ctrl-C arriving during one would wait on however long the daemon takes to
+/// answer -- or for ever, if it never does. `Break` is how the caller leaves
+/// the loop by the same door its own cancel arm uses, so the shutdown drain
+/// still runs.
+///
+/// Split out because two arms of the loop reclaim: the topology event that is
+/// inside the rate limit, and the timer that comes round for one the limit
+/// turned away. Writing it twice is how the two would drift apart on the
+/// failed-listing rule below.
+async fn reclaim_departed<F, Fut>(
+    assemblers: &mut HashMap<(String, u32), LineAssembler>,
+    prefixes: &mut Prefixes,
+    live_containers: &F,
+    cancel: &CancellationToken,
+    out: &mut impl Write,
+) -> io::Result<ControlFlow<()>>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<HashSet<(String, u32)>>>,
+{
+    let live = tokio::select! {
+        _ = cancel.cancelled() => return Ok(ControlFlow::Break(())),
+        live = live_containers() => live,
+    };
+    // `None` is a failed listing, not an empty project. Pruning on it would
+    // read a daemon hiccup as every container having gone at once, cutting
+    // live containers' held lines in half in the middle of a run.
+    let Some(live) = live else {
+        return Ok(ControlFlow::Continue(()));
+    };
+    prune_assemblers(assemblers, prefixes, &live, out)?;
+    Ok(ControlFlow::Continue(()))
+}
+
 /// Prints events from `rx` until the channel closes, `cancel` fires, or a
 /// write fails.
 ///
@@ -292,7 +332,9 @@ fn prune_assemblers(
 /// closing newline. `live_containers` reports the containers that still exist,
 /// or `None` if it could not find out. It is called to reclaim the assemblers
 /// of containers that are gone -- on topology events, but at most once every
-/// [`PRUNE_INTERVAL`] and never while nothing is held.
+/// [`PRUNE_INTERVAL`] and never while nothing is held. An event that arrives
+/// inside the interval is remembered rather than dropped, and answered when
+/// the interval comes round.
 ///
 /// Split from [`run`] so the loop can be driven by a plain channel and a
 /// `Vec<u8>`. What stays in `run` -- opening the channel and spawning the
@@ -314,10 +356,38 @@ where
     // Due immediately, so the interval starts at the first topology event
     // rather than being waited out before the first listing.
     let mut next_prune = tokio::time::Instant::now();
+    // A topology event the rate limit turned away, still owed a listing. A
+    // container leaving emits a burst -- `die`, then its log task ending,
+    // then `destroy` -- and only the last of those reports it gone, because a
+    // listing includes containers that have stopped but not been removed.
+    // Dropping the throttled events outright therefore held the departed
+    // container's assembler, and its megabyte, until the run ended.
+    let mut prune_owed = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            // Armed only by an event the limit turned away, so a run whose
+            // events are all answered on the spot schedules no timer at all.
+            // `prune_assemblers` is the only thing that empties the map, and
+            // the arms that reach it clear this, so the map is never empty
+            // here and the listing is never issued for nothing.
+            _ = tokio::time::sleep_until(next_prune), if prune_owed => {
+                prune_owed = false;
+                next_prune = tokio::time::Instant::now() + PRUNE_INTERVAL;
+                if reclaim_departed(
+                    &mut assemblers,
+                    &mut prefixes,
+                    &live_containers,
+                    cancel,
+                    &mut *out,
+                )
+                .await?
+                .is_break()
+                {
+                    break;
+                }
+            }
             message = rx.recv() => {
                 // `None` means every sender is gone -- the supervisor task
                 // returned or panicked -- so no further event can arrive. A
@@ -344,27 +414,33 @@ where
                         // answer would have been, so asking is pure cost. It
                         // is empty at the supervisor's opening event, which
                         // is the one topology event guaranteed to arrive.
-                        if !assemblers.is_empty() && now >= next_prune {
+                        if assemblers.is_empty() {
+                            // Nothing is owed either: an event with nothing
+                            // held has already been answered in full.
+                        } else if now >= next_prune {
                             // Moved on before the listing rather than after
                             // it, so a daemon that is refusing to answer is
                             // asked at the same leisurely rate as one that is.
                             next_prune = now + PRUNE_INTERVAL;
-                            let live = tokio::select! {
-                                // Listing talks to the daemon and can take a
-                                // while. Without this, a Ctrl-C arriving
-                                // during one would wait on the daemon before
-                                // the loop noticed it.
-                                _ = cancel.cancelled() => break,
-                                live = live_containers() => live,
-                            };
-                            // `None` is a failed listing, not an empty
-                            // project. Pruning on it would read a daemon
-                            // hiccup as every container having gone at once,
-                            // cutting live containers' held lines in half in
-                            // the middle of a run.
-                            if let Some(live) = live {
-                                prune_assemblers(&mut assemblers, &mut prefixes, &live, out)?;
+                            prune_owed = false;
+                            if reclaim_departed(
+                                &mut assemblers,
+                                &mut prefixes,
+                                &live_containers,
+                                cancel,
+                                &mut *out,
+                            )
+                            .await?
+                            .is_break()
+                            {
+                                break;
                             }
+                        } else {
+                            // Turned away by the limit rather than answered.
+                            // Remembering it is what keeps a container that
+                            // left inside the interval from holding its
+                            // assembler for the rest of the run.
+                            prune_owed = true;
                         }
                     }
                 }
@@ -1548,7 +1624,9 @@ mod tests {
         }
         assert_eq!(listings.calls(), 1, "one listing per topology event");
 
-        // Past the interval, the next event lists again.
+        // Past the interval, the daemon is asked once more -- by the events
+        // the limit turned away above, or by this one, whichever the loop
+        // reaches first. Either way it is asked once, which is the limit.
         tokio::time::advance(PRUNE_INTERVAL).await;
         tx.send(SourceEvent::Topology)
             .await
@@ -1561,6 +1639,98 @@ mod tests {
             .expect("writing to a Vec cannot fail");
 
         assert_eq!(listings.calls(), 2, "the interval never came round again");
+    }
+
+    /// An event the rate limit turns away still has to be answered. A
+    /// container leaving emits a burst -- `die`, then its log task ending,
+    /// then `destroy` -- inside a few milliseconds, and only the last of them
+    /// reports it gone, since a listing includes containers that have stopped
+    /// but not been removed. Dropping the throttled events left the departed
+    /// container's assembler, and up to `MAX_PARTIAL` bytes, held until the
+    /// run ended -- the retention `#34` is about.
+    #[tokio::test]
+    async fn a_throttled_topology_event_is_answered_when_the_interval_comes_round() {
+        // Frozen, so the only time that passes is the interval itself.
+        tokio::time::pause();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let out = SharedSink::default();
+        let cancel = CancellationToken::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let task = {
+            let mut out = out.clone();
+            let cancel = cancel.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                stream_events(
+                    &mut rx,
+                    &cancel,
+                    // `web-1` is still listed when the burst's first event is
+                    // answered and gone by the time its second would be,
+                    // which is the sequence a dropped event hides.
+                    move || {
+                        let calls = calls.clone();
+                        async move {
+                            let nth = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Some(if nth == 0 {
+                                live(&[("web", 1)])
+                            } else {
+                                live(&[])
+                            })
+                        }
+                    },
+                    &mut out,
+                )
+                .await
+            })
+        };
+
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            bytes: b"Error: exiting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        // The burst: the first is answered, the second lands inside the
+        // interval and is turned away.
+        for _ in 0..2 {
+            tx.send(SourceEvent::Topology)
+                .await
+                .expect("the receiver is alive");
+        }
+
+        // Nothing is runnable once the loop has handled those, so the paused
+        // clock auto-advances to the earliest timer -- the deferred prune's,
+        // an interval away -- and runs it long before this sleep is due.
+        tokio::time::sleep(PRUNE_INTERVAL * 2).await;
+
+        // The sender is alive and nothing has been cancelled, so the loop is
+        // still running and this cannot have come from the shutdown drain.
+        assert_eq!(
+            out.lines(),
+            vec!["web-1  | Error: exiting"],
+            "the turned-away event was dropped, so the tail waited for shutdown"
+        );
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop did not stop when the last sender was dropped")
+            .expect("the loop panicked")
+            .expect("writing to a Vec cannot fail");
+
+        assert_eq!(
+            out.lines(),
+            vec!["web-1  | Error: exiting"],
+            "the drain printed the reclaimed tail a second time"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the deferred event was answered by more than one listing"
+        );
     }
 
     /// Cancellation has to be noticed while a listing is outstanding. The
