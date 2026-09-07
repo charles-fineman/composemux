@@ -423,6 +423,15 @@ fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>
         SourceEvent::Output {
             service,
             replica,
+            // Ignored on purpose. A pane's buffer is keyed on
+            // `(service, replica)` and is meant to outlive the container: that
+            // shared buffer is what lets a pane keep its history when compose
+            // recreates the container behind it, and keying it on the ID broke
+            // reattach-after-restart (#46). Splitting on identity belongs to
+            // the fallback, where a *held partial line* -- state the TUI's
+            // emulator carries differently -- would otherwise be spliced onto
+            // the replacement's first chunk (#50).
+            container: _,
             bytes,
         } => app.ingest(ServiceKey::new(service, replica), &bytes),
         SourceEvent::Topology => refresh.notify_one(),
@@ -559,6 +568,7 @@ mod tests {
             SourceEvent::Output {
                 service: "api".into(),
                 replica: 1,
+                container: "api-1".into(),
                 bytes: b"hello\r\n".to_vec(),
             },
             &refresh,

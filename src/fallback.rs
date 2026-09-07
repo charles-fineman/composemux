@@ -63,6 +63,12 @@ const PRUNE_INTERVAL: Duration = Duration::from_millis(500);
 struct LineAssembler {
     /// Bytes of a line whose newline has not arrived yet.
     partial: Vec<u8>,
+    /// ID of the container `partial` was read from.
+    ///
+    /// Empty until the first chunk arrives, which cannot collide with a real
+    /// container ID -- and would not matter if it could, since there is
+    /// nothing held to splice at that point.
+    container: String,
 }
 
 impl LineAssembler {
@@ -103,6 +109,36 @@ impl LineAssembler {
         }
         self.partial.extend_from_slice(rest);
         lines
+    }
+
+    /// Hands the assembler to `container`, returning the tail the previous
+    /// one left behind if this is a different container.
+    ///
+    /// The map is keyed on `(service, replica)` because that is what the
+    /// output is labelled with, but compose recreates containers rather than
+    /// restarting them and gives the replacement the same
+    /// `container-number`, so the key outlives the container. A `web-1` that
+    /// stopped mid-line leaves its tail here, and without this the next
+    /// `web-1`'s first chunk is appended to it and the two are printed as one
+    /// line neither container wrote.
+    ///
+    /// The identity travels with the bytes, so the split happens on the
+    /// replacement's very first chunk. Nothing here waits on a listing, a
+    /// topology event or a timer, which is what makes it exact rather than a
+    /// race the recreate window can win: the reclaim in `prune_assemblers`
+    /// still reclaims the *entry*, but it cannot be relied on to be the thing
+    /// that breaks the splice.
+    ///
+    /// Returning the tail rather than printing it keeps this method free of
+    /// the prefix column, and the caller emits it immediately before the new
+    /// container's first line -- which is also where it belongs in time.
+    fn adopt(&mut self, container: &str) -> Option<String> {
+        if self.container == container {
+            return None;
+        }
+        self.container.clear();
+        self.container.push_str(container);
+        self.finish()
     }
 
     /// Takes the unterminated tail the assembler is holding, if there is one.
@@ -171,6 +207,7 @@ fn handle_output(
     prefixes: &mut Prefixes,
     service: String,
     replica: u32,
+    container: &str,
     bytes: &[u8],
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -196,6 +233,14 @@ fn handle_output(
     // them is still holding onto the head of the other's next chunk, emitting
     // a line neither of them ever wrote.
     let assembler = assemblers.entry((service, replica)).or_default();
+    // A recreated container lands on the dead one's key, so the entry can be
+    // holding a tail that belongs to a container that no longer exists. It is
+    // printed under the same label, because the label is the same -- it is the
+    // *line* that has to end here rather than run on into the replacement's
+    // first chunk.
+    if let Some(tail) = assembler.adopt(container) {
+        writeln!(out, "{prefix}{tail}")?;
+    }
     for line in assembler.push(bytes) {
         writeln!(out, "{prefix}{line}")?;
     }
@@ -395,11 +440,12 @@ where
                 // but leaving here spins on it for the life of the process.
                 let Some(message) = message else { break };
                 match message {
-                    SourceEvent::Output { service, replica, bytes } => handle_output(
+                    SourceEvent::Output { service, replica, container, bytes } => handle_output(
                         &mut assemblers,
                         &mut prefixes,
                         service,
                         replica,
+                        &container,
                         &bytes,
                         out,
                     )?,
@@ -922,12 +968,25 @@ mod tests {
         /// Feeds one container's output through the same call the run loop
         /// makes, so interleaving two containers here interleaves them the
         /// way the daemon would.
+        ///
+        /// The container ID is derived from the label, so repeated calls for
+        /// one `(service, replica)` come from the same container -- the
+        /// ordinary case, where nothing has been recreated. A test about a
+        /// recreate names the IDs itself with [`Stream::emit_from`].
         fn emit(&mut self, service: &str, replica: u32, bytes: &[u8]) {
+            self.emit_from(&format!("{service}-{replica}"), service, replica, bytes);
+        }
+
+        /// The same, with the container ID spelled out, so a test can send two
+        /// containers' output under one `(service, replica)` the way a compose
+        /// recreate does.
+        fn emit_from(&mut self, container: &str, service: &str, replica: u32, bytes: &[u8]) {
             handle_output(
                 &mut self.assemblers,
                 &mut self.prefixes,
                 service.to_string(),
                 replica,
+                container,
                 bytes,
                 &mut self.out,
             )
@@ -959,6 +1018,59 @@ mod tests {
                 "web-2  | GET /two 404",
             ]
         );
+    }
+
+    /// A compose recreate replaces `web-1` with a *new* container that carries
+    /// the same `container-number`, so the replacement's output lands on the
+    /// key the dead one was using. If the dead container stopped mid-line, its
+    /// tail is still held there, and appending the replacement's first chunk
+    /// to it prints a line neither container ever wrote.
+    ///
+    /// Nothing but the change of identity separates the two calls here: no
+    /// topology event, no listing, no elapsed time. That is the point. The
+    /// reclaim in `prune_assemblers` would also break the splice when it
+    /// happens to land inside the recreate window, but it is rate-limited and
+    /// a recreate finishes well inside the interval, so it cannot be what this
+    /// rests on.
+    #[test]
+    fn a_recreated_container_does_not_inherit_the_dead_one_s_held_line() {
+        let mut s = Stream::default();
+
+        s.emit_from("web-1-first", "web", 1, b"Error: shutting");
+        s.emit_from("web-1-second", "web", 1, b"listening on 8080\n");
+
+        assert_eq!(
+            s.lines(),
+            vec!["web-1  | Error: shutting", "web-1  | listening on 8080"],
+            "the dead container's tail ran on into its replacement's first line"
+        );
+    }
+
+    /// The other half of the same rule: output really is joined across chunks
+    /// while the container stays put. Splitting on every chunk instead of on a
+    /// change of identity would pass the recreate test above and break every
+    /// line that arrives in two pieces.
+    #[test]
+    fn one_container_s_line_is_still_joined_across_chunks() {
+        let mut s = Stream::default();
+
+        s.emit_from("web-1-first", "web", 1, b"GET /one");
+        s.emit_from("web-1-first", "web", 1, b" 200\n");
+
+        assert_eq!(s.lines(), vec!["web-1  | GET /one 200"]);
+    }
+
+    /// A recreate that catches the dead container between lines has no tail to
+    /// hand over, and must not manufacture one: an empty `partial` is nothing
+    /// to print, not a blank line.
+    #[test]
+    fn a_recreate_on_a_line_boundary_prints_nothing_extra() {
+        let mut s = Stream::default();
+
+        s.emit_from("web-1-first", "web", 1, b"clean exit\n");
+        s.emit_from("web-1-second", "web", 1, b"restarted\n");
+
+        assert_eq!(s.lines(), vec!["web-1  | clean exit", "web-1  | restarted"]);
     }
 
     /// The prefix has to distinguish the replicas too. Separating the buffers
@@ -1043,6 +1155,7 @@ mod tests {
             &mut Prefixes::default(),
             "api".to_string(),
             1,
+            "api-1",
             b"a line\n",
             &mut Closed,
         )
@@ -1082,6 +1195,7 @@ mod tests {
             &mut Prefixes::default(),
             "api".to_string(),
             1,
+            "api-1",
             b"a line\n",
             &mut out,
         )
@@ -1106,6 +1220,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 2,
+            container: "web-2".to_string(),
             bytes: b"served\n".to_vec(),
         })
         .await
@@ -1165,6 +1280,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "api".to_string(),
             replica: 1,
+            container: "api-1".to_string(),
             bytes: b"a line\n".to_vec(),
         })
         .await
@@ -1191,6 +1307,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1229,6 +1346,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1286,6 +1404,7 @@ mod tests {
                 tx.send(SourceEvent::Output {
                     service: service.to_string(),
                     replica,
+                    container: format!("{service}-{replica}"),
                     bytes: byte.as_bytes().to_vec(),
                 })
                 .await
@@ -1338,6 +1457,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"held".to_vec(),
         })
         .await
@@ -1346,6 +1466,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "api".to_string(),
             replica: 1,
+            container: "api-1".to_string(),
             bytes: b"a line\n".to_vec(),
         })
         .await
@@ -1492,6 +1613,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1502,6 +1624,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "api".to_string(),
             replica: 1,
+            container: "api-1".to_string(),
             bytes: b"still here\n".to_vec(),
         })
         .await
@@ -1527,6 +1650,64 @@ mod tests {
         assert_eq!(listings.calls(), 1);
     }
 
+    /// The end-to-end shape of #50, through the loop rather than through
+    /// `handle_output` alone: `web-1` dies mid-line, a topology event arrives,
+    /// and by the time the listing is answered the replacement `web-1` is
+    /// already up -- so the live set still contains `("web", 1)` and the
+    /// reclaim finds nothing departed. That is the case #45's prune cannot
+    /// catch, and a compose recreate is fast enough to produce it routinely.
+    ///
+    /// The listing is asserted on as well, so the test fails rather than
+    /// quietly passing for the wrong reason if the reclaim stops running here.
+    #[tokio::test]
+    async fn a_recreate_the_reclaim_cannot_see_still_splits_the_line() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            container: "web-1-first".to_string(),
+            bytes: b"Error: shutting".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        tx.send(SourceEvent::Topology)
+            .await
+            .expect("the receiver is alive");
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            container: "web-1-second".to_string(),
+            bytes: b"listening on 8080\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        // The replacement is already listed, which is what makes the reclaim a
+        // no-op: nothing has left the live set.
+        let listings = Listings::live(&[("web", 1)]);
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, || listings.list(), &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(
+            out.lines(),
+            vec!["web-1  | Error: shutting", "web-1  | listening on 8080"],
+            "the dead container's tail ran on into its replacement's first line"
+        );
+        assert_eq!(
+            listings.calls(),
+            1,
+            "the topology event should still have been answered with a listing"
+        );
+    }
+
     /// A listing that failed says nothing about which containers exist.
     /// Treating it as an empty project would cut every live container's held
     /// line in half whenever the daemon hiccuped.
@@ -1536,6 +1717,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"half a".to_vec(),
         })
         .await
@@ -1546,6 +1728,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b" line\n".to_vec(),
         })
         .await
@@ -1599,6 +1782,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "api".to_string(),
             replica: 1,
+            container: "api-1".to_string(),
             bytes: b"seed\n".to_vec(),
         })
         .await
@@ -1613,6 +1797,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "api".to_string(),
             replica: 1,
+            container: "api-1".to_string(),
             bytes: b"marker\n".to_vec(),
         })
         .await
@@ -1696,6 +1881,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1774,6 +1960,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1815,6 +2002,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "gateway".to_string(),
             replica: 12,
+            container: "gateway-12".to_string(),
             bytes: b"boot".to_vec(),
         })
         .await
@@ -1822,6 +2010,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "db".to_string(),
             replica: 1,
+            container: "db-1".to_string(),
             bytes: b"ready\n".to_vec(),
         })
         .await
@@ -1829,6 +2018,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "db".to_string(),
             replica: 1,
+            container: "db-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1867,6 +2057,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1896,6 +2087,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1908,6 +2100,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "api".to_string(),
             replica: 1,
+            container: "api-1".to_string(),
             bytes: b"still here\n".to_vec(),
         })
         .await
@@ -1960,6 +2153,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "web".to_string(),
             replica: 1,
+            container: "web-1".to_string(),
             bytes: b"held".to_vec(),
         })
         .await
@@ -2014,6 +2208,7 @@ mod tests {
             tx.send(SourceEvent::Output {
                 service: "web".to_string(),
                 replica: 1,
+                container: "web-1".to_string(),
                 bytes,
             })
             .await
