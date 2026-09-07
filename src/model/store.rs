@@ -314,7 +314,7 @@ impl LogStore {
         // clear covers both, on the other branch's own terms: the screen it
         // keeps is one the pane goes on rendering, so a flag left set there
         // would stop `process` feeding a grid that is on screen, and every
-        // read of it would trip the assertion above.
+        // read of it would trip `live_screen`'s assertion.
         self.released = false;
 
         // Losing height moves the bottom of the window up under a scrolled-up
@@ -1425,7 +1425,8 @@ mod tests {
     }
 
     /// The release has to end where the grid is rebuilt, or a reopened pane
-    /// shows its replayed history and then nothing further. Before this test
+    /// shows its replayed history and then nothing further until it next
+    /// changes size. Before this test
     /// and the line `a_release_is_replayed_even_back_to_the_minimum_size` now
     /// writes after its own reopen, nothing pinned that: with the assertions
     /// compiled out -- which is every release build -- a store that came back
