@@ -52,15 +52,22 @@ const _: () = assert!(MAX_CHUNK_BYTES < MAX_PARTIAL);
 /// Half a second, matching the floor the TUI's poller runs to. That poller
 /// lists unconditionally on a timer *and* inspects every container it finds;
 /// this lists only, and only when a topology event arrives, so it cannot be
-/// the heavier of the two. A compose recreate finishes in well under a second,
-/// so a floor above that would step over the window in which a departed
-/// container is the one thing the listing would have reported.
+/// the heavier of the two.
 ///
-/// What stepping over it costs is a delay and not a wrong line: the
-/// replacement's first chunk ends the dead container's held line where it
-/// stands, in `LineAssembler::adopt`, whether or not a listing has noticed
-/// anything. A replacement that comes up silently is the case that still waits
-/// on this interval.
+/// A compose recreate is not what the floor is racing, though it was first
+/// justified that way. Compose creates the replacement before it destroys the
+/// original, and the replacement carries the same `container-number` from the
+/// moment it is created, so the key is in every listing throughout: polled
+/// every 10ms across a `--force-recreate` on Docker 29.7.2 / Compose v5.5.0,
+/// `("web", 1)` never once left. No interval makes this reclaim a recreated
+/// container, which is why the held line is ended where the bytes arrive
+/// instead, in [`LineAssembler::adopt`].
+///
+/// What this does reclaim is a container that leaves and stays gone -- a
+/// scale-down, a `compose down`, a `docker rm`. None of those is on a
+/// sub-second deadline; the floor is here to keep the daemon calls rare, and
+/// the comparison with the TUI's poller is what says half a second is cheap
+/// enough.
 const PRUNE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
@@ -1032,11 +1039,11 @@ mod tests {
     /// to it prints a line neither container ever wrote.
     ///
     /// Nothing but the change of identity separates the two calls here: no
-    /// topology event, no listing, no elapsed time. That is the point. The
-    /// reclaim in `prune_assemblers` would also break the splice when it
-    /// happens to land inside the recreate window, but it is rate-limited and
-    /// a recreate finishes well inside the interval, so it cannot be what this
-    /// rests on.
+    /// topology event, no listing, no elapsed time. That is the point, and it
+    /// is not a convenience of the test. The reclaim in `prune_assemblers`
+    /// cannot break this splice at all -- see [`PRUNE_INTERVAL`], where the
+    /// key is measured to stay in the listing across a whole recreate -- so
+    /// the change of identity is the only thing there is to act on.
     #[test]
     fn a_recreated_container_does_not_inherit_the_dead_one_s_held_line() {
         let mut s = Stream::default();
@@ -1053,14 +1060,22 @@ mod tests {
 
     /// Two replicas recreated at once, which is what `compose up` does to a
     /// scaled service. Each entry has to end its own tail and adopt its own
-    /// replacement: an identity remembered per map entry rather than per map,
-    /// which nothing else here would catch.
+    /// replacement, so the identity has to be remembered per map entry.
+    ///
+    /// The two replicas alternate *before* the recreate as well as across it,
+    /// which is what makes that distinction visible: one identity shared by
+    /// the whole map reads every alternation as a change and would cut
+    /// `one held` in half. Grouping the calls instead -- both firsts, then
+    /// both seconds -- passes either way, because then the identity really
+    /// does change on every call.
     #[test]
     fn replicas_recreated_together_neither_cross_nor_inherit() {
         let mut s = Stream::default();
 
-        s.emit_from("web-1-first", "web", 1, b"one held");
-        s.emit_from("web-2-first", "web", 2, b"two held");
+        s.emit_from("web-1-first", "web", 1, b"one ");
+        s.emit_from("web-2-first", "web", 2, b"two ");
+        s.emit_from("web-1-first", "web", 1, b"held");
+        s.emit_from("web-2-first", "web", 2, b"held");
         s.emit_from("web-1-second", "web", 1, b"one new\n");
         s.emit_from("web-2-second", "web", 2, b"two new\n");
 
@@ -1681,10 +1696,14 @@ mod tests {
 
     /// The end-to-end shape of #50, through the loop rather than through
     /// `handle_output` alone: `web-1` dies mid-line, a topology event arrives,
-    /// and by the time the listing is answered the replacement `web-1` is
-    /// already up -- so the live set still contains `("web", 1)` and the
-    /// reclaim finds nothing departed. That is the case #45's prune cannot
-    /// catch, and a compose recreate is fast enough to produce it routinely.
+    /// the listing is answered, and it still reports `("web", 1)` live, so the
+    /// reclaim finds nothing departed.
+    ///
+    /// That is not a contrived listing. Compose creates the replacement before
+    /// it destroys the original and labels it `container-number=1` from the
+    /// start, so this is what a real daemon reports throughout a recreate --
+    /// polled every 10ms across one, the key never left. #45's prune therefore
+    /// never breaks this splice, at any interval.
     ///
     /// The listing is asserted on as well, so the test fails rather than
     /// quietly passing for the wrong reason if the reclaim stops running here.

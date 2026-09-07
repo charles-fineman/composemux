@@ -1,4 +1,4 @@
-#![allow(clippy::missing_docs_in_private_items)] // 20 left to document
+#![allow(clippy::missing_docs_in_private_items)] // 17 left to document
 //! Log streaming and container supervision.
 //!
 //! One task per container reads its log stream into a shared channel. A
@@ -74,7 +74,8 @@ pub enum SourceEvent {
     Output {
         /// Compose service name, as the output is labelled with.
         service: String,
-        /// The container's `com.docker.compose.container-number`.
+        /// The container's `com.docker.compose.container-number`, or 1 where
+        /// compose omits it -- the default `resync` and `container_key` apply.
         replica: u32,
         /// ID of the container these bytes were read from.
         ///
