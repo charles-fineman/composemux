@@ -1972,6 +1972,8 @@ mod tests {
         );
     }
 
+    /// More output than a pane holds, so a released store has scrollback to
+    /// restore and not merely a screen.
     fn fill(app: &mut App, key: &ServiceKey, lines: usize) {
         for i in 0..lines {
             app.ingest(key.clone(), format!("line {i}\r\n").as_bytes());
@@ -2049,6 +2051,31 @@ mod tests {
             app.store(&b).unwrap().screen().size(),
             (10, 40),
             "the store on screen was released out from under the pane"
+        );
+    }
+
+    /// The scan asks `pane_key` for every slot, not just the first. One that
+    /// stopped at slot 0 would release the store behind pane 2 on every poll
+    /// while the user was reading it -- the same defect as reading `panes`,
+    /// just one slot further along.
+    #[test]
+    fn a_service_pinned_to_the_second_pane_keeps_its_emulator() {
+        let mut app = app_with(&["a", "b"]);
+        let b = ServiceKey::new("b", 1);
+        fill(&mut app, &b, 200);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.pane_key(1), Some(b.clone()));
+        app.resize_panes(&[(1, 10, 40)]);
+        assert_eq!(app.store(&b).unwrap().screen().size(), (10, 40));
+
+        refresh(&mut app, &["a", "b"]);
+
+        assert_eq!(
+            app.store(&b).unwrap().screen().size(),
+            (10, 40),
+            "the store behind pane 2 was released while it was on screen"
         );
     }
 

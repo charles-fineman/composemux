@@ -1169,12 +1169,69 @@ mod tests {
         resized.resize(10, 30);
 
         assert_eq!(non_empty(&released), non_empty(&resized));
-        // Formatted contents, not plain rows: the pen carried across a trim is
-        // reconstructed by the replay, and plain rows would not notice it going
-        // missing.
+        // Formatted contents, not plain rows: the SGR codes live in `raw` and
+        // are re-parsed by the replay, so a release that mangled the styling
+        // rather than the text would read as identical rows.
         assert_eq!(
             released.screen().contents_formatted(),
             resized.screen().contents_formatted()
+        );
+    }
+
+    /// A released store keeps ingesting, and the point is that what it ingests
+    /// stops costing anything until the service is looked at again. Released
+    /// with its scrollback budget intact it would quietly refill -- 1000 rows
+    /// at any width is hundreds of kilobytes, most of the saving handed back.
+    #[test]
+    fn a_released_store_does_not_refill_a_scrollback() {
+        let mut s = store_with(200);
+        s.release();
+        for i in 0..500 {
+            s.process(format!("after {i}\r\n").as_bytes());
+        }
+
+        s.scroll_to_top();
+
+        assert_eq!(
+            s.scroll_offset(),
+            0,
+            "the released emulator accumulated scrollback while off-screen"
+        );
+    }
+
+    /// Trimming drops the bytes that set the styling still in force, which is
+    /// why `LogStore` carries it in `pen` at all. A release that lost the pen
+    /// would replay the retained lines in default colours, so a service that
+    /// sets a colour once and leaves it on would come back white.
+    #[test]
+    fn the_carried_pen_survives_a_release() {
+        let build = || {
+            let mut s = LogStore::new(2);
+            s.resize(4, 20);
+            for i in 0..40 {
+                let bytes = if i == 0 {
+                    format!("\x1b[31mline {i}\r\n")
+                } else {
+                    format!("line {i}\r\n")
+                };
+                s.process(bytes.as_bytes());
+            }
+            s
+        };
+        let mut released = build();
+        let resized = build();
+        assert!(
+            !released.pen.is_empty(),
+            "the test is not exercising a trim, so it proves nothing"
+        );
+
+        released.release();
+        released.resize(4, 20);
+
+        assert_eq!(
+            released.screen().contents_formatted(),
+            resized.screen().contents_formatted(),
+            "the styling carried across the trim was lost"
         );
     }
 
