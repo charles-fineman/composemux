@@ -237,7 +237,8 @@ service a container is, and reads a container without that label as replica 1.
 Compose v5.5.0 sets it on every container it creates — unscaled services and
 `container_name:` overrides alike — so this is unlikely to be a limitation you
 meet. A Compose that omitted it on a scaled service would give every replica the
-same identity, and all of them would share one sidebar row and one log pane.
+same identity: a row each in the sidebar, all carrying the same name, and a
+single pane behind them holding all their output interleaved.
 [#51](https://github.com/sofired/composemux/issues/51) has the detail.
 
 ## Contributing
