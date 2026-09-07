@@ -6,6 +6,7 @@
 use crate::model::{Service, ServiceStatus};
 use crate::tui::theme::THEME;
 use ratatui::style::Style;
+use std::collections::{HashMap, HashSet};
 
 /// Status → foreground colour. Mirrors nx's `get_task_status_style`.
 pub fn status_style(status: ServiceStatus) -> Style {
@@ -81,6 +82,91 @@ pub fn sort_services(services: &mut [Service]) {
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.replica.cmp(&b.replica))
     });
+}
+
+/// Reduces containers sharing a `(name, replica)` identity to a single service.
+///
+/// `docker compose up` creates a replacement container *before* it stops and
+/// destroys the one it is replacing, so for as long as the original takes to
+/// shut down -- its stop grace period, ten seconds by default and often longer
+/// -- two containers carry the same `service` and `container-number` labels.
+/// Neither is a one-off or a hook, so both reach the service list.
+///
+/// They cannot honestly be shown as two rows. `(name, replica)` is the identity
+/// the log buffer, the pane pin and the selection all key on, so a second row
+/// claims a distinction none of them can act on: the same label on both, the
+/// same pane indicator on both, and a pair tied on `(category, name, replica)`
+/// whose order then falls through to the daemon's list order and can swap from
+/// one refresh to the next.
+///
+/// The survivor is the live member if there is one, and otherwise whichever
+/// started later -- so a running original outlives its not-yet-started
+/// replacement, and a live container is never dropped for a dead sibling that
+/// happens to carry a later start time. When neither is live -- an exited
+/// original beside its created replacement -- `None` sorts below any timestamp,
+/// so the replacement still loses. Two containers compose has created but
+/// not yet started render identically -- same status, no exit code, no uptime --
+/// so which of those survives is not observable; any other tie keeps the one the
+/// daemon listed last, arbitrarily.
+///
+/// A group with *two or more* live members is left alone entirely. Compose
+/// destroys the original before it starts the replacement, so a recreate group
+/// never has two live members, and one that does is a collision this pass did
+/// not come for: a compose that omits `container-number` on a scaled service
+/// (#51) defaults every replica to `1`, and collapsing there would leave one row
+/// while `LogSupervisor`, which derives the replica index independently, went on
+/// streaming all of them into it. The extra rows are the only sign in the UI
+/// that the extra containers exist, so they stay.
+pub fn collapse_replaced_containers(services: &mut Vec<Service>) {
+    let mut groups: HashMap<(&str, u32), Vec<usize>> = HashMap::new();
+    for (idx, service) in services.iter().enumerate() {
+        groups
+            .entry((service.name.as_str(), service.replica))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut dropped: HashSet<usize> = HashSet::new();
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        if members
+            .iter()
+            .filter(|idx| is_live(services[**idx].status))
+            .count()
+            > 1
+        {
+            continue;
+        }
+        // Live first, so a live container is never dropped for a dead sibling
+        // that happens to have started later. `max_by_key` yields the last of
+        // several equal maxima, and the tuple ties only when both halves do, so
+        // a genuine tie resolves to the container the daemon listed last.
+        let survivor = members
+            .iter()
+            .copied()
+            .max_by_key(|idx| (is_live(services[*idx].status), services[*idx].started_at))
+            .expect("a group with two or more members is not empty");
+        dropped.extend(members.iter().copied().filter(|idx| *idx != survivor));
+    }
+
+    if dropped.is_empty() {
+        return;
+    }
+    // `retain` visits in order, which is what lets a positional predicate work.
+    let mut idx = 0;
+    services.retain(|_| {
+        let keep = !dropped.contains(&idx);
+        idx += 1;
+        keep
+    });
+}
+
+/// Whether a container is still doing work, so cannot be one compose has
+/// finished with. Matches the statuses `sort_category` groups as active.
+fn is_live(status: ServiceStatus) -> bool {
+    matches!(status, ServiceStatus::Running | ServiceStatus::Unhealthy)
 }
 
 #[cfg(test)]
@@ -278,5 +364,194 @@ mod tests {
             };
             prop_assert_eq!(deal(&stamps_a, false), deal(&stamps_b, true));
         }
+    }
+
+    /// A container compose has created but not yet started: no start time, so
+    /// nothing to report in the uptime column.
+    fn not_started(name: &str, replica: u32) -> Service {
+        Service {
+            replica,
+            status: ServiceStatus::NotStarted,
+            started_at: None,
+            ..timed(name, ServiceStatus::NotStarted, 0, None)
+        }
+    }
+
+    #[test]
+    fn a_replacement_container_collapses_onto_the_one_it_replaces() {
+        let mut services = vec![
+            not_started("api", 1),
+            timed("api", ServiceStatus::Running, 5, None),
+        ];
+        collapse_replaced_containers(&mut services);
+        assert_eq!(services.len(), 1, "one container identity, one service");
+        assert_eq!(
+            services[0].status,
+            ServiceStatus::Running,
+            "the container actually serving traffic must be the survivor"
+        );
+    }
+
+    #[test]
+    fn the_survivor_does_not_depend_on_list_order_when_only_one_has_started() {
+        let pair = vec![
+            not_started("api", 1),
+            timed("api", ServiceStatus::Running, 5, None),
+        ];
+        let survivor = |mut v: Vec<Service>| {
+            collapse_replaced_containers(&mut v);
+            v.into_iter().map(|s| s.status).collect::<Vec<_>>()
+        };
+        let mut reversed = pair.clone();
+        reversed.reverse();
+        assert_eq!(
+            survivor(pair),
+            survivor(reversed),
+            "the daemon does not promise an order, so it must not pick the row"
+        );
+    }
+
+    #[test]
+    fn a_running_container_outlives_the_one_it_replaced() {
+        // Once the original has exited but not yet been destroyed, the pair is
+        // two started containers rather than a started and a created one.
+        let mut services = vec![
+            timed("api", ServiceStatus::Success, 5, Some(9)),
+            timed("api", ServiceStatus::Running, 7, None),
+        ];
+        collapse_replaced_containers(&mut services);
+        assert_eq!(services.len(), 1, "one container identity, one service");
+        assert_eq!(
+            services[0].status,
+            ServiceStatus::Running,
+            "the container actually serving traffic must be the survivor"
+        );
+    }
+
+    #[test]
+    fn the_live_member_of_three_colliding_containers_wins() {
+        // A second `compose up` inside the first one's grace period stacks
+        // three, which is where picking the survivor differs from picking an
+        // endpoint of the list.
+        for order in [[0usize, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0]] {
+            let all = [
+                not_started("api", 1),
+                timed("api", ServiceStatus::Success, 5, Some(6)),
+                timed("api", ServiceStatus::Running, 9, None),
+            ];
+            let mut services: Vec<Service> = order.iter().map(|i| all[*i].clone()).collect();
+            collapse_replaced_containers(&mut services);
+            assert_eq!(services.len(), 1, "{order:?}");
+            assert_eq!(services[0].status, ServiceStatus::Running, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn two_live_replicas_are_both_kept() {
+        // A compose that omits `container-number` on a scaled service defaults
+        // every replica to 1 (#51). Two is the boundary the guard is written
+        // for, and an unhealthy container is still live: collapsing either
+        // would hide a container whose output still reaches the surviving row.
+        let mut services = vec![
+            timed("web", ServiceStatus::Running, 1, None),
+            timed("web", ServiceStatus::Unhealthy, 2, None),
+        ];
+        collapse_replaced_containers(&mut services);
+        assert_eq!(services.len(), 2, "two live containers, two rows");
+    }
+
+    #[test]
+    fn an_exited_original_outlives_its_created_replacement() {
+        // A second past the observed window: the original has exited but
+        // compose has not destroyed it yet, and the replacement is still
+        // `created`. Neither is live, so the start time is the only thing left
+        // to decide -- and the row must keep the container that actually ran,
+        // with its exit code, rather than its stand-in. Both orders, because
+        // the daemon promises neither.
+        for reversed in [false, true] {
+            let mut services = vec![
+                timed("api", ServiceStatus::Failure, 5, Some(9)),
+                not_started("api", 1),
+            ];
+            if reversed {
+                services.reverse();
+            }
+            collapse_replaced_containers(&mut services);
+            assert_eq!(services.len(), 1, "reversed={reversed}");
+            assert_eq!(
+                services[0].status,
+                ServiceStatus::Failure,
+                "reversed={reversed}: the container that actually ran must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_container_is_never_dropped_for_a_dead_one() {
+        // The group has one live member, so the guard lets it through and the
+        // survivor rule decides. Picking purely on start time would keep the
+        // crashed container and lose the one still serving traffic.
+        let mut services = vec![
+            timed("web", ServiceStatus::Running, 1, None),
+            timed("web", ServiceStatus::Failure, 5, Some(6)),
+        ];
+        collapse_replaced_containers(&mut services);
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services[0].status,
+            ServiceStatus::Running,
+            "the container actually serving traffic must be the survivor"
+        );
+    }
+
+    #[test]
+    fn distinct_replicas_of_a_scaled_service_are_all_kept() {
+        // Only one replica is live, so the live-member guard does not wave this
+        // through: a key that ignored the replica number would reach the
+        // survivor rule and drop two rows.
+        let mut services = vec![
+            replica_of("web", 1, 1),
+            Service {
+                status: ServiceStatus::Success,
+                ..replica_of("web", 2, 2)
+            },
+            Service {
+                status: ServiceStatus::Success,
+                ..replica_of("web", 3, 3)
+            },
+        ];
+        collapse_replaced_containers(&mut services);
+        assert_eq!(
+            services.iter().map(|s| s.replica).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "a scaled service keeps one row per replica"
+        );
+    }
+
+    #[test]
+    fn services_that_never_collide_keep_their_arrival_order() {
+        // `b` is the only live one, so the live-member guard does not wave this
+        // through: a key that dropped the service name would collapse two
+        // different services into one row.
+        let mut services = vec![
+            timed("b", ServiceStatus::Running, 1, None),
+            timed("a", ServiceStatus::Success, 2, Some(3)),
+        ];
+        collapse_replaced_containers(&mut services);
+        assert_eq!(
+            services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["b", "a"],
+            "two services are two rows, in arrival order"
+        );
+    }
+
+    /// Guards a rewrite that reaches for `services[0]` before checking the
+    /// length. It kills no mutation of the survivor rule and is not coverage
+    /// of it.
+    #[test]
+    fn an_empty_list_collapses_to_nothing() {
+        let mut services: Vec<Service> = Vec::new();
+        collapse_replaced_containers(&mut services);
+        assert!(services.is_empty());
     }
 }
