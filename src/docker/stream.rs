@@ -37,16 +37,29 @@ const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// everything downstream of the frame finite, and lets the frame itself be
 /// freed at the end of the iteration.
 ///
-/// How big a frame gets depends on the service, and there are two cases.
-/// Without a tty the daemon multiplexes the stream through stdcopy framing
-/// and its log copier splits a message at 16 KiB: a 5 MB line containing no
-/// newline at all comes back as 306 frames, none over 16384 bytes, on both
-/// the json-file and local drivers. Those never reach this bound. With
-/// `tty: true` there is no framing at all -- the same 5 MB arrives as one
-/// unbroken body -- and bollard's decoder cuts it at newlines instead,
-/// yielding a whole line per frame however long the line is. That is the case
-/// this bound exists for, and the case where it actually fires. It buffers
-/// that unframed stream until it finds a newline, which #38 tracks.
+/// How big a frame gets depends on the service, and the reason is not the one
+/// it looks like. The daemon's log copier splits a message at 16 KiB
+/// *regardless of tty* -- reading the socket directly, a tty service and a
+/// non-tty service writing the same 48 KiB both produce three 16384-byte
+/// writes, at the same moments. What a tty removes is the stdcopy header on
+/// each of those writes, so bollard cannot tell them apart and its decoder
+/// re-joins them, cutting at newlines instead. Output the daemon had already
+/// bounded and sent seconds earlier is held until a newline arrives:
+///
+/// ```text
+///                 daemon sends                    bollard delivers
+/// tty: false      16384 B at 4.65s 7.96s 11.34s   the same three, ~80ms later
+/// tty: true       16384 B at 4.55s 7.87s 11.16s   nothing until 11.44s,
+///                                                 then one 49154 B frame
+/// ```
+///
+/// So without a tty a 5 MB newline-free line arrives as 306 frames, none over
+/// 16384 bytes, and never reaches this bound. With one it arrives as a single
+/// 5,010,002-byte frame, which is the case this bound exists for and the only
+/// case where it fires. The re-joining is bollard's, not the daemon's, and is
+/// a latency defect as much as a memory one; #38 tracks it, including the
+/// upstream fix, since the daemon already announces the framing in a
+/// `Content-Type` bollard never reads.
 ///
 /// 64 KiB is four times the daemon's own 16 KiB message split, so the common
 /// path keeps costing exactly one copy per frame, and it holds the most the
