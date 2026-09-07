@@ -30,7 +30,7 @@ const FAILURES_BEFORE_UNREACHABLE: u32 = 3;
 /// The cost of that choice is that a daemon which accepts a connection and
 /// then never answers is not noticed until the request itself gives up, which
 /// against bollard's default timeout is minutes rather than seconds. That is a
-/// real gap and not merely a tradeoff -- #48 tracks bounding the poll so a
+/// real gap and not merely a tradeoff -- #52 tracks bounding the poll so a
 /// hung daemon counts as a failed one.
 #[derive(Debug, Default)]
 pub struct ConnectionHealth {
