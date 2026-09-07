@@ -199,13 +199,18 @@ mod tests {
     /// arithmetic and actually land on the screen, not merely exist in a
     /// `Line` the bar might never give room to.
     ///
-    /// 64 is the exact width at which the whole note still fits, and so the
-    /// width an off-by-one in the bar's arithmetic would break first: below
-    /// it the hints are already down to their 16-column minimum, so the slot
-    /// shrinks with the terminal and the note truncates. It truncates without
-    /// an ellipsis, as the filter and countdown messages always have here --
-    /// nx uses `fit_with_ellipsis` for this and composemux never has, which is
-    /// a gap in the port rather than something this note introduced.
+    /// 64 is the narrowest width at which this fixture still carries the whole
+    /// note, and so the width an off-by-one in the bar's arithmetic would
+    /// break first: below it the hints are already down to their 16-column
+    /// minimum, so the slot shrinks with the terminal and the note truncates.
+    /// The figure moves with the status slot to its left -- a project with a
+    /// two-digit count is two columns wider there, and needs 66 -- so it is
+    /// the floor for these three services, not a constant of the bar.
+    ///
+    /// It truncates without an ellipsis, as the filter and countdown messages
+    /// always have here -- nx uses `fit_with_ellipsis` for this and composemux
+    /// never has, which is a gap in the port rather than something this note
+    /// introduced.
     #[test]
     fn a_lost_daemon_is_reported_on_the_rendered_frame() {
         let mut app = app();
