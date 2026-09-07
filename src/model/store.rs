@@ -288,6 +288,13 @@ impl LogStore {
     /// Scroll position does not survive, and should not: the offset counts rows
     /// back from the bottom, and output kept arriving while the pane was
     /// closed, so the row it named is no longer the row the reader left.
+    ///
+    /// Everything else is left alone, `pending_cr` included. The byte stream
+    /// feeding `raw` is continuous across a release -- a chunk boundary can
+    /// still fall between a `\r` and its `\n` -- so the carry is mid-stream
+    /// state a release has no business in, exactly as `pen` and `lines` are.
+    /// Clearing it happens to be invisible today, but only because a doubled
+    /// carriage return is; that is a fact about the emulator, not a licence.
     pub fn release(&mut self) {
         // Rebuilding from nothing would blank a pane that has content, which is
         // the same hazard `resize` keeps the screen for rather than replaying.
