@@ -207,6 +207,39 @@ than smearing themselves across the UI. It's also a safety property — containe
 logs are untrusted input, and they're never passed through to your terminal
 verbatim.
 
+## Known limitations
+
+Two things composemux needs from the Compose project it attaches to, both
+worth knowing before you go looking for the bug in your own service.
+
+**A `tty: true` service that writes without newlines will look stalled.** The
+daemon splits a log message every 16 KiB whether or not the service has a tty;
+what a tty removes is the per-write header saying where each split falls. The
+Docker client composemux reads logs through (bollard) then has nothing to frame
+on, scans for a newline instead, and holds the daemon's chunks until one
+arrives. Measured on a service printing 48 KiB with no newline in it: without a
+tty the three 16 KiB writes arrive as the daemon sends them, at 4.7 s, 8.0 s
+and 11.4 s; with a tty nothing appears at all until 11.4 s, when all three come
+at once as a single frame. Output that never contains a newline — a `\r`
+progress bar redrawing in place is the realistic shape — is held, in memory,
+until the stream ends.
+
+Set `tty: false` on the service and it streams as it should; that is the whole
+remedy, and it is entirely in your hands. The framing is decided inside the
+Docker client before composemux sees a byte, so there is nothing to fix at this
+layer — [#38](https://github.com/sofired/composemux/issues/38) tracks the
+upstream change. Ordinary line-oriented output is unaffected: each line is its
+own frame and nothing accumulates.
+
+**Replicas are told apart by a Compose label.** composemux reads
+`com.docker.compose.container-number` to decide which replica of a scaled
+service a container is, and reads a container without that label as replica 1.
+Compose v5.5.0 sets it on every container it creates — unscaled services and
+`container_name:` overrides alike — so this is unlikely to be a limitation you
+meet. A Compose that omitted it on a scaled service would give every replica the
+same identity, and all of them would share one sidebar row and one log pane.
+[#51](https://github.com/sofired/composemux/issues/51) has the detail.
+
 ## Contributing
 
 Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the
