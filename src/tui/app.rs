@@ -8,6 +8,7 @@
 //! reproduced deliberately: they are what make the tool feel like nx.
 
 use crate::config::Config;
+use crate::docker::Outage;
 use crate::model::{LogStore, Service, ServiceStatus};
 use crate::tui::filter::Filter;
 use crate::tui::focus::{Focus, FocusStack, MAX_PANES};
@@ -129,10 +130,11 @@ pub struct App {
     stack_finished: bool,
     all_finished_since: Option<Instant>,
     status_message: Option<(String, Instant)>,
-    /// False while the Docker daemon has been failing to answer for long
-    /// enough to be worth saying so. Set from the service poller rather than
-    /// derived here: the app never talks to the daemon itself.
-    daemon_reachable: bool,
+    /// Set while the Docker daemon has been failing to answer for long
+    /// enough to be worth saying so, and to how it is failing. Set from the
+    /// service poller rather than derived here: the app never talks to the
+    /// daemon itself.
+    daemon_outage: Option<Outage>,
     /// Advanced by `tick` and `handle_key`, so countdown state is testable
     /// without sleeping.
     clock: Instant,
@@ -168,7 +170,7 @@ impl App {
             status_message: None,
             // Assume the best until a poll says otherwise, so the note cannot
             // appear on a frame drawn before the first poll has even run.
-            daemon_reachable: true,
+            daemon_outage: None,
             clock: Instant::now(),
             startup_pins: config.pinned.clone(),
             pending: None,
@@ -228,15 +230,15 @@ impl App {
         self.status_message.as_ref().map(|(m, _)| m.as_str())
     }
 
-    /// Whether the Docker daemon is currently answering.
-    pub fn daemon_reachable(&self) -> bool {
-        self.daemon_reachable
+    /// How the Docker daemon is failing to answer, if it is.
+    pub fn daemon_outage(&self) -> Option<Outage> {
+        self.daemon_outage
     }
 
     /// Records what the latest service poll found, so the status bar can say
-    /// when the statuses on screen have stopped being refreshed.
-    pub fn set_daemon_reachable(&mut self, reachable: bool) {
-        self.daemon_reachable = reachable;
+    /// when the statuses on screen have stopped being refreshed, and why.
+    pub fn set_daemon_outage(&mut self, outage: Option<Outage>) {
+        self.daemon_outage = outage;
     }
 
     /// The service shown in a pane. In spacebar mode pane 0 follows the

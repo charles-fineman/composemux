@@ -176,6 +176,35 @@ pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)>
     Some((labels_map.get(labels::SERVICE)?.clone(), replica))
 }
 
+/// The one daemon call the periodic service poll makes.
+///
+/// A trait rather than the concrete client because `main`'s refresh loop is
+/// otherwise only drivable against a live daemon, and the interesting cases --
+/// a poll that fails, and a poll that is accepted and never answered -- are
+/// exactly the ones a live daemon will not arrange on request. This is the
+/// seam a test stands in at.
+pub trait ServiceSource: Send + Sync + 'static {
+    /// The project's services, as [`DockerClient::list_services`] reports them.
+    ///
+    /// Returns a future rather than being an `async fn` so the `Send` bound can
+    /// be written down: the poll runs in a spawned task.
+    fn list_services(
+        &self,
+        project: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<Service>>> + Send;
+}
+
+impl ServiceSource for DockerClient {
+    fn list_services(
+        &self,
+        project: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<Service>>> + Send {
+        // The inherent method, which takes precedence over this one in path
+        // resolution; `unconditional_recursion` would catch it if it did not.
+        DockerClient::list_services(self, project)
+    }
+}
+
 /// Builds a `Service` from a list entry and the container's inspected state.
 ///
 /// Kept free of I/O so the status mapping can be tested directly.
