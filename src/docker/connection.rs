@@ -68,6 +68,13 @@ pub struct ConnectionHealth {
 
 impl ConnectionHealth {
     /// Records a poll the daemon answered, ending any outage.
+    ///
+    /// Clearing the kind as well is not observable through [`outage`], which
+    /// cannot report one until three further failures have each overwritten
+    /// it. It is here so the field means what it says it means: after this,
+    /// there is no most recent failure to name.
+    ///
+    /// [`outage`]: Self::outage
     pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.last_failure = None;

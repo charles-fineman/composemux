@@ -996,6 +996,55 @@ mod tests {
         );
     }
 
+    /// The pacing between rounds, both halves of it at once. The floor is what
+    /// stops a burst of container events turning the poller into a hot loop
+    /// against the daemon; the wake is what stops a topology change leaving
+    /// the sidebar stale for the full refresh period. Both are one line in the
+    /// loop, and nothing else exercises either.
+    #[tokio::test(start_paused = true)]
+    async fn a_topology_event_wakes_the_poller_early_but_no_sooner_than_the_floor() {
+        let daemon = FakeDaemon::new(Behaviour::Answers(Vec::new()));
+        let refresh = Arc::new(Notify::new());
+        let (tx, mut rx) = mpsc::channel::<Poll>(8);
+        let cancel = CancellationToken::new();
+        spawn_refresher(
+            daemon,
+            "demo".to_string(),
+            Config::default(),
+            tx,
+            refresh.clone(),
+            cancel.clone(),
+        );
+
+        let started = tokio::time::Instant::now();
+        rx.recv().await.expect("the first poll");
+        // `notify_one` leaves a permit whether or not the poller is waiting
+        // yet, so this does not race the loop reaching its rest.
+        refresh.notify_one();
+        rx.recv().await.expect("the second poll");
+        let between = started.elapsed();
+        cancel.cancel();
+
+        assert!(
+            between >= MIN_REFRESH,
+            "the floor must hold, or a burst of events becomes a hot loop: {between:?}"
+        );
+        assert!(
+            between < REFRESH,
+            "a topology event must not wait out the whole refresh period: {between:?}"
+        );
+    }
+
+    /// `POLL_TIMEOUT`'s doc argues for ten seconds from measurements, the same
+    /// way `FAILURES_BEFORE_OUTAGE`'s argues for three. The other tests scale
+    /// off the constant and so hold for any value; this one is longhand,
+    /// because the value is a promise about how long the screen may go on
+    /// showing statuses nothing is refreshing.
+    #[test]
+    fn the_poll_waits_ten_seconds_exactly() {
+        assert_eq!(POLL_TIMEOUT, Duration::from_secs(10));
+    }
+
     /// The mirror of the case above, and the reason going quiet is remembered
     /// per request rather than for good: a daemon that wedged once and has
     /// since been stopped outright has to be called unreachable again. Keeping
@@ -1082,8 +1131,22 @@ mod tests {
             .join("\n")
     }
 
-    /// Runs `event_loop` against a test backend with `polls`, `logs` and
-    /// `keys` already queued, and hands back how it ended and the last frame.
+    /// The frame the event-loop tests draw into. Wide enough that an output
+    /// pane is comfortably wider than a `LogStore`'s own starting width, which
+    /// is what lets a test tell a pane that was sized from one that was not.
+    const TEST_FRAME: (u16, u16) = (200, 40);
+
+    /// One key press, as the input stream carries it.
+    fn key(code: crossterm::event::KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    /// Runs `event_loop` against a test backend and `events`, with `polls` and
+    /// `logs` already queued, and hands back whatever it returned -- `None` if
+    /// it was still running at the deadline -- and the last frame.
     ///
     /// Deterministic because time is paused. The ticker is the only arm that
     /// becomes ready on the clock, and a paused clock only advances once every
@@ -1091,25 +1154,21 @@ mod tests {
     /// the loop with work to do. So everything queued here is drained before
     /// the loop can go quiet, whatever order `select!` picks along the way.
     ///
-    /// The senders are held for the whole call on purpose: a closed channel
-    /// and an ended stream both resolve immediately and for ever, which is the
-    /// `None` race #53 describes.
-    async fn drive_event_loop(
+    /// The channel senders are held for the whole call on purpose: a closed
+    /// channel resolves immediately and for ever, and the arms that read them
+    /// would spin.
+    async fn drive_event_loop_over<E>(
         app: &mut App,
         polls: Vec<Poll>,
         logs: Vec<SourceEvent>,
-        keys: Vec<crossterm::event::KeyCode>,
-    ) -> (Option<ExitReason>, String) {
-        let backend = ratatui::backend::TestBackend::new(120, 20);
+        events: &mut E,
+        cancel: &CancellationToken,
+    ) -> (Option<Result<ExitReason>>, String)
+    where
+        E: Stream<Item = std::io::Result<Event>> + Unpin,
+    {
+        let backend = ratatui::backend::TestBackend::new(TEST_FRAME.0, TEST_FRAME.1);
         let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
-
-        let (key_tx, mut key_rx) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
-        for code in keys {
-            let key = crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
-            key_tx
-                .unbounded_send(Ok(Event::Key(key)))
-                .expect("the receiver is alive");
-        }
 
         let (svc_tx, mut svc_rx) = mpsc::channel::<Poll>(16);
         for poll in polls {
@@ -1121,29 +1180,53 @@ mod tests {
         }
 
         let refresh = Arc::new(Notify::new());
-        let cancel = CancellationToken::new();
         // A deadline rather than a quit key, so a test that wants to inspect
         // the app after the loop has digested its input does not have to race
-        // the exit against the input. Virtual seconds; the loop wakes on its
-        // 100ms ticker, so this is ample and costs nothing.
+        // the exit against the input. Virtual seconds, but not free: a test
+        // that never exits redraws on the loop's 100ms ticker until the
+        // deadline, fifty frames of it, which measures around a fifth of a
+        // second of real time apiece.
         let exit = tokio::time::timeout(
             Duration::from_secs(5),
             event_loop(
                 &mut terminal,
-                &mut key_rx,
+                events,
                 app,
                 &mut log_rx,
                 &mut svc_rx,
                 &refresh,
-                &cancel,
+                cancel,
             ),
         )
         .await
-        .ok()
-        .transpose()
-        .expect("the event loop must not fail");
-        drop((key_tx, svc_tx, log_tx));
+        .ok();
+        drop((svc_tx, log_tx));
         (exit, frame_text(&terminal))
+    }
+
+    /// `drive_event_loop_over` with an input channel built for `input`, which
+    /// is what all but the exit-path tests want.
+    ///
+    /// The sender is held until the loop is done, because a stream that has
+    /// ended resolves immediately and for ever -- the `None` race #53
+    /// describes, which only one test wants on purpose.
+    async fn drive_event_loop(
+        app: &mut App,
+        polls: Vec<Poll>,
+        logs: Vec<SourceEvent>,
+        input: Vec<Event>,
+    ) -> (Option<ExitReason>, String) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
+        for event in input {
+            tx.unbounded_send(Ok(event)).expect("the receiver is alive");
+        }
+        let cancel = CancellationToken::new();
+        let (exit, frame) = drive_event_loop_over(app, polls, logs, &mut rx, &cancel).await;
+        drop(tx);
+        (
+            exit.transpose().expect("the event loop must not fail"),
+            frame,
+        )
     }
 
     /// The mutation #53 names for the event loop: inline the old `set_services`
@@ -1238,6 +1321,136 @@ mod tests {
         );
     }
 
+    /// `handle_action` is the other half of the key arm: `handle_key` only
+    /// records what the app could not do on its own, and this is what carries
+    /// it out. Dropping the call leaves copy-output and the layout toggle
+    /// silently doing nothing, which is #53's complaint exactly.
+    #[tokio::test(start_paused = true)]
+    async fn the_event_loop_carries_out_the_action_a_key_asked_for() {
+        let mut app = app_with_service("api");
+        app.open_and_focus_selection();
+        let area = ratatui::layout::Rect::new(0, 0, TEST_FRAME.0, TEST_FRAME.1);
+        let before = app.layout().calculate(area, 1);
+        drive_event_loop(
+            &mut app,
+            Vec::new(),
+            Vec::new(),
+            vec![key(crossterm::event::KeyCode::Char('m'))],
+        )
+        .await;
+        let after = app.layout().calculate(area, 1);
+        assert_ne!(
+            before.panes[0], after.panes[0],
+            "the layout toggle never left the queue"
+        );
+    }
+
+    /// Sizing the emulators to their panes happens at the top of the loop, and
+    /// nothing but the loop does it. Without it a pane wraps its output at a
+    /// `LogStore`'s starting width rather than the width on screen, so what
+    /// the user reads is broken in a place they would blame the service for.
+    #[tokio::test(start_paused = true)]
+    async fn the_event_loop_sizes_a_pane_before_anything_is_written_to_it() {
+        let mut app = app_with_service("api");
+        app.open_and_focus_selection();
+        let area = ratatui::layout::Rect::new(0, 0, TEST_FRAME.0, TEST_FRAME.1);
+        let (_, sizes) = tui::render::layout_for(&app, area);
+        let cols = sizes.first().expect("an open pane").2;
+        // The premise: a line this long fits the pane and does not fit a store
+        // that was never told about the pane. Asserted rather than assumed, so
+        // a layout change makes this say so instead of passing vacuously.
+        let line = "x".repeat(100);
+        assert!(
+            cols > line.len() as u16,
+            "the frame is too narrow for this test to mean anything: {cols} columns"
+        );
+
+        drive_event_loop(
+            &mut app,
+            Vec::new(),
+            vec![SourceEvent::Output {
+                service: "api".into(),
+                replica: 1,
+                bytes: format!("{line}\r\n").into_bytes(),
+            }],
+            Vec::new(),
+        )
+        .await;
+
+        let store = app.store(&ServiceKey::new("api", 1)).expect("a buffer");
+        assert!(
+            store.visible_lines().iter().any(|l| l.contains(&line)),
+            "the line was wrapped at some width other than the pane's"
+        );
+    }
+
+    /// The `None` arm, which #53 names as the one a test would have raced. An
+    /// ended stream is deliberate here, and the only place it is.
+    #[tokio::test(start_paused = true)]
+    async fn an_input_stream_that_ends_quits_the_loop() {
+        let mut app = app_with_service("api");
+        let mut ended = futures::stream::iter(Vec::<std::io::Result<Event>>::new());
+        let cancel = CancellationToken::new();
+        let (exit, _) =
+            drive_event_loop_over(&mut app, Vec::new(), Vec::new(), &mut ended, &cancel).await;
+        assert!(
+            matches!(exit, Some(Ok(ExitReason::Quit))),
+            "input running out is a quit, not an interrupt: {exit:?}"
+        );
+    }
+
+    /// The other exit, which carries a different status to the calling script.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_token_stops_the_loop_as_an_interrupt() {
+        let mut app = app_with_service("api");
+        let mut waiting = futures::stream::pending::<std::io::Result<Event>>();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (exit, _) =
+            drive_event_loop_over(&mut app, Vec::new(), Vec::new(), &mut waiting, &cancel).await;
+        assert!(
+            matches!(exit, Some(Ok(ExitReason::Interrupt))),
+            "a cancelled run is an interrupt, not a quit: {exit:?}"
+        );
+    }
+
+    /// A broken input stream is reported rather than treated as an exit, so
+    /// the terminal is restored and the failure reaches the caller.
+    #[tokio::test(start_paused = true)]
+    async fn an_input_stream_that_fails_is_reported() {
+        let mut app = app_with_service("api");
+        let mut broken = futures::stream::iter(vec![Err(std::io::Error::other("the tty went"))]);
+        let cancel = CancellationToken::new();
+        let (exit, _) =
+            drive_event_loop_over(&mut app, Vec::new(), Vec::new(), &mut broken, &cancel).await;
+        let Some(Err(err)) = exit else {
+            panic!("a failed read must not look like an ordinary exit: {exit:?}");
+        };
+        assert!(err.to_string().contains("the tty went"), "got {err}");
+    }
+
+    /// Only presses are acted on, and `KeyEventKind` has three variants, not
+    /// two. Windows reports a repeat for a held key and a release for every
+    /// key, so anything looser than "is a press" hands the app the same
+    /// keystroke more than once -- and `q` would quit from a key the user is
+    /// still holding, or has just let go of.
+    ///
+    /// Both kinds, because either one alone leaves a loosening that passes:
+    /// excluding only releases still admits repeats, and vice versa.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_that_is_not_being_pressed_is_not_a_key_press() {
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let mut app = app_with_service("api");
+            let event = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                crossterm::event::KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::NONE,
+                kind,
+            ));
+            let (exit, _) = drive_event_loop(&mut app, Vec::new(), Vec::new(), vec![event]).await;
+            assert_eq!(exit, None, "{kind:?} must not be handled as a press");
+        }
+    }
+
     /// The key arm, and the exit it produces. `q` is dispatched through the
     /// injected stream, which is the whole point of injecting one.
     #[tokio::test(start_paused = true)]
@@ -1247,7 +1460,7 @@ mod tests {
             &mut app,
             Vec::new(),
             Vec::new(),
-            vec![crossterm::event::KeyCode::Char('q')],
+            vec![key(crossterm::event::KeyCode::Char('q'))],
         )
         .await;
         assert_eq!(exit, Some(ExitReason::Quit));
