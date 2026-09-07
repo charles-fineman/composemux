@@ -1230,8 +1230,10 @@ mod tests {
     }
 
     /// The mutation #53 names for the event loop: inline the old `set_services`
-    /// into the `svc_rx` arm and drop both `set_daemon_reachable` calls. The
-    /// note then never appears in the real binary, and this is what notices.
+    /// into the `svc_rx` arm and drop both `set_daemon_outage` calls -- which
+    /// #53 names as `set_daemon_reachable`, the method they were before this.
+    /// The note then never appears in the real binary, and this is what
+    /// notices.
     #[tokio::test(start_paused = true)]
     async fn the_event_loop_puts_an_outage_on_the_frame() {
         let mut app = app_with_service("api");
@@ -1449,6 +1451,23 @@ mod tests {
             let (exit, _) = drive_event_loop(&mut app, Vec::new(), Vec::new(), vec![event]).await;
             assert_eq!(exit, None, "{kind:?} must not be handled as a press");
         }
+    }
+
+    /// The last arm with nothing holding it. The ticker is what advances the
+    /// throbber and the uptimes, ages a status message out, and paces the
+    /// auto-exit countdown -- so a loop that stopped calling `tick` would look
+    /// frozen in precisely the way #19 was opened about.
+    #[tokio::test(start_paused = true)]
+    async fn the_event_loop_goes_on_ticking_the_app() {
+        let mut app = app_with_service("api");
+        let before = app.throbber();
+        drive_event_loop(&mut app, Vec::new(), Vec::new(), Vec::new()).await;
+        // More than one, so a single tick could not pass for a running clock.
+        assert!(
+            app.throbber() > before + 1,
+            "the throbber moved {} times across the whole deadline",
+            app.throbber() - before
+        );
     }
 
     /// The key arm, and the exit it produces. `q` is dispatched through the
