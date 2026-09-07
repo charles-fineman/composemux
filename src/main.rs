@@ -394,14 +394,13 @@ async fn refresh_loop<S: ServiceSource>(
 /// The terminal backend and the input stream are both injected rather than
 /// built here, because building either one is what made this loop untestable.
 /// `EventStream::new` reads crossterm's global reader, which panics with
-/// "reader source not set" in its own constructor, before the first
-/// `select!`. Crossterm falls back to `/dev/tty` when stdin is not a terminal,
-/// so what is actually missing is a controlling terminal at all -- which is
-/// the normal condition in CI, and the condition the panic in #53 was seen
-/// under. A
-/// caller that supplies its own stream also controls when input arrives, which
-/// is the only way to order events through a `select!` that picks at random
-/// among ready branches.
+/// "reader source not set" in its own constructor, before the first `select!`.
+/// Crossterm falls back to `/dev/tty` when stdin is not a terminal, so what is
+/// actually missing is a controlling terminal at all -- the normal condition
+/// in CI, and the condition the panic in #53 was seen under. A caller that
+/// supplies its own stream also controls when input arrives, which is the only
+/// way to order events through a `select!` that picks at random among ready
+/// branches.
 async fn event_loop<B, E>(
     terminal: &mut ratatui::Terminal<B>,
     events: &mut E,
@@ -821,6 +820,10 @@ mod tests {
         /// Goes quiet, then fails after this long -- what bollard's own 120s
         /// request timeout does to a request against a wedged daemon.
         QuietThenFails(Duration),
+        /// The same, but only for the first request: every one after it fails
+        /// at once, the way a daemon that has since been stopped outright
+        /// does. Pins that going quiet is remembered per request.
+        QuietOnceThenFailsAtOnce(Duration),
     }
 
     impl FakeDaemon {
@@ -838,7 +841,8 @@ mod tests {
             &self,
             _project: &str,
         ) -> impl std::future::Future<Output = Result<Vec<Service>>> + Send {
-            self.started
+            let request = self
+                .started
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let behaviour = self.behaviour.clone();
             async move {
@@ -853,6 +857,12 @@ mod tests {
                     Behaviour::QuietThenFails(delay) => {
                         tokio::time::sleep(delay).await;
                         Err(anyhow::anyhow!("Timeout error"))
+                    }
+                    Behaviour::QuietOnceThenFailsAtOnce(delay) => {
+                        if request == 0 {
+                            tokio::time::sleep(delay).await;
+                        }
+                        Err(anyhow::anyhow!("no such file or directory"))
                     }
                 }
             }
@@ -983,6 +993,56 @@ mod tests {
             seen.iter()
                 .all(|p| matches!(p, Poll::Lost(Outage::NotAnswering))),
             "a daemon that only ever went quiet was called something else: {seen:?}"
+        );
+    }
+
+    /// The mirror of the case above, and the reason going quiet is remembered
+    /// per request rather than for good: a daemon that wedged once and has
+    /// since been stopped outright has to be called unreachable again. Keeping
+    /// the old note would send the user away from the remedy that works.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_daemon_that_is_then_stopped_is_called_unreachable_again() {
+        // Three bounds and a bit: long enough that the first request is
+        // reported before it errors, so the flag is set when it does.
+        let quiet = POLL_TIMEOUT * 3 + Duration::from_secs(1);
+        let daemon = FakeDaemon::new(Behaviour::QuietOnceThenFailsAtOnce(quiet));
+        let (tx, mut rx) = mpsc::channel::<Poll>(64);
+        let cancel = CancellationToken::new();
+        spawn_refresher(
+            daemon,
+            "demo".to_string(),
+            Config::default(),
+            tx,
+            Arc::new(Notify::new()),
+            cancel.clone(),
+        );
+        let mut seen = Vec::new();
+        let watch = async {
+            loop {
+                match rx.recv().await {
+                    Some(poll) => {
+                        let done = matches!(poll, Poll::Lost(Outage::Unreachable));
+                        seen.push(poll);
+                        if done {
+                            return;
+                        }
+                    }
+                    None => return,
+                }
+            }
+        };
+        let reached = tokio::time::timeout(POLL_TIMEOUT * 30, watch).await;
+        cancel.cancel();
+        assert!(
+            matches!(seen.first(), Some(Poll::Lost(Outage::NotAnswering))),
+            "the wedge had to be reported as a wedge first: {seen:?}"
+        );
+        assert!(
+            reached.is_ok(),
+            "a daemon that is now simply gone was never called unreachable: \
+             {} polls, none of them it, the first being {:?}",
+            seen.len(),
+            seen.first()
         );
     }
 
