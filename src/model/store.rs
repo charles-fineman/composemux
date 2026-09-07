@@ -311,10 +311,10 @@ impl LogStore {
             self.replay_pending = false;
         }
         // The rebuild is the only branch a released store can reach, but the
-        // clear covers both. If the other one ever became reachable, leaving
-        // the flag set would keep the parse skipped for a grid that no later
-        // resize could rebuild -- `raw` is empty, so every resize would take
-        // that same branch -- and the pane would stay blank for the session.
+        // clear covers both, on the other branch's own terms: the screen it
+        // keeps is one the pane goes on rendering, so a flag left set there
+        // would stop `process` feeding a grid that is on screen, and every
+        // read of it would trip the assertion above.
         self.released = false;
 
         // Losing height moves the bottom of the window up under a scrolled-up
@@ -1258,8 +1258,9 @@ mod tests {
 
         // The same resize is where the release has to end, not just where the
         // replay happens: a store that came back with its history but kept
-        // skipping the parse would sit frozen on it for the rest of the
-        // session, and this is the geometry where that is easiest to miss.
+        // skipping the parse would show nothing new until the pane next
+        // changed size. This is the geometry where that is easiest to miss,
+        // because the resize that has to end the release changes nothing else.
         s.process(b"and more\r\n");
         assert!(
             non_empty(&s).iter().any(|l| l == "and more"),
@@ -1424,10 +1425,11 @@ mod tests {
     }
 
     /// The release has to end where the grid is rebuilt, or a reopened pane
-    /// freezes on its replayed history and never shows another line. Nothing
-    /// else pins that: with the assertions compiled out -- which is every
-    /// release build -- a store that came back but never resumed parsing was
-    /// caught by no behaviour at all.
+    /// shows its replayed history and then nothing further. Before this test
+    /// and the line `a_release_is_replayed_even_back_to_the_minimum_size` now
+    /// writes after its own reopen, nothing pinned that: with the assertions
+    /// compiled out -- which is every release build -- a store that came back
+    /// and never resumed parsing was caught by no behaviour at all.
     #[test]
     fn a_reopened_store_parses_again() {
         let mut s = store_with(200);
@@ -1444,14 +1446,24 @@ mod tests {
     }
 
     /// A service that has said nothing yet is released too, so the skip covers
-    /// its first output as well: those bytes reach `raw` and nothing else, and
-    /// the replay is the only thing that can ever put them on a screen.
+    /// its first output as well: those bytes reach `raw`, the line count and
+    /// the carry, but not the emulator, and the replay is the only thing that
+    /// can ever put them on a screen.
     #[test]
     fn the_first_output_after_a_release_survives_the_reopen() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.release();
 
         s.process(b"first words\r\n");
+
+        // The premise, not just the conclusion: without this the test would
+        // still pass in a world where a store that has never had output is
+        // never released in the first place.
+        assert!(
+            !s.released_grid().contents().contains("first words"),
+            "the store parsed its first output while released"
+        );
+
         s.resize(10, 40);
 
         let rows = non_empty(&s);
