@@ -171,7 +171,7 @@ pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)>
     // on every container it creates -- unscaled services and `container_name:`
     // overrides alike -- so against it this default is never reached; it
     // stands for a compose that omits the label. Reading the index out of the
-    // container name instead was weighed and rejected in #51:
+    // container name is the alternative #51 raises, and it is declined here:
     // `<project>-<service>-<n>` is not a shape every container has, since a
     // `container_name:` override replaces the whole name, so that fallback
     // would sometimes read an index out of a name carrying none.
