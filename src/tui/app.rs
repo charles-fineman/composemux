@@ -2218,10 +2218,47 @@ mod tests {
         // a loose bound without releasing anything. `(3, 20)` is `MIN_ROWS` and
         // `MIN_COLS`, which are private to `model::store` and cannot be named
         // from here.
+        //
+        // Read through the released-grid peephole rather than `screen`, which
+        // now refuses a released store: that refusal is what stops a reader
+        // that skipped `pane_key` from drawing this empty grid as the service's
+        // output.
         assert_eq!(
-            app.store(&a).unwrap().screen().size(),
+            app.store(&a).unwrap().released_grid().size(),
             (3, 20),
             "a service in no pane kept its pane-sized emulator"
+        );
+    }
+
+    /// The end-to-end version of the parse skip: a released store stops feeding
+    /// its emulator, so everything that arrives while the pane is closed exists
+    /// only as raw bytes until the reopen replays them. If the reopen were to
+    /// miss any of it, this is where a user would see it -- output that arrived
+    /// while they were looking elsewhere, silently absent when they came back.
+    #[test]
+    fn output_that_arrived_while_released_is_there_on_reopen() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        // Pin b over the top of a, so a is live but in no pane, and let the
+        // housekeeping release it.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+        app.ingest(a.clone(), b"arrived while closed\r\n");
+
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        let lines = app.store(&a).unwrap().visible_lines();
+        assert!(
+            lines.iter().any(|l| l.contains("arrived while closed")),
+            "output taken in while the pane was closed never came back:\n{lines:#?}"
         );
     }
 
