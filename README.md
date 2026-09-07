@@ -230,19 +230,19 @@ Output that never contains a newline is held, in memory, until the stream ends.
 The framing is settled inside the Docker client before composemux sees a byte,
 so there's nothing to fix at this layer;
 [#38](https://github.com/sofired/composemux/issues/38) tracks the upstream
-change. Ordinary line-oriented output isn't affected: each line is its own
-frame and nothing accumulates.
+change. Ordinary line-oriented output isn't affected: the newline ending each
+line releases it, so nothing accumulates.
 
 **Replicas are told apart by a Compose label.** composemux reads
 `com.docker.compose.container-number` to decide which replica of a scaled
 service a container is, and reads a container without that label as replica 1.
-Compose v5.5.0 sets it on every container it creates — unscaled services and
-`container_name:` overrides alike — so it's unlikely to be a limitation you
-meet. A Compose version that omitted it on a scaled service would give every
-replica the same identity: a row each in the sidebar, all carrying the same
-name, and one log buffer behind them all, holding their output interleaved with
-no way to separate them. There's nothing to configure at this end; composemux
-needs a Compose that sets the label.
+Compose v5.5.0 sets it on every service container it creates — unscaled
+services and `container_name:` overrides alike — so it's unlikely to be a
+limitation you meet. A Compose version that omitted it on a scaled service
+would give every replica the same identity: while they're running, a row each
+in the sidebar all carrying the same name, and one log buffer behind them all,
+holding their output interleaved with no way to separate them. There's nothing
+to configure at this end; composemux needs a Compose that sets the label.
 [#51](https://github.com/sofired/composemux/issues/51) has the detail.
 
 ## Contributing
