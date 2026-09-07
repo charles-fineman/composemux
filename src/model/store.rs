@@ -72,8 +72,9 @@ pub struct LogStore {
     /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
     /// across chunks isn't mistaken for a bare newline.
     pending_cr: bool,
-    /// Set when a replay had to be skipped, so the next resize retries instead
-    /// of short-circuiting on a size that was applied without one.
+    /// Set when the parser holds a size it was never given content at -- a
+    /// replay that had to be skipped, or an emulator released while off-screen
+    /// -- so the next resize replays instead of short-circuiting on the size.
     replay_pending: bool,
     /// The styling active where `raw` begins.
     ///
@@ -261,6 +262,33 @@ impl LogStore {
             old_offset
         };
         self.parser.screen_mut().set_scrollback(target);
+    }
+
+    /// Drops the emulator, keeping the bytes needed to rebuild it.
+    ///
+    /// A filled grid is `(scrollback + rows) x cols` cells of 32 bytes each --
+    /// 2.5 MB at the 24x80 default, 5.8 MB at 50x200, 15.5 MB at 60x500 --
+    /// while the raw bytes it was built from are 75-220 kB for typical log
+    /// lines. A service no pane is showing is holding the larger figure for a
+    /// grid nothing reads, so this releases it and leaves `resize` to replay.
+    ///
+    /// The replay is not new work. A store is created at the default geometry
+    /// and `resize` already replays it the first time it lands in a pane of any
+    /// other size; this only makes every view a first view.
+    ///
+    /// Scroll position does not survive, and should not: the offset counts rows
+    /// back from the bottom, and output kept arriving while the pane was
+    /// closed, so the row it named is no longer the row the reader left.
+    pub fn release(&mut self) {
+        // Rebuilding from nothing would blank a pane that has content, which is
+        // the same hazard `resize` keeps the screen for rather than replaying.
+        if self.raw.is_empty() && self.has_output {
+            return;
+        }
+        self.parser = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+        // A pane floored at the minimum geometry would otherwise short-circuit
+        // the resize and render this empty grid as the service's output.
+        self.replay_pending = true;
     }
 
     /// Rows scrolled back from the bottom. `0` means tailing.
@@ -1058,6 +1086,110 @@ mod tests {
         assert!(text.contains("line 0"), "expected scrollback in the copy");
         assert!(text.contains("line 39"), "expected the newest line too");
         assert!(tailing(&s), "copying must not disturb the scroll position");
+    }
+
+    // ---- releasing an off-screen emulator ----
+
+    /// The point of releasing is that the grid goes away, and a grid is the
+    /// only part of a store big enough to be worth releasing. Asserting on the
+    /// emulated size is the observable stand-in for the allocation: a `10x40`
+    /// grid at a 1000-row scrollback is 1.3 MB of cells, a `3x20` one with no
+    /// scrollback is under 2 kB.
+    #[test]
+    fn releasing_shrinks_the_grid_to_nothing() {
+        let mut s = store_with(200);
+        assert_eq!(s.screen().size(), (10, 40));
+
+        s.release();
+
+        assert_eq!(
+            s.screen().size(),
+            (MIN_ROWS, MIN_COLS),
+            "the emulator was kept at its pane size"
+        );
+    }
+
+    /// Releasing is only safe because the raw bytes outlive the grid. A store
+    /// that came back short of what it had would be trading a memory bug for a
+    /// data-loss one.
+    #[test]
+    fn a_released_store_comes_back_with_the_same_content() {
+        let mut s = store_with(200);
+        let before = non_empty(&s);
+        let deep = {
+            let mut probe = store_with(200);
+            probe.scroll_to_top();
+            non_empty(&probe)
+        };
+
+        s.release();
+        s.resize(10, 40);
+
+        assert_eq!(non_empty(&s), before, "the visible rows changed");
+        s.scroll_to_top();
+        assert_eq!(non_empty(&s), deep, "the scrollback did not come back");
+    }
+
+    /// A pane floored at the emulator's own minimum is a real geometry -- a
+    /// terminal barely large enough to draw one. Rebuilding has to happen on
+    /// the size comparison alone being unable to tell "released" from
+    /// "already this size", or that pane renders an empty grid.
+    #[test]
+    fn a_release_is_replayed_even_back_to_the_minimum_size() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(MIN_ROWS, MIN_COLS);
+        s.process(b"hello\r\n");
+        let before = non_empty(&s);
+
+        s.release();
+        s.resize(MIN_ROWS, MIN_COLS);
+
+        assert_eq!(non_empty(&s), before, "the pane came back empty");
+    }
+
+    /// Rewrapping on resize is the behaviour several merged fixes exist to
+    /// protect, and a release must route through it rather than around it: a
+    /// store released at one width and reopened at another has to look exactly
+    /// like one that was only ever resized.
+    #[test]
+    fn a_released_store_still_rewraps_at_the_width_it_reopens_at() {
+        let line = "x".repeat(70);
+        let mut released = LogStore::new(DEFAULT_SCROLLBACK);
+        released.resize(10, 80);
+        let mut resized = LogStore::new(DEFAULT_SCROLLBACK);
+        resized.resize(10, 80);
+        for i in 0..40 {
+            let bytes = format!("\x1b[3{}m{i:03} {line}\r\n", 1 + i % 7);
+            released.process(bytes.as_bytes());
+            resized.process(bytes.as_bytes());
+        }
+
+        released.release();
+        released.resize(10, 30);
+        resized.resize(10, 30);
+
+        assert_eq!(non_empty(&released), non_empty(&resized));
+        // Formatted contents, not plain rows: the pen carried across a trim is
+        // reconstructed by the replay, and plain rows would not notice it going
+        // missing.
+        assert_eq!(
+            released.screen().contents_formatted(),
+            resized.screen().contents_formatted()
+        );
+    }
+
+    /// A store with output it cannot reproduce must keep the grid it has. The
+    /// pane is showing content that exists nowhere else, and releasing would
+    /// blank it permanently -- the same case `resize` refuses to replay.
+    #[test]
+    fn a_store_that_cannot_be_rebuilt_keeps_its_grid() {
+        let mut s = store_with(200);
+        s.raw.clear();
+
+        s.release();
+
+        assert_eq!(s.screen().size(), (10, 40));
+        assert!(!non_empty(&s).is_empty(), "the pane was blanked");
     }
 }
 
