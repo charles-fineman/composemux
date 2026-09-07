@@ -167,8 +167,18 @@ pub(super) fn container_key(summary: &ContainerSummary) -> Option<(String, u32)>
     if is_transient_labels(labels_map) {
         return None;
     }
-    // Compose omits the number on an unscaled service, which is replica 1 --
-    // the same default `LogSupervisor::resync` applies to the same label.
+    // A container with no number is replica 1. Compose v5.5.0 sets the label on
+    // every service container it creates -- unscaled services and
+    // `container_name:` overrides alike. What it leaves unlabelled is a
+    // `docker compose run` one-off, which `is_transient_labels` has already
+    // rejected above. So against that compose the default is unreachable, and
+    // it is that filter rather than the label that keeps it so. The default
+    // stands for a compose that omits the label on a service container.
+    // Reading the index out of the container name is the alternative #51
+    // raises, and it is declined here:
+    // `<project>-<service>-<n>` is not a shape every container has, since a
+    // `container_name:` override replaces the whole name, so that fallback
+    // would sometimes read an index out of a name carrying none.
     let replica = labels_map
         .get(labels::CONTAINER_NUMBER)
         .and_then(|n| n.parse().ok())

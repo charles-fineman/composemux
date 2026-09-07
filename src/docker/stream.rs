@@ -1,4 +1,4 @@
-#![allow(clippy::missing_docs_in_private_items)] // 20 left to document
+#![allow(clippy::missing_docs_in_private_items)] // 17 left to document
 //! Log streaming and container supervision.
 //!
 //! One task per container reads its log stream into a shared channel. A
@@ -72,8 +72,22 @@ pub(crate) const MAX_CHUNK_BYTES: usize = 64 * 1024;
 pub enum SourceEvent {
     /// Raw output from one service's container.
     Output {
+        /// Compose service name, as the output is labelled with.
         service: String,
+        /// The container's `com.docker.compose.container-number`, or 1 where
+        /// compose omits it -- the default `resync` and `container_key` apply.
         replica: u32,
+        /// ID of the container these bytes were read from.
+        ///
+        /// `(service, replica)` does not identify a container: compose
+        /// recreates rather than restarts, and the replacement carries the
+        /// same `container-number` label, so a consumer keyed on the pair
+        /// alone cannot see that the container writing to it has changed.
+        /// Carried per piece so a consumer holding bytes across writes can
+        /// tell whose they are; the ID travels with the output rather than
+        /// alongside it, so it cannot be raced by a separate notification.
+        container: String,
+        /// One piece of a log frame, no larger than [`MAX_CHUNK_BYTES`].
         bytes: Vec<u8>,
     },
     /// Container topology or status changed; the UI should re-read services.
@@ -466,6 +480,9 @@ async fn forward_frame(
         let event = SourceEvent::Output {
             service: desc.service.clone(),
             replica: desc.replica,
+            // One ID clone per piece, next to a service-name clone that was
+            // already here, against a piece of up to `MAX_CHUNK_BYTES`.
+            container: desc.id.clone(),
             bytes: piece.to_vec(),
         };
         tokio::select! {
@@ -534,6 +551,7 @@ mod tests {
         tx.send(SourceEvent::Output {
             service: "filler".to_string(),
             replica: 1,
+            container: "filler-id".to_string(),
             bytes: vec![b'x'],
         })
         .await
@@ -586,10 +604,16 @@ mod tests {
                 SourceEvent::Output {
                     service,
                     replica,
+                    container,
                     bytes,
                 } => {
                     assert_eq!(service, "svc-a", "a piece lost its service");
                     assert_eq!(replica, 1, "a piece lost its replica");
+                    // The container ID, not the service name or the label:
+                    // it is the one part of the identity that a compose
+                    // recreate changes, which is the whole reason the
+                    // fallback is given it.
+                    assert_eq!(container, "a", "a piece lost its container ID");
                     pieces.push(bytes);
                 }
                 other => panic!("expected output, got {other:?}"),

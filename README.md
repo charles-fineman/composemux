@@ -207,6 +207,45 @@ than smearing themselves across the UI. It's also a safety property — containe
 logs are untrusted input, and they're never passed through to your terminal
 verbatim.
 
+## Known limitations
+
+Two ways a Compose project can surprise composemux, both worth knowing before
+you go looking for the bug in your own service.
+
+**A `tty: true` service that writes without newlines will look stalled.** Set
+`tty: false` and it streams as it should. That's the whole remedy — with the
+caveat that the service then sees a pipe rather than a terminal, so anything
+that checks for one — a `\r` progress bar redrawing in place, say — will render
+differently. `tty: true` isn't Compose's default, so this only bites a service
+that asked for one.
+
+What's going on: the daemon splits a log message at 16 KiB whether or not the
+service has a tty, and what a tty removes is the per-write header saying where
+each split falls. The Docker client composemux reads logs through (bollard)
+then has nothing to frame on, scans for a newline instead, and holds the
+daemon's chunks until one arrives. Measured: a service writing 48 KiB with no
+newline in it delivers three 16 KiB pieces over eleven seconds without a tty;
+with one, nothing at all for those eleven seconds and then all three at once.
+Output that never contains a newline is held, in memory, until the stream ends.
+The framing is settled inside the Docker client before composemux sees a byte,
+so there's nothing to fix at this layer;
+[#38](https://github.com/sofired/composemux/issues/38) tracks the upstream
+change. Ordinary line-oriented output isn't affected: the newline ending each
+line releases it, so nothing accumulates.
+
+**Replicas are told apart by a Compose label.** composemux reads
+`com.docker.compose.container-number` to decide which replica of a scaled
+service a container is, and reads a container without that label as replica 1.
+Compose v5.5.0 sets it on every container composemux follows — unscaled
+services and `container_name:` overrides alike — so it's unlikely to be a
+limitation you meet. A Compose version that omitted it on a scaled service
+would give every replica the same identity: a row each in the sidebar for as
+long as they're running, all carrying the same name, and one log buffer behind
+them all, holding their output interleaved with no way to separate them.
+There's nothing to configure at this end, and nothing to fix for an unscaled
+service — only a scaled one needs a Compose that sets the label.
+[#51](https://github.com/sofired/composemux/issues/51) has the detail.
+
 ## Contributing
 
 Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the
