@@ -79,12 +79,20 @@ const MIN_REFRESH: Duration = Duration::from_millis(500);
 /// polls): 2.1s on a local socket, 3.1s across a 50ms round trip, 6.7s across
 /// 200ms, worst single sample 7.1s. A 60-container project cost 0.8s, 1.4s and
 /// 3.0s. So ten seconds is already longer than any honest poll observed --
-/// and one overrun says nothing on its own, since `FAILURES_BEFORE_UNREACHABLE`
+/// and one overrun says nothing on its own, since `FAILURES_BEFORE_OUTAGE`
 /// wants three. So a daemon that goes quiet while it is being polled is not
 /// called out until one request has been outstanding for thirty seconds --
 /// fifteen missed refreshes, and four times the slowest honest poll measured.
 /// (A hang that follows failures already on the count is called out sooner,
 /// which is right: the daemon has been failing that whole time.)
+///
+/// Where those measurements stop is worth saying, since they are the argument:
+/// 150 containers across a 200ms round trip. Cost grows with containers times
+/// round trip, so a project several times larger again over a slow link could
+/// cross thirty seconds honestly. What that costs is bounded and clears
+/// itself -- the request is still in flight, so the services arrive and take
+/// the note back down with them -- which is why the bound is a constant here
+/// rather than something to configure.
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most log messages folded into one redraw. Without a cap, a service logging
 /// faster than we can render would keep the drain loop from ever returning, and
@@ -247,8 +255,8 @@ async fn run_tui(
     tui::terminal::install_panic_hook();
     let mut terminal = tui::terminal::setup()?;
     // Constructed here rather than inside the loop: crossterm's reader is a
-    // process-wide singleton tied to the real stdin, and owning it is what a
-    // test cannot do.
+    // process-wide singleton tied to the controlling terminal, and owning it
+    // is what a test cannot do.
     let mut events = EventStream::new();
     let result = event_loop(
         &mut terminal,
@@ -309,6 +317,15 @@ async fn refresh_loop<S: ServiceSource>(
     // mean a daemon that answers in eleven seconds never delivers anything at
     // all, which is a worse failure than the one being fixed.
     let mut inflight = Box::pin(source.list_services(&project));
+    // Whether the request now in flight has already gone past the bound at
+    // least once. bollard puts its own 120s timeout on every request
+    // (`DEFAULT_TIMEOUT`, which `connect_with_defaults` takes), so the request
+    // we are deliberately holding does eventually come back -- as an error.
+    // Without this, a daemon that hangs for good would be called wedged for
+    // 110 seconds, then unreachable for the twelve it takes to notice the next
+    // hang, and round again: the bar would send the user off to start a daemon
+    // that is plainly running, once every two minutes.
+    let mut overran = false;
     loop {
         let waited = tokio::select! {
             _ = cancel.cancelled() => return,
@@ -328,12 +345,20 @@ async fn refresh_loop<S: ServiceSource>(
                 // failures, and this is the only place to look when the note
                 // will not clear.
                 docker::log_debug(&format!("service poll failed: {err}"));
-                Err(Outage::Unreachable)
+                // A request that already went quiet on us and has now errored
+                // out is the wedged daemon we have been naming all along, not
+                // a newly unreachable one.
+                Err(if overran {
+                    Outage::NotAnswering
+                } else {
+                    Outage::Unreachable
+                })
             }
             Err(_) => {
                 docker::log_debug(&format!(
                     "service poll still unanswered after {POLL_TIMEOUT:?}"
                 ));
+                overran = true;
                 Err(Outage::NotAnswering)
             }
         };
@@ -360,6 +385,7 @@ async fn refresh_loop<S: ServiceSource>(
             _ = tokio::time::sleep(REFRESH.saturating_sub(MIN_REFRESH)) => {}
         }
         inflight = Box::pin(source.list_services(&project));
+        overran = false;
     }
 }
 
@@ -367,9 +393,12 @@ async fn refresh_loop<S: ServiceSource>(
 ///
 /// The terminal backend and the input stream are both injected rather than
 /// built here, because building either one is what made this loop untestable.
-/// `EventStream::new` reads crossterm's global reader, which has no source
-/// when stdin is not a terminal -- the normal condition under `cargo test` --
-/// and panics with "reader source not set" before the first `select!`. A
+/// `EventStream::new` reads crossterm's global reader, which panics with
+/// "reader source not set" in its own constructor, before the first
+/// `select!`. Crossterm falls back to `/dev/tty` when stdin is not a terminal,
+/// so what is actually missing is a controlling terminal at all -- which is
+/// the normal condition in CI, and the condition the panic in #53 was seen
+/// under. A
 /// caller that supplies its own stream also controls when input arrives, which
 /// is the only way to order events through a `select!` that picks at random
 /// among ready branches.
@@ -789,6 +818,9 @@ mod tests {
         Hangs,
         /// Answers, but only after this long.
         Slow(Duration, Vec<Service>),
+        /// Goes quiet, then fails after this long -- what bollard's own 120s
+        /// request timeout does to a request against a wedged daemon.
+        QuietThenFails(Duration),
     }
 
     impl FakeDaemon {
@@ -817,6 +849,10 @@ mod tests {
                     Behaviour::Slow(delay, services) => {
                         tokio::time::sleep(delay).await;
                         Ok(services)
+                    }
+                    Behaviour::QuietThenFails(delay) => {
+                        tokio::time::sleep(delay).await;
+                        Err(anyhow::anyhow!("Timeout error"))
                     }
                 }
             }
@@ -903,6 +939,50 @@ mod tests {
             started.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "giving up on waiting must not reissue the request"
+        );
+    }
+
+    /// bollard puts a 120s timeout on every request, so the request this loop
+    /// holds in flight against a wedged daemon does come back -- as an error.
+    /// Calling that "unreachable" would march the note back and forth between
+    /// two contradictory claims about one unchanging daemon, and send the user
+    /// to start one that is plainly running.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_daemon_is_never_reported_as_unreachable() {
+        // Long enough for the wait to overrun several times over first, which
+        // is what bollard's own timeout does at twelve times POLL_TIMEOUT.
+        let daemon = FakeDaemon::new(Behaviour::QuietThenFails(POLL_TIMEOUT * 12));
+        let (tx, mut rx) = mpsc::channel::<Poll>(64);
+        let cancel = CancellationToken::new();
+        spawn_refresher(
+            daemon,
+            "demo".to_string(),
+            Config::default(),
+            tx,
+            Arc::new(Notify::new()),
+            cancel.clone(),
+        );
+        // Two of bollard's timeouts' worth, so the round after the error --
+        // where the misclassification showed up -- is included.
+        let mut seen = Vec::new();
+        let watch = async {
+            while seen.len() < 30 {
+                match rx.recv().await {
+                    Some(poll) => seen.push(poll),
+                    None => break,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(POLL_TIMEOUT * 30, watch).await;
+        cancel.cancel();
+        assert!(
+            !seen.is_empty(),
+            "the refresher must report a wedged daemon at all"
+        );
+        assert!(
+            seen.iter()
+                .all(|p| matches!(p, Poll::Lost(Outage::NotAnswering))),
+            "a daemon that only ever went quiet was called something else: {seen:?}"
         );
     }
 

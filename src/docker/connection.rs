@@ -5,7 +5,7 @@
 //! What was missing is any sign of it: this decides when an outage has lasted
 //! long enough to be worth telling the user about.
 
-/// Consecutive failed polls before the daemon is reported as lost.
+/// Consecutive failed rounds before the daemon is reported as lost.
 ///
 /// Three, so that the note costs two more failures than a single dropped
 /// request. That one case is what the debounce exists for: a transient error
@@ -17,8 +17,9 @@
 /// in `main`), so the note lands within about six seconds; measured against a
 /// cut socket it took 2.7s. Against a daemon that accepts and then never
 /// answers, each round instead costs `POLL_TIMEOUT` in `main`, so the note
-/// lands three of those in -- see [`Outage`].
-const FAILURES_BEFORE_UNREACHABLE: u32 = 3;
+/// lands three of those in -- see that constant's own note for how it was
+/// picked.
+const FAILURES_BEFORE_OUTAGE: u32 = 3;
 
 /// Why the daemon is not being heard from.
 ///
@@ -29,8 +30,10 @@ const FAILURES_BEFORE_UNREACHABLE: u32 = 3;
 /// send the user to check something that is probably fine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outage {
-    /// The request itself failed: the socket was refused or cut, or the
-    /// daemon answered with an error. Nothing came back.
+    /// The request came back a failure, whatever the cause: a socket that was
+    /// refused or cut, and also a daemon that answered with an error of its
+    /// own. The second is not literally unreachable, which is a rough edge the
+    /// note inherits rather than one this introduced.
     Unreachable,
     /// The request has been outstanding longer than the poller is willing to
     /// wait for it, without either answering or failing. The daemon may be
@@ -40,16 +43,17 @@ pub enum Outage {
 
 /// Tracks whether the daemon is still answering the periodic service poll.
 ///
-/// It counts rounds of the poll rather than measuring elapsed time, because a
-/// run of failures is unambiguous where a wall-clock window is not: a window
-/// would also fire part way through a single slow request that may yet
-/// succeed, which is a different thing from an outage.
-///
 /// A round ends either with the daemon's answer or with the poller's own
-/// bound on how long it will wait for one, so a request that is accepted and
-/// never answered now ends rounds too and is reported like any other outage.
+/// bound on how long it will wait for one, so a request that is taken and
+/// never answered ends rounds too and is reported like any other outage.
 /// Waiting is all that is given up on: the request stays in flight, so a poll
 /// that is merely slow still delivers its services and clears the note.
+///
+/// Counting those rounds is what buys the headroom. A single wall-clock window
+/// would call an outage the first time one request ran long, which is a
+/// different thing from a daemon that has gone away; requiring a run of them
+/// means the same request has to overrun three times over before anyone is
+/// told, and any answer along the way resets it.
 #[derive(Debug, Default)]
 pub struct ConnectionHealth {
     /// Failed rounds since the last success. Saturates rather than wrapping,
@@ -77,7 +81,7 @@ impl ConnectionHealth {
 
     /// The outage to report, once the run has been going long enough to show.
     pub fn outage(&self) -> Option<Outage> {
-        if self.consecutive_failures >= FAILURES_BEFORE_UNREACHABLE {
+        if self.consecutive_failures >= FAILURES_BEFORE_OUTAGE {
             self.last_failure
         } else {
             None
@@ -107,11 +111,11 @@ mod tests {
     #[test]
     fn failures_short_of_the_threshold_stay_silent() {
         let mut health = ConnectionHealth::default();
-        for _ in 1..FAILURES_BEFORE_UNREACHABLE {
+        for _ in 1..FAILURES_BEFORE_OUTAGE {
             health.record_failure(Outage::Unreachable);
             assert!(
                 health.outage().is_none(),
-                "reported an outage before {FAILURES_BEFORE_UNREACHABLE} failures"
+                "reported an outage before {FAILURES_BEFORE_OUTAGE} failures"
             );
         }
     }
@@ -119,16 +123,16 @@ mod tests {
     #[test]
     fn the_threshold_run_of_failures_reports_an_outage() {
         let mut health = ConnectionHealth::default();
-        for _ in 0..FAILURES_BEFORE_UNREACHABLE {
+        for _ in 0..FAILURES_BEFORE_OUTAGE {
             health.record_failure(Outage::Unreachable);
         }
         assert_eq!(health.outage(), Some(Outage::Unreachable));
     }
 
     /// The note has to name the failure the user is living with now. A daemon
-    /// that refused while it was restarting and then came up wedged is
-    /// hanging, and sending them to check whether docker is running would be
-    /// sending them to check something that is true.
+    /// that refused while it was restarting and has since come up wedged is
+    /// hanging now, and a note still saying "unreachable" would send the user
+    /// to start a daemon that is already running.
     #[test]
     fn the_reported_outage_is_the_most_recent_kind() {
         let mut health = ConnectionHealth::default();
@@ -160,11 +164,11 @@ mod tests {
         }
         // Then a run stopped one short, resumed after a success, which is the
         // near miss an off-by-one would let through.
-        for _ in 1..FAILURES_BEFORE_UNREACHABLE {
+        for _ in 1..FAILURES_BEFORE_OUTAGE {
             health.record_failure(Outage::Unreachable);
         }
         health.record_success();
-        for _ in 1..FAILURES_BEFORE_UNREACHABLE {
+        for _ in 1..FAILURES_BEFORE_OUTAGE {
             health.record_failure(Outage::Unreachable);
         }
         assert!(
@@ -179,7 +183,7 @@ mod tests {
     /// stay silent, and changing it should have to be deliberate.
     #[test]
     fn the_threshold_is_three_failures_exactly() {
-        assert_eq!(FAILURES_BEFORE_UNREACHABLE, 3);
+        assert_eq!(FAILURES_BEFORE_OUTAGE, 3);
         let mut health = ConnectionHealth::default();
         health.record_failure(Outage::Unreachable);
         assert!(health.outage().is_none(), "one failure");
@@ -192,7 +196,7 @@ mod tests {
     #[test]
     fn one_answered_poll_ends_an_outage() {
         let mut health = ConnectionHealth::default();
-        for _ in 0..FAILURES_BEFORE_UNREACHABLE + 5 {
+        for _ in 0..FAILURES_BEFORE_OUTAGE + 5 {
             health.record_failure(Outage::Unreachable);
         }
         assert!(health.outage().is_some());
