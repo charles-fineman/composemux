@@ -13,10 +13,18 @@ updates:
       prefix: "deps"
 
   # Keep the Actions themselves current; this is the supply chain that has
-  # write access to releases.
+  # write access to releases. Every `uses:` is pinned to a commit SHA, so this
+  # is now the only thing that moves them -- without it the pinning would just
+  # trade a supply-chain risk for an update-lag one.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # A SHA pin makes every patch release its own PR, where a major tag would
+      # have absorbed it silently. Batch them so the volume stays reviewable;
+      # majors stay on their own, since those are the ones that break.
+      actions:
+        update-types: [minor, patch]
     commit-message:
       prefix: "ci"
