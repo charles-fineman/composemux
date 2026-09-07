@@ -1109,8 +1109,10 @@ mod tests {
     /// The point of releasing is that the grid goes away, and a grid is the
     /// only part of a store big enough to be worth releasing. Asserting on the
     /// emulated size is the observable stand-in for the allocation: a `10x40`
-    /// grid at a 1000-row scrollback is 1.3 MB of cells, a `3x20` one with no
-    /// scrollback is under 2 kB.
+    /// grid *would* reach 1.3 MB of cells once its 1000-row scrollback filled,
+    /// while a `3x20` one with no scrollback cannot pass 2 kB. Rows are
+    /// allocated as output arrives, so this 200-line store is far short of that
+    /// ceiling -- what is released is the geometry, not the figure.
     #[test]
     fn releasing_shrinks_the_grid_to_nothing() {
         let mut s = store_with(200);

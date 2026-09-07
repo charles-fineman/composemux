@@ -2094,6 +2094,73 @@ mod tests {
         );
     }
 
+    /// Scroll position deliberately does not survive a close and reopen. A
+    /// reader who had scrolled up used to come back to the same row and now
+    /// comes back tailing. The offset counts rows back from the bottom, and
+    /// output kept arriving while the pane was closed, so restoring the number
+    /// would restore a different row than the one they left.
+    #[test]
+    fn reopening_a_service_comes_back_tailing_rather_than_where_it_was_left() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Enter);
+        app.resize_panes(&[(0, 10, 40)]);
+        press_ctrl(&mut app, KeyCode::Char('u'));
+        assert!(
+            app.store(&a).unwrap().scroll_offset() > 0,
+            "the test needs a scrolled-up pane to prove anything"
+        );
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('1'));
+        refresh(&mut app, &["a", "b"]);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('1'));
+        app.resize_panes(&[(0, 10, 40)]);
+
+        assert_eq!(
+            app.store(&a).unwrap().scroll_offset(),
+            0,
+            "a reopened pane should be tailing, not restoring a stale row"
+        );
+    }
+
+    /// Full screen hides the sibling pane without vacating its slot, so the
+    /// housekeeping leaves its emulator alone and returning to it finds the
+    /// pane as it was. This is the one case where a service no pane is showing
+    /// deliberately keeps its grid.
+    #[test]
+    fn a_pane_hidden_by_full_screen_keeps_its_emulator() {
+        let mut app = app_with(&["a", "b"]);
+        let a = ServiceKey::new("a", 1);
+        fill(&mut app, &a, 200);
+
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('2'));
+        app.resize_panes(&[(0, 10, 40), (1, 10, 40)]);
+        assert_eq!(app.store(&a).unwrap().screen().size(), (10, 40));
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.full_screen_pane(),
+            Some(1),
+            "expected pane 2 full screen"
+        );
+
+        refresh(&mut app, &["a", "b"]);
+
+        assert_eq!(
+            app.store(&a).unwrap().screen().size(),
+            (10, 40),
+            "the pane hidden behind full screen lost its emulator"
+        );
+    }
+
     /// The scan asks `pane_key` for every slot, not just the first. One that
     /// stopped at slot 0 would release the store behind pane 2 on every poll
     /// while the user was reading it -- the same defect as reading `panes`,
