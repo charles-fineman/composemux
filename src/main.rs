@@ -1324,6 +1324,7 @@ mod tests {
             vec![SourceEvent::Output {
                 service: "api".into(),
                 replica: 1,
+                container: "api-1".into(),
                 bytes: b"hello from the loop\r\n".to_vec(),
             }],
             Vec::new(),
@@ -1389,6 +1390,7 @@ mod tests {
             vec![SourceEvent::Output {
                 service: "api".into(),
                 replica: 1,
+                container: "api-1".into(),
                 bytes: format!("{line}\r\n").into_bytes(),
             }],
             Vec::new(),
