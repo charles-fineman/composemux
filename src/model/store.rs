@@ -127,8 +127,8 @@ impl LogStore {
     /// so a reader that reaches a store by any route other than `App::pane_key`
     /// draws a blank pane instead of the service's output. Skipping the parse
     /// is what turned that from wasted work into a wrong pane, so every read
-    /// goes through here and a stray one fails in debug builds and in the test
-    /// suite rather than quietly on a user's screen.
+    /// goes through here and a stray one fails in any debug build, the test
+    /// suite included, rather than quietly on a user's screen.
     fn live_screen(&self) -> &vt100::Screen {
         debug_assert!(
             !self.released,
@@ -291,6 +291,14 @@ impl LogStore {
         let old_offset = self.parser.screen().scrollback();
 
         if self.raw.is_empty() && self.has_output {
+            // Not reachable for a released store: `release` refuses this state,
+            // and `raw` never empties again once it has been filled. Asserted
+            // rather than argued, because the screen kept here is the released
+            // placeholder if it ever is.
+            debug_assert!(
+                !self.released,
+                "a released store reached the branch that keeps its grid"
+            );
             // Rebuilding from nothing would blank a pane that has content.
             // Keep what is on screen and try again on the next resize.
             self.parser.screen_mut().set_size(rows, cols);
@@ -302,9 +310,11 @@ impl LogStore {
             self.parser = rebuilt;
             self.replay_pending = false;
         }
-        // Cleared whichever branch ran: the skipped replay kept a screen a
-        // pane is showing, and the rebuild replayed `raw` into a fresh one.
-        // Either way the parser is again one `process` has to feed.
+        // The rebuild is the only branch a released store can reach, but the
+        // clear covers both. If the other one ever became reachable, leaving
+        // the flag set would keep the parse skipped for a grid that no later
+        // resize could rebuild -- `raw` is empty, so every resize would take
+        // that same branch -- and the pane would stay blank for the session.
         self.released = false;
 
         // Losing height moves the bottom of the window up under a scrolled-up
@@ -339,10 +349,12 @@ impl LogStore {
     /// the cost from "when the pane changes size" to "whenever the pane
     /// closes".
     ///
-    /// What stops is the parse, not the ingest. Output keeps arriving for a
-    /// closed pane and keeps being retained, but `process` stops feeding it to
-    /// the emulator until a resize ends the release -- so an off-screen service
-    /// costs the bytes and the line accounting, and nothing else.
+    /// What stops is the feed into this store's own grid, not the ingest.
+    /// Output keeps arriving for a closed pane and keeps being retained, and
+    /// `retain` still runs the bytes that age out of `raw` through a scratch
+    /// emulator to carry `pen` forward -- so an off-screen service still costs
+    /// the bytes, the line accounting and that scratch parse. What it stops
+    /// paying for is a parse into a grid nothing will read.
     ///
     /// Scroll position does not survive, and should not: the offset counts rows
     /// back from the bottom, and output kept arriving while the pane was
@@ -1243,6 +1255,16 @@ mod tests {
         s.resize(MIN_ROWS, MIN_COLS);
 
         assert_eq!(non_empty(&s), before, "the pane came back empty");
+
+        // The same resize is where the release has to end, not just where the
+        // replay happens: a store that came back with its history but kept
+        // skipping the parse would sit frozen on it for the rest of the
+        // session, and this is the geometry where that is easiest to miss.
+        s.process(b"and more\r\n");
+        assert!(
+            non_empty(&s).iter().any(|l| l == "and more"),
+            "a reopened store never resumed parsing"
+        );
     }
 
     /// Rewrapping on resize is the behaviour several merged fixes exist to
@@ -1338,8 +1360,14 @@ mod tests {
     /// properties and the one this change is for. It has to look at the grid
     /// through the released-grid peephole, because reading a released store
     /// through `screen` is the mistake the whole thing is guarding against.
+    ///
+    /// The scrollback budget the placeholder is built with is deliberately not
+    /// asserted any more, and cannot be: `vt100` allocates scrollback rows as
+    /// they arrive, so a grid nothing is parsed into costs nothing whatever
+    /// that budget says, and the old check reached it through a `scroll_to_top`
+    /// that is itself now a read of a released store.
     #[test]
-    fn a_released_store_parses_nothing_and_so_refills_no_scrollback() {
+    fn a_released_store_parses_nothing_while_off_screen() {
         let mut s = store_with(200);
         s.release();
         for i in 0..500 {
@@ -1361,27 +1389,76 @@ mod tests {
     ///
     /// So the rule is asserted where it can be enforced -- on the read itself,
     /// which no new reader can avoid -- rather than restated in a comment.
+    ///
+    /// Through `screen`, which is what `log_pane` blits a pane from. Reached
+    /// through `visible_lines` instead this passed while `screen` was routed
+    /// around the guard entirely, because `visible_lines` is `#[cfg(test)]` and
+    /// draws nothing.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "released store")]
+    #[should_panic(expected = "read the screen")]
     fn reading_a_released_store_trips_an_assertion() {
         let mut s = store_with(200);
         s.release();
 
-        let _ = s.visible_lines();
+        let _ = s.screen();
     }
 
-    /// Scroll handling reaches the emulator by a different door, and a pane
-    /// that resolved a store correctly for its cells but not for its scrollbar
-    /// would be just as wrong.
+    /// Moving the offset reaches the grid through `live_screen_mut`, a second
+    /// door with its own assertion: a pane that resolved its store correctly
+    /// for the cells but not for the scrollbar would be just as wrong.
+    ///
+    /// `scroll_to_top` rather than `scroll_up`, which reads the current offset
+    /// first and so trips the *read* assertion before it ever reaches the
+    /// second door -- written with `scroll_up` this test passed with
+    /// `live_screen_mut`'s assertion deleted. The expected message names the
+    /// door for the same reason: "released store" appears in both.
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "released store")]
+    #[should_panic(expected = "moved the scroll offset")]
     fn scrolling_a_released_store_trips_an_assertion() {
         let mut s = store_with(200);
         s.release();
 
-        s.scroll_up(1);
+        s.scroll_to_top();
+    }
+
+    /// The release has to end where the grid is rebuilt, or a reopened pane
+    /// freezes on its replayed history and never shows another line. Nothing
+    /// else pins that: with the assertions compiled out -- which is every
+    /// release build -- a store that came back but never resumed parsing was
+    /// caught by no behaviour at all.
+    #[test]
+    fn a_reopened_store_parses_again() {
+        let mut s = store_with(200);
+        s.release();
+        s.resize(10, 40);
+
+        s.process(b"after the reopen\r\n");
+
+        let rows = non_empty(&s);
+        assert!(
+            rows.iter().any(|l| l == "after the reopen"),
+            "a reopened store never resumed parsing:\n{rows:#?}"
+        );
+    }
+
+    /// A service that has said nothing yet is released too, so the skip covers
+    /// its first output as well: those bytes reach `raw` and nothing else, and
+    /// the replay is the only thing that can ever put them on a screen.
+    #[test]
+    fn the_first_output_after_a_release_survives_the_reopen() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.release();
+
+        s.process(b"first words\r\n");
+        s.resize(10, 40);
+
+        let rows = non_empty(&s);
+        assert!(
+            rows.iter().any(|l| l == "first words"),
+            "the first output a released store took in was lost:\n{rows:#?}"
+        );
     }
 
     /// Skipping the parse must cost the reopened pane nothing. A store that was

@@ -2251,6 +2251,18 @@ mod tests {
         refresh(&mut app, &["a", "b"]);
         app.ingest(a.clone(), b"arrived while closed\r\n");
 
+        // The premise, not just the conclusion: without this the test would
+        // keep passing if the housekeeping stopped releasing anything, and it
+        // would then be proving nothing about the path it is named for.
+        assert!(
+            !app.store(&a)
+                .unwrap()
+                .released_grid()
+                .contents()
+                .contains("arrived while closed"),
+            "the store was still parsing while it was in no pane"
+        );
+
         press(&mut app, KeyCode::Char('k'));
         press(&mut app, KeyCode::Char('1'));
         app.resize_panes(&[(0, 10, 40)]);
