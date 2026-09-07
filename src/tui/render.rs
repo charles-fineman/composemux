@@ -195,6 +195,50 @@ mod tests {
         assert!(text.contains("DEMO"), "missing project badge:\n{text}");
     }
 
+    /// #19 end to end: the note has to survive the status bar's layout
+    /// arithmetic and actually land on the screen, not merely exist in a
+    /// `Line` the bar might never give room to.
+    ///
+    /// 64 is the narrowest width at which this fixture still carries the whole
+    /// note, and so the width an off-by-one in the bar's arithmetic would
+    /// break first: below it the hints are already down to their 16-column
+    /// minimum, so the slot shrinks with the terminal and the note truncates.
+    /// The figure moves with the status slot to its left -- a project with a
+    /// two-digit count is two columns wider there, and needs 66 -- so it is
+    /// the floor for these three services, not a constant of the bar.
+    ///
+    /// It truncates without an ellipsis, as the filter and countdown messages
+    /// always have here -- nx uses `fit_with_ellipsis` for this and composemux
+    /// never has, which is a gap in the port rather than something this note
+    /// introduced.
+    #[test]
+    fn a_lost_daemon_is_reported_on_the_rendered_frame() {
+        let mut app = app();
+        app.set_daemon_reachable(false);
+        for width in [64, 80, 100, 120, 200] {
+            let text = render_to_text(&app, width, 40);
+            assert!(
+                text.contains("Docker daemon unreachable - retrying"),
+                "at {width} columns the frame does not carry the whole note:\n{text}"
+            );
+        }
+    }
+
+    /// The complaint in #19 is that a frozen screen is indistinguishable from
+    /// a quiet one, so a healthy daemon must add nothing at all.
+    ///
+    /// It deliberately never calls `set_daemon_reachable`, so it also pins the
+    /// starting state: the very first frame is drawn before any poll has run,
+    /// and it must not accuse a daemon nobody has spoken to yet.
+    #[test]
+    fn a_daemon_nothing_has_complained_about_adds_nothing_to_the_frame() {
+        let text = render_to_text(&app(), 120, 40);
+        assert!(
+            !text.contains("Docker daemon"),
+            "an unprompted daemon note:\n{text}"
+        );
+    }
+
     #[test]
     fn the_status_bar_shows_key_hints() {
         let text = render_to_text(&app(), 120, 40);

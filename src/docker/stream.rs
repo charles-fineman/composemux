@@ -479,7 +479,7 @@ fn now_seconds() -> i64 {
 
 /// Diagnostics go to a file rather than stderr: the alternate screen is active,
 /// so printing would corrupt the display.
-fn log_debug(message: &str) {
+pub(crate) fn log_debug(message: &str) {
     if std::env::var_os("COMPOSEMUX_DEBUG").is_none() {
         return;
     }
