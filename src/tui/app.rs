@@ -13,7 +13,7 @@ use crate::tui::filter::Filter;
 use crate::tui::focus::{Focus, FocusStack, MAX_PANES};
 use crate::tui::layout_manager::{LayoutManager, ListVisibility, PaneArrangement};
 use crate::tui::scroll_momentum::{ScrollDirection, ScrollMomentum};
-use crate::tui::utils::sort_services;
+use crate::tui::utils::{collapse_replaced_containers, sort_services};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -285,6 +285,7 @@ impl App {
 
     /// Replaces the known service list, preserving selection and pins.
     pub fn set_services(&mut self, mut services: Vec<Service>) {
+        collapse_replaced_containers(&mut services);
         sort_services(&mut services);
 
         // A service with more than one container is shown per replica.
@@ -942,6 +943,7 @@ mod tests {
     use super::*;
     use crate::config::DEFAULT_AUTO_EXIT_SECONDS;
     use crate::model::Health;
+    use chrono::TimeZone;
 
     fn svc(name: &str, status: ServiceStatus) -> Service {
         Service {
@@ -952,6 +954,19 @@ mod tests {
             exit_code: None,
             started_at: None,
             finished_at: None,
+        }
+    }
+
+    /// A service at a given replica index, for the collision fixtures.
+    fn svc_replica(name: &str, replica: u32, status: ServiceStatus) -> Service {
+        Service {
+            replica,
+            started_at: Some(
+                chrono::Utc
+                    .timestamp_millis_opt(1_000 * replica as i64)
+                    .unwrap(),
+            ),
+            ..svc(name, status)
         }
     }
 
@@ -1921,6 +1936,128 @@ mod tests {
         let mut app = App::new("test", &cfg);
         app.set_services(vec![]);
         assert!(app.countdown_remaining().is_none());
+    }
+
+    // ---- recreate window ----
+
+    /// The pair `docker compose up` puts on the daemon while it swaps a
+    /// container: the replacement is created before the original is destroyed,
+    /// so both carry `service=api` and `container-number=1`.
+    fn recreate_pair() -> Vec<Service> {
+        use chrono::TimeZone;
+        let original = Service {
+            started_at: Some(chrono::Utc.timestamp_millis_opt(1_000).unwrap()),
+            ..svc("api", ServiceStatus::Running)
+        };
+        let replacement = svc("api", ServiceStatus::NotStarted);
+        vec![replacement, original]
+    }
+
+    #[test]
+    fn a_container_being_replaced_does_not_double_its_row() {
+        let cfg = Config::default();
+        let mut app = App::new("test", &cfg);
+        app.set_services(recreate_pair());
+        assert_eq!(app.rows().len(), 1, "one container identity, one row");
+        assert_eq!(
+            app.rows()[0].display_name,
+            "api",
+            "an unscaled service must not gain a replica suffix mid-recreate"
+        );
+        assert_eq!(
+            app.rows()[0].service.status,
+            ServiceStatus::Running,
+            "the row keeps showing the container that is actually up"
+        );
+    }
+
+    #[test]
+    fn the_row_that_survives_a_replacement_is_stable_across_refreshes() {
+        let cfg = Config::default();
+        let mut app = App::new("test", &cfg);
+        let mut pair = recreate_pair();
+        app.set_services(pair.clone());
+        let first = app.rows()[0].service.status;
+        // The daemon does not promise a stable order for two containers that
+        // tie on every field the sidebar sorts by, so the same pair can arrive
+        // the other way round on the next poll.
+        pair.reverse();
+        app.set_services(pair);
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.rows()[0].service.status, first);
+    }
+
+    #[test]
+    fn a_genuinely_scaled_service_keeps_every_replica() {
+        // Only replica 1 is live, so the live-member guard does not wave this
+        // through: a key that ignored the replica number would reach the
+        // survivor rule and cost the service two rows.
+        let cfg = Config::default();
+        let mut app = App::new("test", &cfg);
+        app.set_services(vec![
+            svc_replica("web", 1, ServiceStatus::Running),
+            svc_replica("web", 2, ServiceStatus::Success),
+            svc_replica("web", 3, ServiceStatus::Success),
+        ]);
+        let mut names: Vec<&str> = app.rows().iter().map(|r| r.display_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["web-1", "web-2", "web-3"]);
+    }
+
+    #[test]
+    fn two_live_containers_sharing_a_replica_stay_visible_as_two_rows() {
+        // The #51 label-absence collision. Both rows read `web-1`, which is
+        // wrong -- but they are the only sign in the UI that two containers
+        // exist, so collapsing one away would be worse.
+        let cfg = Config::default();
+        let mut app = App::new("test", &cfg);
+        app.set_services(vec![
+            svc_replica("web", 1, ServiceStatus::Running),
+            svc_replica("web", 1, ServiceStatus::Unhealthy),
+        ]);
+        let names: Vec<&str> = app.rows().iter().map(|r| r.display_name.as_str()).collect();
+        assert_eq!(names, vec!["web-1", "web-1"]);
+    }
+
+    #[test]
+    fn a_scaled_service_mid_recreate_keeps_one_row_per_replica() {
+        use chrono::TimeZone;
+        let at = |ms: i64| chrono::Utc.timestamp_millis_opt(ms).unwrap();
+        let started = |replica: u32| Service {
+            replica,
+            started_at: Some(at(1_000)),
+            ..svc("web", ServiceStatus::Running)
+        };
+        let created = |replica: u32| Service {
+            replica,
+            ..svc("web", ServiceStatus::NotStarted)
+        };
+        let cfg = Config::default();
+        let mut app = App::new("test", &cfg);
+        // Observed live on a `--scale web=3` project mid `--force-recreate`:
+        // every replica number carried a running original and a created
+        // replacement at once. Replica 2 is left un-recreated here so the
+        // container count and the replica count differ, which is what the
+        // `-{replica}` suffix decision reads.
+        app.set_services(vec![
+            created(1),
+            started(1),
+            started(2),
+            created(3),
+            started(3),
+        ]);
+        let names: Vec<&str> = app.rows().iter().map(|r| r.display_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["web-1", "web-2", "web-3"],
+            "a replica mid-recreate must not cost the service a row"
+        );
+        assert!(
+            app.rows()
+                .iter()
+                .all(|r| r.service.status == ServiceStatus::Running),
+            "each row must show the replica that is actually up"
+        );
     }
 
     // ---- ingest ----
