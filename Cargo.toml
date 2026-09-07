@@ -46,3 +46,7 @@ strip = true
 
 [dev-dependencies]
 proptest = "1.11.0"
+# Only for `tokio::time::pause`. `src/fallback.rs` rate-limits how often it
+# lists containers, and a test for a rate limit either controls the clock or
+# sleeps through it.
+tokio = { version = "1.53", features = ["test-util"] }
