@@ -99,6 +99,45 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// the UI would stop responding to keys.
 const MAX_DRAIN_PER_FRAME: usize = 512;
 
+/// How long startup will wait for the daemon in silence before saying that it
+/// is waiting.
+///
+/// Not a verdict, which is what makes this a different question from
+/// `POLL_TIMEOUT`. Nothing is given up on and nothing is called lost: the
+/// request stays in flight and the notice says so. Overrunning costs one true
+/// sentence on stderr, where overrunning `POLL_TIMEOUT` three times over puts
+/// a diagnosis on the screen -- so this wants to land while the user is still
+/// looking at the terminal, and does not need the headroom over an honest slow
+/// daemon that a diagnosis does.
+///
+/// Five seconds, measured the same way `POLL_TIMEOUT` was. Startup is
+/// `connect` -- one round trip to negotiate an API version -- and then one
+/// `list_services`, which is one list plus one inspect per container at
+/// `INSPECT_CONCURRENCY` 8. Against the real daemon, median of ten runs, with
+/// a proxy inserting the round trip:
+///
+/// | containers | local | 10ms | 50ms | 200ms |
+/// |---|---|---|---|---|
+/// | 6 | 74ms | 113ms | 263ms | 814ms |
+/// | 150 | 1.17s | 1.63s | 2.66s | 5.90s |
+///
+/// So an ordinary project is under a second even across a link no one would
+/// call fast, and five seconds is five times the worst of those. The one
+/// measured configuration that crosses it is the deliberate corner -- 150
+/// containers across a 200ms round trip, 6.25s worst sample -- where the
+/// notice is still true, is followed by the UI about a second later, and says
+/// it is still trying.
+const STARTUP_NOTICE_AFTER: Duration = Duration::from_secs(5);
+/// How often the startup notice repeats once it has been shown.
+///
+/// A single line goes stale: against a daemon that has gone quiet the user is
+/// then looking at one message and a cursor again, with nothing to say the
+/// process is still alive. bollard puts its own 120s timeout on the request
+/// (`DEFAULT_TIMEOUT`), so the wait ends by itself about two minutes in, and
+/// repeating every thirty seconds fills that with four lines rather than
+/// forty.
+const STARTUP_NOTICE_EVERY: Duration = Duration::from_secs(30);
+
 /// What one round of the service poll has to tell the UI.
 ///
 /// A poll that fails without the daemon having failed often enough to count as
@@ -201,6 +240,13 @@ async fn run() -> Result<i32> {
         }
         Ok::<DockerClient, anyhow::Error>(client)
     };
+    // Nothing has been printed yet and there is no UI to write a note into, so
+    // a startup that stalls looks exactly like a program that has hung. The
+    // notice is the only thing standing between the user and a blank terminal.
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    let announced = announce_a_slow_startup(startup, |waited| {
+        eprintln!("{}", startup_notice(waited, docker_host.as_deref()));
+    });
     let client = tokio::select! {
         // Biased, so a signal that lands as startup is failing still reports
         // the signal. Under the default random poll order the startup branch
@@ -208,7 +254,7 @@ async fn run() -> Result<i32> {
         // startup error instead of the status the supervisor is waiting for.
         biased;
         _ = cancel.cancelled() => return Ok(exit_status(&signal_exit)),
-        result = startup => result?,
+        result = announced => result?,
     };
 
     // A full-screen UI is useless when output is piped, and would write escape
@@ -219,6 +265,63 @@ async fn run() -> Result<i32> {
     }
 
     run_tui(client, project, cfg, cancel, signal_exit).await
+}
+
+/// Awaits `startup`, calling `notice` once it has been waiting long enough to
+/// be worth mentioning, and again on every repeat after that.
+///
+/// Waiting is all that is reported. `startup` is never dropped or restarted,
+/// so a daemon that is merely slow -- one that is itself still coming up,
+/// which a wrapper script racing `compose up` will hit -- still gets to
+/// finish, and its result is the one returned. Giving up instead would break
+/// composemux against a daemon that was about to answer, which is a worse
+/// failure than the silence being fixed.
+///
+/// Separated from `run` and generic over the future so a test can drive it:
+/// `run` itself needs a daemon, a terminal and the process's signal
+/// dispositions, and the case worth pinning is a startup that never answers.
+async fn announce_a_slow_startup<F>(startup: F, mut notice: impl FnMut(Duration)) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(startup);
+    let mut waited = Duration::ZERO;
+    let mut next = STARTUP_NOTICE_AFTER;
+    loop {
+        match tokio::time::timeout(next, &mut startup).await {
+            Ok(finished) => return finished,
+            Err(_) => {
+                waited += next;
+                notice(waited);
+                next = STARTUP_NOTICE_EVERY;
+            }
+        }
+    }
+}
+
+/// What that notice says, given how long startup has been waiting and the
+/// `DOCKER_HOST` it is waiting on, if one is set.
+///
+/// Names the target because a `DOCKER_HOST` left pointing at a context that is
+/// no longer up is the likeliest reason to be reading this at all, and it is
+/// not otherwise visible anywhere. Says it is still trying, because it is:
+/// the sentence has to be true of a daemon that answers a moment later.
+/// Mentions ctrl+c because this is before the TUI, so `q` is not a thing yet,
+/// and the handlers installed above turn the signal into a clean exit.
+///
+/// Takes the host rather than reading the environment itself, so that what it
+/// says can be tested without a process-wide variable the rest of the suite
+/// shares.
+fn startup_notice(waited: Duration, docker_host: Option<&str>) -> String {
+    let target = match docker_host {
+        Some(host) if !host.is_empty() => format!("DOCKER_HOST={host}"),
+        _ => "the default Docker socket".to_string(),
+    };
+    format!(
+        "composemux: still waiting for the Docker daemon on {target}, {}s so far. \
+         Still trying; ctrl+c to stop.",
+        waited.as_secs()
+    )
 }
 
 /// The full-screen path: draws, and owns the event loop until it exits.
@@ -351,11 +454,14 @@ async fn refresh_loop<S: ServiceSource>(
                 docker::log_debug(&format!("service poll failed: {err}"));
                 // A request that already went quiet on us and has now errored
                 // out is the wedged daemon we have been naming all along, not
-                // a newly unreachable one.
+                // a newly unreachable one. That takes precedence over what the
+                // error itself says: bollard ends a held request with a
+                // timeout of its own, and the daemon has been silent for two
+                // minutes by then whatever it finally says.
                 Err(if overran {
                     Outage::NotAnswering
                 } else {
-                    Outage::Unreachable
+                    Outage::classify(&err)
                 })
             }
             Err(_) => {
@@ -463,7 +569,28 @@ where
             return Ok(reason);
         }
 
+        // Biased, so a cancelled app stops here rather than at whichever
+        // iteration the random poll order happens to pick it -- the same
+        // reason the startup select in `run` and the send in `refresh_loop`
+        // are biased. Nothing broke without it, since the token is read again
+        // next time round; what it buys is that "stop" means the next
+        // opportunity, and that a test of the shutdown path can assert that
+        // rather than repeat until it happens.
+        //
+        // Which makes the written order a priority order, so it is chosen
+        // rather than inherited. The rule is that an arm may only sit above
+        // one it cannot starve, and starving needs an arm that is ready at
+        // nearly every poll. Cancellation is ready once and returns. Input
+        // arrives at whatever rate a person produces it. A poll lands every
+        // `REFRESH`, and a tick every `TICK`. Log output has no such ceiling
+        // -- a chatty service can outrun the drain bound below and leave this
+        // arm ready every time -- so it goes last, where being always ready
+        // costs the arms above it nothing. Under the old order it sat above
+        // the poll and the tick, and biasing that would have let a flood
+        // freeze the throbber, the uptimes and the auto-exit countdown.
         tokio::select! {
+            biased;
+
             _ = cancel.cancelled() => return Ok(ExitReason::Interrupt),
 
             maybe_event = events.next() => {
@@ -483,6 +610,22 @@ where
                 }
             }
 
+            polled = svc_rx.recv() => {
+                if let Some(poll) = polled {
+                    // Pins wait for a poll the daemon answered, which is what
+                    // the old code waited for too. An answered poll carrying
+                    // no services still counts: a project really can have
+                    // none, and holding the pins back forever would be worse
+                    // than applying them to an empty list.
+                    if apply_poll(app, poll) && !pinned_applied {
+                        pinned_applied = true;
+                        app.apply_startup_pins();
+                    }
+                }
+            }
+
+            _ = ticker.tick() => app.tick(Instant::now()),
+
             message = log_rx.recv() => {
                 let Some(message) = message else { continue };
                 apply_source_event(app, message, refresh);
@@ -500,22 +643,6 @@ where
                     }
                 }
             }
-
-            polled = svc_rx.recv() => {
-                if let Some(poll) = polled {
-                    // Pins wait for a poll the daemon answered, which is what
-                    // the old code waited for too. An answered poll carrying
-                    // no services still counts: a project really can have
-                    // none, and holding the pins back forever would be worse
-                    // than applying them to an empty list.
-                    if apply_poll(app, poll) && !pinned_applied {
-                        pinned_applied = true;
-                        app.apply_startup_pins();
-                    }
-                }
-            }
-
-            _ = ticker.tick() => app.tick(Instant::now()),
         }
     }
 }
@@ -821,6 +948,161 @@ mod tests {
         assert_eq!(app.daemon_outage(), None, "recovery must clear the mark");
     }
 
+    // ---- startup ---------------------------------------------------------
+    //
+    // #61: `run` awaits `connect` and then `list_services` with nothing but
+    // the cancellation token beside them. Against a daemon that takes the
+    // connection and goes quiet that is a terminal which has printed nothing
+    // and is not obviously doing anything, for the two minutes bollard's own
+    // request timeout takes to end it. These drive the wait itself; `run`
+    // around it needs a daemon, a terminal and the process's signals.
+
+    /// Runs `announce_a_slow_startup` over `startup` for `run_for` of virtual
+    /// time, and reports what it said and whether the startup finished.
+    async fn notices_while_waiting<F>(startup: F, run_for: Duration) -> (Vec<Duration>, bool)
+    where
+        F: std::future::Future,
+    {
+        let mut seen = Vec::new();
+        // Scoped so the future -- and with it the closure's borrow of `seen`
+        // -- is dropped before the notices are read back.
+        let finished = {
+            let announced = announce_a_slow_startup(startup, |waited| seen.push(waited));
+            tokio::time::timeout(run_for, announced).await.is_ok()
+        };
+        (seen, finished)
+    }
+
+    /// The whole of #61: a startup that is going nowhere has to say so.
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_that_never_answers_says_that_it_is_waiting() {
+        let (seen, finished) = notices_while_waiting(
+            std::future::pending::<()>(),
+            STARTUP_NOTICE_AFTER + Duration::from_secs(1),
+        )
+        .await;
+        assert!(!finished, "a pending startup cannot have finished");
+        assert_eq!(
+            seen,
+            vec![STARTUP_NOTICE_AFTER],
+            "startup went quiet instead of saying it was waiting"
+        );
+    }
+
+    /// The other half, and what stops the notice being noise: the ordinary
+    /// startup measured in `STARTUP_NOTICE_AFTER`'s note is well inside the
+    /// bound, and must print nothing at all. The value has to come back
+    /// unchanged too, since everything after this point depends on it.
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_that_answers_before_the_bound_says_nothing() {
+        let quick = async {
+            tokio::time::sleep(STARTUP_NOTICE_AFTER - Duration::from_millis(1)).await;
+            "a client"
+        };
+        let mut seen = Vec::new();
+        let client = {
+            let announced = announce_a_slow_startup(quick, |waited| seen.push(waited));
+            announced.await
+        };
+        assert_eq!(
+            client, "a client",
+            "the startup's own result must come back"
+        );
+        assert!(seen.is_empty(), "a healthy startup said {seen:?}");
+    }
+
+    /// #61 turns down giving up: a daemon that is itself still coming up is a
+    /// normal thing for a wrapper script to race, and cutting it off would
+    /// break composemux against a daemon that was about to answer. So the
+    /// notice is a notice, and the slow startup still wins.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_startup_is_waited_out_rather_than_given_up_on() {
+        let slow = async {
+            tokio::time::sleep(STARTUP_NOTICE_AFTER + STARTUP_NOTICE_EVERY * 2).await;
+            "a client"
+        };
+        let mut seen = Vec::new();
+        let client = {
+            let announced = announce_a_slow_startup(slow, |waited| seen.push(waited));
+            // Bounded so a wrapper that gave up would fail here rather than
+            // hang the suite, and generously, so passing means it waited.
+            tokio::time::timeout(Duration::from_secs(3600), announced)
+                .await
+                .expect("a slow startup must be waited out, not abandoned")
+        };
+        assert_eq!(client, "a client");
+        assert!(
+            !seen.is_empty(),
+            "a startup slow enough to need the notice never got one"
+        );
+    }
+
+    /// One line goes stale. Against a daemon that has gone quiet the user is
+    /// otherwise back to a message and a cursor, with nothing saying the
+    /// process is still alive, and the elapsed time in each repeat is what
+    /// says it.
+    #[tokio::test(start_paused = true)]
+    async fn the_notice_repeats_while_the_wait_goes_on() {
+        let window = STARTUP_NOTICE_AFTER + STARTUP_NOTICE_EVERY * 2 + Duration::from_secs(1);
+        let (seen, _) = notices_while_waiting(std::future::pending::<()>(), window).await;
+        assert_eq!(
+            seen,
+            vec![
+                STARTUP_NOTICE_AFTER,
+                STARTUP_NOTICE_AFTER + STARTUP_NOTICE_EVERY,
+                STARTUP_NOTICE_AFTER + STARTUP_NOTICE_EVERY * 2,
+            ],
+            "each repeat has to carry how long it has really been waiting"
+        );
+    }
+
+    /// A `DOCKER_HOST` pointing at a context that is no longer up is the
+    /// likeliest reason to be reading the notice at all, and it is not
+    /// visible anywhere else.
+    #[test]
+    fn the_notice_names_the_docker_host_it_is_waiting_on() {
+        let text = startup_notice(STARTUP_NOTICE_AFTER, Some("tcp://build-box.internal:2375"));
+        assert!(
+            text.contains("tcp://build-box.internal:2375"),
+            "got {text:?}"
+        );
+        assert!(
+            text.contains("5s"),
+            "the wait so far has to be in it: {text:?}"
+        );
+        // Not "gave up", not "failed": the request is still out there, and the
+        // sentence has to stay true of a daemon that answers a moment later.
+        assert!(text.contains("Still trying"), "got {text:?}");
+    }
+
+    /// The usual case, where nothing is set and bollard falls back to the
+    /// platform socket. An empty value is the same case: bollard ignores it.
+    #[test]
+    fn the_notice_says_which_socket_when_no_host_is_set() {
+        for host in [None, Some("")] {
+            let text = startup_notice(STARTUP_NOTICE_AFTER, host);
+            assert!(
+                text.contains("the default Docker socket"),
+                "{host:?} gave {text:?}"
+            );
+            assert!(
+                !text.contains("DOCKER_HOST"),
+                "there is no DOCKER_HOST to name: {text:?}"
+            );
+        }
+    }
+
+    /// The other tests scale off the constants, so they hold for whatever
+    /// these are set to. This one is longhand, because five seconds is a
+    /// promise about how long the terminal may stay blank, and thirty about
+    /// how long it may then stay silent -- see their notes for the
+    /// measurements behind both.
+    #[test]
+    fn startup_waits_five_seconds_before_saying_anything() {
+        assert_eq!(STARTUP_NOTICE_AFTER, Duration::from_secs(5));
+        assert_eq!(STARTUP_NOTICE_EVERY, Duration::from_secs(30));
+    }
+
     // ---- the two loops ---------------------------------------------------
     //
     // #53: everything above tests a fold in isolation, and nothing tested the
@@ -850,6 +1132,9 @@ mod tests {
         Answers(Vec<Service>),
         /// Fails at once, the way a refused or cut socket does.
         Fails,
+        /// Answers at once with an error of the daemon's own, the way a
+        /// daemon that is running but will not serve the request does.
+        Rejects,
         /// Accepts the request and never answers it.
         Hangs,
         /// Answers, but only after this long.
@@ -886,6 +1171,16 @@ mod tests {
                 match behaviour {
                     Behaviour::Answers(services) => Ok(services),
                     Behaviour::Fails => Err(anyhow::anyhow!("no such file or directory")),
+                    // Wrapped in context the way `list_services` wraps its
+                    // own, so what the loop classifies is shaped like what it
+                    // will really be handed.
+                    Behaviour::Rejects => Err(anyhow::Error::from(
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: 500,
+                            message: "server error".to_string(),
+                        },
+                    )
+                    .context("could not list containers")),
                     Behaviour::Hangs => std::future::pending().await,
                     Behaviour::Slow(delay, services) => {
                         tokio::time::sleep(delay).await;
@@ -950,6 +1245,19 @@ mod tests {
         assert!(
             matches!(poll, Poll::Lost(Outage::Unreachable)),
             "a failing poll must reach the UI as an outage, got {poll:?}"
+        );
+    }
+
+    /// #64: the same wiring, for a daemon that is running and said no. The
+    /// classification is unit-tested next to `Outage` itself; what this pins
+    /// is that the loop asks it at all rather than filling in `Unreachable`
+    /// the way it used to.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresher_whose_polls_are_rejected_says_so_rather_than_unreachable() {
+        let poll = first_poll(FakeDaemon::new(Behaviour::Rejects), Config::default()).await;
+        assert!(
+            matches!(poll, Poll::Lost(Outage::Rejected)),
+            "a daemon that answered with an error must not be called unreachable, got {poll:?}"
         );
     }
 
@@ -1568,6 +1876,115 @@ mod tests {
         assert!(
             matches!(exit, Some(Ok(ExitReason::Interrupt))),
             "a cancelled run is an interrupt, not a quit: {exit:?}"
+        );
+    }
+
+    /// #66: with the select unbiased, a set token competed on equal terms with
+    /// whatever else was ready, so a cancelled app went on handling input and
+    /// drawing for however many more iterations the random order took to pick
+    /// the cancel arm. Nothing broke -- the token is read again next time
+    /// round -- but "stop" meant "stop soon", and no test of the shutdown path
+    /// could assert anything better than that.
+    ///
+    /// Both arms are ready at the first poll here: the token is already set
+    /// and a key is already queued. Correct code takes the key nowhere.
+    /// Unbiased, tokio starts at a random one of the five branches, so the
+    /// key is taken about a quarter of the time -- which is what the rounds
+    /// are for. Fifty of them leave roughly one chance in a million of
+    /// missing it, and each costs one cancelled loop and one frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_loop_takes_no_further_input() {
+        for round in 0..50 {
+            let mut app = app_with_service("api");
+            let (tx, mut rx) = futures::channel::mpsc::unbounded::<std::io::Result<Event>>();
+            tx.unbounded_send(Ok(key(crossterm::event::KeyCode::Char('m'))))
+                .expect("the receiver is alive");
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let (exit, _) =
+                drive_event_loop_over(&mut app, Vec::new(), Vec::new(), &mut rx, &cancel).await;
+            assert!(
+                matches!(exit, Some(Ok(ExitReason::Interrupt))),
+                "round {round}: a cancelled run is an interrupt: {exit:?}"
+            );
+            // Still queued, which is the assertion: the loop stopped without
+            // reading it. `try_recv` gives `Err(Empty)` on a live sender with
+            // nothing in it, so a loop that took the key cannot pass here.
+            assert!(
+                rx.try_recv().is_ok(),
+                "round {round}: a cancelled loop handled another key first"
+            );
+            drop(tx);
+        }
+    }
+
+    /// The order the `biased` above turns into a priority order, and the
+    /// reason the log arm is last. This one does not fail against the code
+    /// before #66 -- unbiased, every arm gets a turn -- it fails against the
+    /// obvious way to do #66, which is to write `biased` and leave the arms
+    /// where they were, with `log_rx` above the poll and the tick.
+    ///
+    /// Real time rather than paused, because the point is an arm that is
+    /// ready at every poll: under a paused clock the flooding task is never
+    /// idle, so the clock would never move and the ticker would never come
+    /// due whatever the order. Half a second is five ticks' worth, and the
+    /// assertion only needs one.
+    #[tokio::test]
+    async fn a_flood_of_logs_does_not_starve_the_rest_of_the_loop() {
+        let mut app = app_with_service("api");
+        let backend = ratatui::backend::TestBackend::new(TEST_FRAME.0, TEST_FRAME.1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+        let (_svc_tx, mut svc_rx) = mpsc::channel::<Poll>(4);
+        let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(16);
+        let refresh = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let mut input = futures::stream::pending::<std::io::Result<Event>>();
+
+        // A service that never stops talking: every time the loop drains the
+        // channel this refills it, so the log arm is ready again by the time
+        // the next select runs.
+        let flooding = cancel.clone();
+        tokio::spawn(async move {
+            while !flooding.is_cancelled() {
+                let event = SourceEvent::Output {
+                    service: "api".into(),
+                    replica: 1,
+                    container: "api-1".into(),
+                    bytes: b"chatter\r\n".to_vec(),
+                };
+                if log_tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let stopping = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            stopping.cancel();
+        });
+
+        let before = app.throbber();
+        let exit = event_loop(
+            &mut terminal,
+            &mut input,
+            &mut app,
+            &mut log_rx,
+            &mut svc_rx,
+            &refresh,
+            &cancel,
+        )
+        .await;
+        assert!(
+            matches!(exit, Ok(ExitReason::Interrupt)),
+            "the flood must not have kept the loop from stopping: {exit:?}"
+        );
+        // The tick is what advances the throbber and the uptimes and paces the
+        // auto-exit countdown, so a starved ticker is a frozen bar for as long
+        // as the service keeps talking.
+        assert!(
+            app.throbber() > before,
+            "the ticker never got a turn across half a second of logs"
         );
     }
 

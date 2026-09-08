@@ -194,12 +194,29 @@ the finest resolution the Engine API offers here. A couple of already-visible
 lines can reappear as a result. That's the deliberate trade: a duplicated line
 beats a missing one.
 
-If the daemon goes away entirely, composemux keeps retrying rather than
-exiting, and the status bar says `Docker daemon unreachable - retrying` so a
-frozen screen can't be mistaken for a quiet stack. Statuses and logs stay at
-their last known values until it answers again, at which point the note clears
-on its own. It takes a short run of failed polls to appear, so a single dropped
-request never flashes it.
+If the daemon stops answering, composemux keeps retrying rather than exiting,
+and the status bar says so, so a frozen screen can't be mistaken for a quiet
+stack. Which note you get depends on how it's failing, because the three send
+you to different places:
+
+- `Docker daemon unreachable - retrying` — nothing was reached. Start Docker.
+- `Docker daemon not answering - retrying` — the request was taken and never
+  came back. Docker is running; it's wedged, and restarting composemux won't
+  help.
+- `Docker daemon rejected the request - retrying` — Docker answered, with an
+  error. It's running and reachable, and the usual cause is that your user
+  can't open the socket. Run with `COMPOSEMUX_DEBUG=1` and the actual error is
+  written to `composemux.log` in your temp directory.
+
+Statuses and logs stay at their last known values until it answers again, at
+which point the note clears on its own. It takes a short run of failed polls to
+appear, so a single dropped request never flashes it.
+
+Startup has no status bar to write into, so a daemon that takes the connection
+and goes quiet used to leave you with a blank terminal. After five seconds it
+says on stderr that it's still waiting, and which `DOCKER_HOST` it's waiting
+on, repeating every thirty seconds. It keeps waiting either way: a daemon
+that's still coming up is a normal thing for a wrapper script to race.
 
 Everything then goes through a `vt100` terminal emulator before it reaches the
 screen, which is why colour, cursor movement and progress bars behave rather
