@@ -453,7 +453,7 @@ async fn refresh_loop<S: ServiceSource>(
                 // Why is what the supervisor already writes here for its own
                 // failures, and this is the only place to look when the note
                 // will not clear.
-                docker::log_debug(&format!("service poll failed: {err}"));
+                docker::log_debug(&poll_failure_log(&err));
                 // A request that already went quiet on us and has now errored
                 // out is the wedged daemon we have been naming all along, not
                 // a newly unreachable one. That takes precedence over what the
@@ -656,6 +656,19 @@ where
 
         }
     }
+}
+
+/// What the debug log records when a poll fails.
+///
+/// `{err:#}` rather than `{err}`, which is what this was: anyhow's plain
+/// `Display` prints only the outermost context, and here that is
+/// `list_services`'s own "could not list containers" -- true, and useless. The
+/// alternate form prints the chain, which is where the status code or the
+/// permission error actually is. That matters more now than it did: the note
+/// for [`Outage::Rejected`] has room to say the request was refused and no
+/// room to say why, so this line is where the user is sent for the why.
+fn poll_failure_log(err: &anyhow::Error) -> String {
+    format!("service poll failed: {err:#}")
 }
 
 /// Folds one poll result into the connection health, returning what the UI
@@ -1077,9 +1090,12 @@ mod tests {
             text.contains("tcp://build-box.internal:2375"),
             "got {text:?}"
         );
+        // The whole token, not "5s": a notice that had drifted to "15s" would
+        // contain that too, and the elapsed figure is the only part of this
+        // string nothing else checks.
         assert!(
-            text.contains("5s"),
-            "the wait so far has to be in it: {text:?}"
+            text.contains(&format!("{}s so far", STARTUP_NOTICE_AFTER.as_secs())),
+            "the wait so far has to be in it, and be right: {text:?}"
         );
         // Not "gave up", not "failed": the request is still out there, and the
         // sentence has to stay true of a daemon that answers a moment later.
@@ -1160,6 +1176,9 @@ mod tests {
         /// Goes quiet, then fails after this long -- what bollard's own 120s
         /// request timeout does to a request against a wedged daemon.
         QuietThenFails(Duration),
+        /// Goes quiet, then answers with an error of the daemon's own. The
+        /// case where `overran` and the classification disagree.
+        QuietThenRejects(Duration),
         /// The same, but only for the first request: every one after it fails
         /// at once, the way a daemon that has since been stopped outright
         /// does. Pins that going quiet is remembered per request.
@@ -1207,6 +1226,16 @@ mod tests {
                     Behaviour::QuietThenFails(delay) => {
                         tokio::time::sleep(delay).await;
                         Err(anyhow::anyhow!("Timeout error"))
+                    }
+                    Behaviour::QuietThenRejects(delay) => {
+                        tokio::time::sleep(delay).await;
+                        Err(anyhow::Error::from(
+                            bollard::errors::Error::DockerResponseServerError {
+                                status_code: 500,
+                                message: "server error".to_string(),
+                            },
+                        )
+                        .context("could not list containers"))
                     }
                     Behaviour::QuietOnceThenFailsAtOnce(delay) => {
                         if request == 0 {
@@ -1263,6 +1292,32 @@ mod tests {
         assert!(
             matches!(poll, Poll::Lost(Outage::Unreachable)),
             "a failing poll must reach the UI as an outage, got {poll:?}"
+        );
+    }
+
+    /// The debug log is where the note for a rejected request sends the user,
+    /// so it has to carry the error the daemon actually gave. Plain `{err}`
+    /// on an `anyhow::Error` prints only the outermost context, which
+    /// `list_services` supplies and which says nothing about the failure.
+    #[test]
+    fn the_debug_log_records_the_error_under_the_context_not_just_the_context() {
+        let err = Err::<(), _>(bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "server error".to_string(),
+        })
+        .context("could not list containers")
+        .unwrap_err();
+        let line = poll_failure_log(&err);
+        // The premise, asserted rather than assumed: the outer context really
+        // is there and really does hide the rest, so a line carrying only it
+        // would look plausible.
+        assert!(
+            line.contains("could not list containers"),
+            "the context belongs in it too: {line:?}"
+        );
+        assert!(
+            line.contains("status code 500"),
+            "the daemon's own error never reached the log: {line:?}"
         );
     }
 
@@ -1356,6 +1411,58 @@ mod tests {
             seen.iter()
                 .all(|p| matches!(p, Poll::Lost(Outage::NotAnswering))),
             "a daemon that only ever went quiet was called something else: {seen:?}"
+        );
+    }
+
+    /// The precedence `overran` takes over the classification, in the case
+    /// where the two actually disagree.
+    ///
+    /// `a_wedged_daemon_is_never_reported_as_unreachable` covers the
+    /// mechanism, but its error classifies as `Unreachable` anyway, so it
+    /// would pass on a loop that had dropped the precedence and simply
+    /// classified. Here the error is a 500, so classifying would say
+    /// `Rejected` and only the precedence gives `NotAnswering`.
+    ///
+    /// Constructible rather than likely -- what really ends a held request is
+    /// bollard's own timeout, which is neither of the two kinds `classify`
+    /// picks out -- but the precedence is a claim the code makes, so something
+    /// should hold it to it.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_goes_quiet_and_then_says_no_is_still_not_answering() {
+        // Past the bound three times over, so the wedge is reported before the
+        // error lands and `overran` is set when it does.
+        let quiet = POLL_TIMEOUT * 3 + Duration::from_secs(1);
+        let daemon = FakeDaemon::new(Behaviour::QuietThenRejects(quiet));
+        let (tx, mut rx) = mpsc::channel::<Poll>(64);
+        let cancel = CancellationToken::new();
+        spawn_refresher(
+            daemon,
+            "demo".to_string(),
+            Config::default(),
+            tx,
+            Arc::new(Notify::new()),
+            cancel.clone(),
+        );
+        let mut seen = Vec::new();
+        let watch = async {
+            while seen.len() < 8 {
+                match rx.recv().await {
+                    Some(poll) => seen.push(poll),
+                    None => break,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(POLL_TIMEOUT * 12, watch).await;
+        cancel.cancel();
+        assert!(
+            !seen.is_empty(),
+            "the refresher must report the wedge at all"
+        );
+        assert!(
+            seen.iter()
+                .all(|p| matches!(p, Poll::Lost(Outage::NotAnswering))),
+            "a daemon that went quiet first was reclassified by its late \
+             error: {seen:?}"
         );
     }
 
