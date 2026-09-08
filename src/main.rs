@@ -585,14 +585,19 @@ where
         // saying why this one is safe. The arm to worry about is `log_rx`: it
         // sits above the poll and the tick, and a chatty service can make it
         // ready far more often than either. What stops it starving them is the
-        // drain below, which empties the channel every time this arm wins, so
-        // the next poll finds it pending and reaches the arms under it. The
-        // two below are level-triggered and stay ready until they are taken,
-        // so a turn deferred is not a turn lost. Measured against a service
-        // flooding the channel for a second, the loop still ticked 7-10 times
-        // out of a possible 10; with the drain removed so the channel is never
-        // emptied, it ticked 0, which is what
-        // `a_flood_of_logs_does_not_stop_the_clock` pins.
+        // drain below, which takes everything queued up to
+        // `MAX_DRAIN_PER_FRAME` -- so unless more than that is waiting, the
+        // next poll finds this arm pending and reaches the arms under it. Both
+        // of those stay ready until they are taken, so neither is starved.
+        //
+        // Deferred is not free for the ticker, though: it is
+        // `MissedTickBehavior::Skip`, so a tick it was late for is dropped
+        // rather than delivered behind. Measured against a service flooding
+        // the channel for a second, the loop ticked 7-10 times out of a
+        // possible 10, against 10 with this arm moved below the two -- the
+        // difference #74 is about. With the drain removed so the channel is
+        // never emptied it ticked 0, which is the starvation this reasoning
+        // rules out and what `a_flood_of_logs_does_not_stop_the_clock` pins.
         tokio::select! {
             biased;
 
