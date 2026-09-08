@@ -2066,15 +2066,14 @@ mod tests {
     /// Trimming before the tail arrives is not enough to exercise it, though,
     /// and an earlier version of this test made that mistake. A trim here is
     /// triggered by the line budget, so a write carrying no newline never
-    /// causes one at these sizes -- `MAX_RAW_BYTES` is the other trigger and is
-    /// eight megabytes away. Send the lines and the tail separately and every
-    /// trim has
-    /// already happened by the time a partial is being held, which is the one
-    /// arrangement where nothing can go wrong. The tail has to arrive in the
-    /// same write that overruns the budget, so the cut runs with the partial
-    /// already appended to `raw`. That is not a contrivance: a docker frame
-    /// routinely carries several complete lines and then stops part way along
-    /// the next one.
+    /// causes one at these sizes -- `MAX_RAW_BYTES` is the other trigger and
+    /// is eight megabytes away. Send the lines and the tail separately and
+    /// every trim has already happened by the time a partial is being held,
+    /// which is the one arrangement where nothing can go wrong. The tail has
+    /// to arrive in the same write that overruns the budget, so the cut runs
+    /// with the partial already appended to `raw`. That is not a contrivance:
+    /// a docker frame routinely carries several complete lines and then stops
+    /// part way along the next one.
     ///
     /// What this then catches is a trim that drops the held partial on its way
     /// past: the predicate reads a byte that is not the last one written and
