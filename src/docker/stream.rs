@@ -87,6 +87,20 @@ pub enum SourceEvent {
         /// tell whose they are; the ID travels with the output rather than
         /// alongside it, so it cannot be raced by a separate notification.
         container: String,
+        /// Which attach to that container the bytes were read from.
+        ///
+        /// The ID alone does not answer that. A container's log task can end
+        /// while the container keeps running, and the next resync reattaches
+        /// the same container from `since = ended_at` -- a new attach, no
+        /// change of identity. `since` has one-second resolution, so the
+        /// replay can restart an entry the consumer is holding an
+        /// unterminated piece of, and a consumer that sees nothing change
+        /// appends the replay to that piece: `GET /oneGET /one 200`, which is
+        /// neither the line nor a duplicate of it. Stamped per attach so a
+        /// consumer can end what it held, which is what keeps the cost of a
+        /// reattach to the whole-line duplicate [`log_window`] accepts. The
+        /// fallback compares it; the TUI ignores it until #68.
+        attach: u64,
         /// One piece of a log frame, no larger than [`MAX_CHUNK_BYTES`].
         bytes: Vec<u8>,
     },
@@ -136,6 +150,13 @@ pub struct LogWindow<'a> {
 /// task had already delivered, showing it twice. That is deliberate: the only
 /// alternative is to resume a second later and risk dropping output, and a
 /// duplicated line is far cheaper than a missing one.
+///
+/// What the same resolution does to a line the consumer was still holding is
+/// worse than a duplicate: the replay runs on from the middle of that line.
+/// `SourceEvent::Output` carries the attach it was read from so a consumer can
+/// end the held line when the reattach's first bytes arrive, which leaves it
+/// with only the duplicate above. The fallback does; the TUI holds its partial
+/// line as a row in an emulator and does not yet -- #68.
 pub fn log_window(since: Option<i64>, tail: &str) -> LogWindow<'_> {
     match since {
         // The Engine API models this field as a 32-bit count of seconds, so
@@ -146,6 +167,25 @@ pub fn log_window(since: Option<i64>, tail: &str) -> LogWindow<'_> {
             tail: "all",
         },
         None => LogWindow { since: None, tail },
+    }
+}
+
+/// Hands out an id per attach, so a consumer can tell one attach to a
+/// container from the next attach to the same container.
+///
+/// Counted across the supervisor rather than per container: the requirement is
+/// only that two attaches never share an id, and one counter cannot fall out
+/// of step with itself. It starts at one, so zero stays available to a
+/// consumer as "no attach seen yet".
+#[derive(Debug, Default)]
+struct AttachIds(u64);
+
+impl AttachIds {
+    /// The id for the next attach. Not named `next`, which would read as
+    /// `Iterator`'s.
+    fn next_id(&mut self) -> u64 {
+        self.0 += 1;
+        self.0
     }
 }
 
@@ -209,6 +249,8 @@ pub struct LogSupervisor {
     tail: usize,
     tx: mpsc::Sender<SourceEvent>,
     attached: HashMap<String, Attachment>,
+    /// Ids stamped onto the output of the attaches this supervisor starts.
+    attaches: AttachIds,
     /// Container IDs whose streaming task has exited, with the time it ended.
     done_tx: mpsc::UnboundedSender<(String, i64)>,
     done_rx: mpsc::UnboundedReceiver<(String, i64)>,
@@ -228,6 +270,7 @@ impl LogSupervisor {
             tail,
             tx,
             attached: HashMap::new(),
+            attaches: AttachIds::default(),
             done_tx,
             done_rx,
         }
@@ -315,8 +358,17 @@ impl LogSupervisor {
         Ok(())
     }
 
-    fn attach(&mut self, desc: ContainerDesc, since: Option<i64>) {
+    /// Starts streaming `desc`, returning the id its output is stamped with.
+    ///
+    /// The id is returned because nothing else can see it: everything else
+    /// this does is inside a spawned task that needs a daemon. `resync` has no
+    /// use for it.
+    fn attach(&mut self, desc: ContainerDesc, since: Option<i64>) -> u64 {
         let cancel = CancellationToken::new();
+        // A fresh id even when the container is one we have streamed before:
+        // a reattach replays at `since`'s one-second resolution, so its first
+        // bytes must not be read as a continuation of the last attach's.
+        let attach = self.attaches.next_id();
         self.attached.insert(
             desc.id.clone(),
             Attachment {
@@ -333,12 +385,13 @@ impl LogSupervisor {
         // than replaying the tail and duplicating output.
         let tail = self.tail.to_string();
         tokio::spawn(async move {
-            let result = stream_container(&docker, &desc, &tail, since, &tx, &cancel).await;
+            let result = stream_container(&docker, &desc, &tail, since, attach, &tx, &cancel).await;
             if let Err(err) = result {
                 log_debug(&format!("log stream for {} ended: {err}", desc.service));
             }
             let _ = done.send((desc.id, now_seconds()));
         });
+        attach
     }
 
     /// Subscribes to container events for this project. Returns `Ok` only on
@@ -420,6 +473,7 @@ async fn stream_container(
     desc: &ContainerDesc,
     tail: &str,
     since: Option<i64>,
+    attach: u64,
     tx: &mpsc::Sender<SourceEvent>,
     cancel: &CancellationToken,
 ) -> Result<()> {
@@ -441,7 +495,7 @@ async fn stream_container(
                 let Some(chunk) = next else { return Ok(()) };
                 // stdout and stderr both land in the same emulator, exactly as
                 // they would in a terminal attached to the container.
-                if !forward_frame(tx, desc, &chunk?.into_bytes(), cancel).await {
+                if !forward_frame(tx, desc, attach, &chunk?.into_bytes(), cancel).await {
                     // Receiver gone, or this container was cancelled part way
                     // through a frame.
                     return Ok(());
@@ -473,6 +527,7 @@ async fn stream_container(
 async fn forward_frame(
     tx: &mpsc::Sender<SourceEvent>,
     desc: &ContainerDesc,
+    attach: u64,
     frame: &[u8],
     cancel: &CancellationToken,
 ) -> bool {
@@ -483,6 +538,7 @@ async fn forward_frame(
             // One ID clone per piece, next to a service-name clone that was
             // already here, against a piece of up to `MAX_CHUNK_BYTES`.
             container: desc.id.clone(),
+            attach,
             bytes: piece.to_vec(),
         };
         tokio::select! {
@@ -528,6 +584,23 @@ pub(crate) fn log_debug(message: &str) {
 mod tests {
     use super::*;
 
+    /// The attach the forwarding tests stream under. Any id will do; a
+    /// distinctive one makes a stamp that was defaulted rather than carried
+    /// visible.
+    const ATTACH: u64 = 7;
+
+    /// One event, to fill a capacity-one channel so that the next send has
+    /// nowhere to go.
+    fn filler() -> SourceEvent {
+        SourceEvent::Output {
+            service: "filler".to_string(),
+            replica: 1,
+            container: "filler-id".to_string(),
+            attach: 1,
+            bytes: vec![b'x'],
+        }
+    }
+
     fn desc(id: &str, running: bool) -> ContainerDesc {
         ContainerDesc {
             id: id.to_string(),
@@ -548,21 +621,14 @@ mod tests {
     async fn a_cancelled_container_stops_forwarding_into_a_full_channel() {
         // Capacity one, and already full, so the very first send blocks.
         let (tx, _rx) = mpsc::channel::<SourceEvent>(1);
-        tx.send(SourceEvent::Output {
-            service: "filler".to_string(),
-            replica: 1,
-            container: "filler-id".to_string(),
-            bytes: vec![b'x'],
-        })
-        .await
-        .unwrap();
+        tx.send(filler()).await.unwrap();
 
         let cancel = CancellationToken::new();
         let container = desc("a", true);
         // Two pieces, so it cannot finish without a send completing.
         let frame = vec![b'x'; MAX_CHUNK_BYTES + 1];
 
-        let forwarding = forward_frame(&tx, &container, &frame, &cancel);
+        let forwarding = forward_frame(&tx, &container, ATTACH, &frame, &cancel);
         tokio::pin!(forwarding);
 
         // It is genuinely stuck: nothing drains the channel.
@@ -581,6 +647,58 @@ mod tests {
         );
     }
 
+    /// The allocation itself, at the one place that does it. A reattach that
+    /// was handed the id it is replacing is invisible to every consumer, which
+    /// is #57 restored in full, and no test downstream of here can see that:
+    /// they are all given their ids rather than allocating them.
+    ///
+    /// No daemon is contacted. The handle points at a closed loopback port
+    /// rather than at the local socket, so the task `attach` spawns fails its
+    /// first request instead of reaching a daemon that may or may not be
+    /// running; what is asserted happens before the spawn either way.
+    #[tokio::test]
+    async fn the_supervisor_gives_every_attach_a_fresh_id() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        let mut supervisor = LogSupervisor {
+            docker: Docker::connect_with_http("127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .expect("building a handle makes no request"),
+            project: "p".to_string(),
+            tail: 10,
+            tx,
+            attached: HashMap::new(),
+            attaches: AttachIds::default(),
+            done_tx,
+            done_rx,
+        };
+
+        // The same container twice: a fresh attach, then the reattach a
+        // resync makes when the first one's task has ended.
+        let first = supervisor.attach(desc("a", true), None);
+        let second = supervisor.attach(desc("a", true), Some(1));
+
+        assert_ne!(
+            first, second,
+            "a reattach was stamped with the id of the attach it replaces"
+        );
+    }
+
+    /// Ids are what tell one attach from the next, so they must not repeat --
+    /// a reattach handed the previous id is invisible to a consumer, which is
+    /// the whole of #57. Zero is never handed out, so a consumer that starts
+    /// at its default cannot read the first attach as one it has seen.
+    #[test]
+    fn attach_ids_are_distinct_and_never_zero() {
+        let mut ids = AttachIds::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let id = ids.next_id();
+            assert_ne!(id, 0, "zero is the consumers' 'no attach seen yet'");
+            assert!(!seen.contains(&id), "attach id {id} was handed out twice");
+            seen.push(id);
+        }
+    }
+
     fn attached(entries: &[(&str, bool)]) -> HashMap<String, Attach> {
         entries
             .iter()
@@ -596,8 +714,8 @@ mod tests {
     }
 
     /// Drains everything queued, checking each event still carries the identity
-    /// of the container it came from.
-    fn drain(rx: &mut mpsc::Receiver<SourceEvent>) -> Vec<Vec<u8>> {
+    /// of the container and the attach it came from.
+    fn drain(rx: &mut mpsc::Receiver<SourceEvent>, attach: u64) -> Vec<Vec<u8>> {
         let mut pieces = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event {
@@ -605,6 +723,7 @@ mod tests {
                     service,
                     replica,
                     container,
+                    attach: from,
                     bytes,
                 } => {
                     assert_eq!(service, "svc-a", "a piece lost its service");
@@ -614,6 +733,11 @@ mod tests {
                     // recreate changes, which is the whole reason the
                     // fallback is given it.
                     assert_eq!(container, "a", "a piece lost its container ID");
+                    // The container ID cannot separate two attaches to one
+                    // container; this is what the consumer ends a held line
+                    // on, so losing it downgrades #57's mangled line to
+                    // nothing being noticed at all.
+                    assert_eq!(from, attach, "a piece lost its attach id");
                     pieces.push(bytes);
                 }
                 other => panic!("expected output, got {other:?}"),
@@ -633,9 +757,18 @@ mod tests {
         let size = 4 * MAX_CHUNK_BYTES + 7;
         let frame: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
 
-        assert!(forward_frame(&tx, &desc("a", true), &frame, &CancellationToken::new()).await);
+        assert!(
+            forward_frame(
+                &tx,
+                &desc("a", true),
+                ATTACH,
+                &frame,
+                &CancellationToken::new()
+            )
+            .await
+        );
 
-        let pieces = drain(&mut rx);
+        let pieces = drain(&mut rx, ATTACH);
         for piece in &pieces {
             assert!(
                 piece.len() <= MAX_CHUNK_BYTES,
@@ -655,9 +788,18 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let frame = vec![b'x'; MAX_CHUNK_BYTES];
 
-        assert!(forward_frame(&tx, &desc("a", true), &frame, &CancellationToken::new()).await);
+        assert!(
+            forward_frame(
+                &tx,
+                &desc("a", true),
+                ATTACH,
+                &frame,
+                &CancellationToken::new()
+            )
+            .await
+        );
 
-        let pieces = drain(&mut rx);
+        let pieces = drain(&mut rx, ATTACH);
         assert_eq!(pieces.len(), 1, "a frame at the bound should not be split");
         assert_eq!(pieces[0].len(), MAX_CHUNK_BYTES);
     }
@@ -668,9 +810,18 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let frame = vec![b'x'; MAX_CHUNK_BYTES + 1];
 
-        assert!(forward_frame(&tx, &desc("a", true), &frame, &CancellationToken::new()).await);
+        assert!(
+            forward_frame(
+                &tx,
+                &desc("a", true),
+                ATTACH,
+                &frame,
+                &CancellationToken::new()
+            )
+            .await
+        );
 
-        let pieces = drain(&mut rx);
+        let pieces = drain(&mut rx, ATTACH);
         assert_eq!(pieces.len(), 2);
         assert_eq!(pieces[0].len(), MAX_CHUNK_BYTES);
         assert_eq!(pieces[1].len(), 1);
@@ -683,9 +834,21 @@ mod tests {
     async fn an_empty_frame_is_not_forwarded() {
         let (tx, mut rx) = mpsc::channel(8);
 
-        assert!(forward_frame(&tx, &desc("a", true), b"", &CancellationToken::new()).await);
+        assert!(
+            forward_frame(
+                &tx,
+                &desc("a", true),
+                ATTACH,
+                b"",
+                &CancellationToken::new()
+            )
+            .await
+        );
 
-        assert!(drain(&mut rx).is_empty(), "an empty frame was forwarded");
+        assert!(
+            drain(&mut rx, ATTACH).is_empty(),
+            "an empty frame was forwarded"
+        );
     }
 
     /// A departed receiver has to be reported, so the reading loop stops
@@ -700,11 +863,55 @@ mod tests {
             !forward_frame(
                 &tx,
                 &desc("a", true),
+                ATTACH,
                 b"anything",
                 &CancellationToken::new()
             )
             .await,
             "the caller must be told to stop reading"
+        );
+    }
+
+    /// Every piece carries the attach it was read from. Two attaches to one
+    /// container are the pair the container ID cannot separate, and the stamp
+    /// has to travel with the bytes rather than alongside them, for the reason
+    /// the container ID does: a notification sent separately races the output
+    /// it describes. What allocates the two ids is
+    /// [`the_supervisor_gives_every_attach_a_fresh_id`]; this is the wire.
+    ///
+    /// Both frames here fit in one piece. That a *split* frame stamps every
+    /// piece is `drain`'s business, which the three chunking tests run.
+    #[tokio::test]
+    async fn forward_frame_stamps_the_attach_it_was_given() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let container = desc("a", true);
+        let mut ids = AttachIds::default();
+        let cancel = CancellationToken::new();
+
+        // The dying attach delivers a line it never terminates, and the
+        // reattach replays that entry from the start -- `since` resolves to
+        // the second, so it can only resume at or before where the line began.
+        let first = ids.next_id();
+        assert!(forward_frame(&tx, &container, first, b"GET /one", &cancel).await);
+        let second = ids.next_id();
+        assert!(forward_frame(&tx, &container, second, b"GET /one 200\n", &cancel).await);
+
+        let mut stamps = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                SourceEvent::Output {
+                    container, attach, ..
+                } => {
+                    assert_eq!(container, "a", "both attaches are to one container");
+                    stamps.push(attach);
+                }
+                other => panic!("expected output, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            stamps,
+            vec![first, second],
+            "the reattach's replay is indistinguishable from the line it splices onto"
         );
     }
 
