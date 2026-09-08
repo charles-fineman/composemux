@@ -329,7 +329,7 @@ mod tests {
         // rect slot 0 drew an empty placeholder pane that never filled.
         let mut app = app();
         press(&mut app, KeyCode::Char('2'));
-        app.ingest(
+        app.ingest_steady(
             crate::tui::app::ServiceKey::new("api", 1),
             b"output from api\n",
         );
@@ -357,7 +357,7 @@ mod tests {
         app.resize_panes(&sizes);
 
         let key = crate::tui::app::ServiceKey::new("api", 1);
-        app.ingest(key.clone(), b"x\n");
+        app.ingest_steady(key.clone(), b"x\n");
         let (rows, cols) = app
             .store(&key)
             .expect("the pinned service should have a buffer")
@@ -389,7 +389,7 @@ mod tests {
             service("db", ServiceStatus::Success),
         ]);
         press(&mut app, KeyCode::Char('1'));
-        app.ingest(crate::tui::app::ServiceKey::new("api", 1), b"still here\n");
+        app.ingest_steady(crate::tui::app::ServiceKey::new("api", 1), b"still here\n");
         press(&mut app, KeyCode::Char('/'));
         for c in "zzz".chars() {
             press(&mut app, KeyCode::Char(c));
@@ -476,7 +476,7 @@ mod tests {
     fn log_output_is_visible_in_a_pane() {
         let mut app = app();
         press(&mut app, KeyCode::Char('1'));
-        app.ingest(
+        app.ingest_steady(
             crate::tui::app::ServiceKey::new("api", 1),
             b"hello from the container\r\n",
         );
@@ -495,7 +495,7 @@ mod tests {
         press(&mut app, KeyCode::Char('1'));
         let key = crate::tui::app::ServiceKey::new("api", 1);
         let long = "X".repeat(150);
-        app.ingest(key, format!("{long}\n").as_bytes());
+        app.ingest_steady(key, format!("{long}\n").as_bytes());
 
         let narrow = Rect::new(0, 0, 90, 30);
         let (_, sizes) = layout_for(&app, narrow);
@@ -531,7 +531,7 @@ mod tests {
         // would begin where the previous one ended.
         let mut app = app();
         press(&mut app, KeyCode::Char('1'));
-        app.ingest(
+        app.ingest_steady(
             crate::tui::app::ServiceKey::new("api", 1),
             b"alpha\nbravo\ncharlie\n",
         );
@@ -642,7 +642,7 @@ mod tests {
 
         // Output arrives, and the terminal shrinks, while the pane is hidden.
         let long = "W".repeat(120);
-        app.ingest(
+        app.ingest_steady(
             crate::tui::app::ServiceKey::new("worker", 1),
             format!("{long}\n").as_bytes(),
         );

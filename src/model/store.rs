@@ -72,6 +72,12 @@ pub struct LogStore {
     /// Whether the previous chunk ended on a carriage return, so a `\r\n` split
     /// across chunks isn't mistaken for a bare newline.
     pending_cr: bool,
+    /// ID of the container whose output the store is currently holding.
+    ///
+    /// Empty until the first [`LogStore::adopt`], which cannot collide with a
+    /// real container ID -- and would not matter if it could, since there is
+    /// no row part way through at that point to break.
+    container: String,
     /// Set when the parser holds a size it was never given content at -- a
     /// replay that had to be skipped, or an emulator released while off-screen
     /// -- so the next resize replays instead of short-circuiting on the size.
@@ -104,6 +110,7 @@ impl LogStore {
             keep_lines: keep_lines_for(scrollback, INITIAL_ROWS),
             lines: 0,
             pending_cr: false,
+            container: String::new(),
             pen: Vec::new(),
             replay_pending: false,
             has_output: false,
@@ -147,6 +154,53 @@ impl LogStore {
              through `App::pane_key`, the set `release_offscreen_stores` leaves alone"
         );
         self.parser.screen_mut()
+    }
+
+    /// Hands the store to `container`, ending the row the previous one left
+    /// part way along.
+    ///
+    /// A store is keyed on `(service, replica)` and is meant to outlive the
+    /// container: that shared buffer is what lets a pane keep its history when
+    /// compose recreates the container behind it, which is why #46 turned down
+    /// keying it on the ID. But compose gives the replacement the same
+    /// `container-number`, so the key outlives the container -- and a `web-1`
+    /// that stopped mid-line leaves the emulator's cursor part way along a row.
+    /// Without this the replacement's first chunk continues that row and the
+    /// pane shows one line neither container wrote.
+    ///
+    /// It is the *row* that ends here, not the buffer. Nothing is discarded:
+    /// the break is written into the stream, so the dead container's tail stays
+    /// on screen as its own line and the replacement starts on the next one.
+    ///
+    /// Fed through [`LogStore::process`] rather than to the parser directly, so
+    /// the break is recorded in `raw` as well as on the grid. Anything else
+    /// would splice again on the next resize, which replays `raw` from
+    /// scratch -- and would do nothing at all for a released store, whose grid
+    /// is rebuilt from `raw` when a pane next shows it.
+    ///
+    /// A bare `\n` because `normalise_newlines` is what decides whether a `\r`
+    /// belongs in front of one, and it is holding the state that decision needs:
+    /// a chunk that ended on a `\r` already left one in `pending_cr`, and this
+    /// has no business adding a second byte no container wrote. The grid would
+    /// not show the difference -- a `\r` at column 0 moves nothing -- but `raw`
+    /// is replayed, and adopting the ONLCR rule wholesale is what keeps this
+    /// from having a second opinion about it.
+    ///
+    /// `raw`'s last byte is what says whether there is a row to end, because
+    /// trimming only ever cuts from the front -- so the last byte of `raw` is
+    /// the last byte the store received, and bytes since the last newline are
+    /// exactly what `LineAssembler` holds in `partial` for the same decision.
+    /// An empty `raw` is a store nothing has been written to, which has no row
+    /// to end and must not be given a blank one.
+    pub fn adopt(&mut self, container: &str) {
+        if self.container == container {
+            return;
+        }
+        self.container.clear();
+        self.container.push_str(container);
+        if self.raw.last().is_some_and(|byte| *byte != b'\n') {
+            self.process(b"\n");
+        }
     }
 
     /// Feeds raw container output to the emulator, or past it while released.
@@ -1663,6 +1717,204 @@ mod tests {
 
         assert_eq!(s.screen().size(), (10, 40));
         assert!(!non_empty(&s).is_empty(), "the pane was blanked");
+    }
+
+    /// A compose recreate replaces `web-1` with a *new* container carrying the
+    /// same `container-number`, so the replacement's output lands on the store
+    /// the dead one was using. If the dead container stopped mid-line, the
+    /// emulator's cursor is still part way along that row, and the
+    /// replacement's first chunk continues it -- one row showing text neither
+    /// container wrote.
+    ///
+    /// Nothing but the change of identity separates the two writes: no resize,
+    /// no topology event, no elapsed time. That is the whole signal there is,
+    /// which is why it is the one the fix acts on.
+    #[test]
+    fn a_recreated_container_does_not_inherit_the_dead_one_s_held_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"Error: shutting");
+        s.adopt("web-1-second");
+        s.process(b"listening on 8080\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["Error: shutting", "listening on 8080"],
+            "the dead container's row ran on into its replacement's first chunk"
+        );
+    }
+
+    /// The break has to be in `raw`, not only on the grid. A resize throws the
+    /// grid away and replays `raw` from scratch, so a break written only to the
+    /// emulator would splice the two containers back together the first time
+    /// the pane changed size -- and the pane the store was created for is
+    /// almost always a different size from the one it starts at, so that resize
+    /// is the ordinary case rather than an unusual one.
+    ///
+    /// The narrower width also proves the break is a real line rather than a
+    /// wrap: rewrapped at 40 columns the two texts would sit on one row
+    /// together if they had been joined.
+    #[test]
+    fn the_break_a_recreate_makes_survives_a_replay() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 80);
+
+        s.adopt("web-1-first");
+        s.process(b"Error: shutting");
+        s.adopt("web-1-second");
+        s.process(b"listening on 8080\n");
+
+        s.resize(10, 40);
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["Error: shutting", "listening on 8080"],
+            "the replay spliced the two containers back together"
+        );
+    }
+
+    /// A pane whose store was released is rebuilt entirely from `raw` when it
+    /// comes back, and while released the parser is skipped altogether (#58).
+    /// So a recreate that happens with no pane open has only `raw` to record it
+    /// in, and the row it broke has to still be broken when someone looks.
+    #[test]
+    fn a_recreate_while_released_still_breaks_the_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        s.adopt("web-1-first");
+        s.process(b"Error: shutting");
+
+        s.release();
+        s.adopt("web-1-second");
+        s.process(b"listening on 8080\n");
+        s.resize(10, 40);
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["Error: shutting", "listening on 8080"],
+            "a recreate that happened off-screen was spliced by the replay"
+        );
+    }
+
+    /// The other half of the rule: output really is joined across chunks while
+    /// the container stays put. The stream layer cuts frames at
+    /// `MAX_CHUNK_BYTES` with no regard for content, so breaking on every write
+    /// instead of on a change of identity would pass the recreate tests above
+    /// and break every line that arrives in two pieces.
+    #[test]
+    fn one_container_s_row_is_still_joined_across_chunks() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"GET /one");
+        s.adopt("web-1-first");
+        s.process(b" 200\n");
+
+        assert_eq!(non_empty(&s), vec!["GET /one 200"]);
+    }
+
+    /// A recreate that catches the dead container between lines has no row part
+    /// way along to end, and must not manufacture one: a blank row pushed in on
+    /// every recreate is a gap in the pane and a line off the retention budget
+    /// each time.
+    ///
+    /// Asserted on the rows as they sit rather than through `non_empty`, which
+    /// discards exactly the blank row under test, and on `raw` besides, because
+    /// a blank line written there costs the budget whether or not a pane is
+    /// currently wide enough to show where it went.
+    #[test]
+    fn a_recreate_on_a_line_boundary_adds_no_blank_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"clean exit\n");
+        s.adopt("web-1-second");
+        s.process(b"listening on 8080\n");
+
+        let rows = s.visible_lines();
+        assert_eq!(rows[0].trim_end(), "clean exit");
+        assert_eq!(
+            rows[1].trim_end(),
+            "listening on 8080",
+            "a blank row was pushed between the two containers"
+        );
+        assert_eq!(
+            s.raw.iter().filter(|b| **b == b'\n').count(),
+            2,
+            "a blank line was written into the retained buffer"
+        );
+    }
+
+    /// The first container to write has nothing before it to break away from,
+    /// and the store starts with an empty ID that no real container can carry.
+    /// Ending a row here would push every pane in the stack down by one and
+    /// spend a line of its budget before any output arrived.
+    #[test]
+    fn the_first_container_to_write_gets_no_leading_break() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"listening on 8080\n");
+
+        assert_eq!(
+            s.visible_lines()[0].trim_end(),
+            "listening on 8080",
+            "the pane's first row was given away to a blank"
+        );
+        assert_eq!(
+            s.raw.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "a leading blank line was written into the retained buffer"
+        );
+    }
+
+    /// A chunk can end between a `\r` and its `\n`, and can end on a `\r` a
+    /// progress rewrite meant to keep. Either way the store is part way along a
+    /// row, so a recreate there has a row to end -- and has to end it through
+    /// the same ONLCR normalisation the rest of the stream goes through, or the
+    /// `pending_cr` carry decides that the newline it wrote was the completion
+    /// of the container's own carriage return.
+    ///
+    /// Without the break the replacement's chunk overwrites the progress line
+    /// from column 0, which is a splice that leaves no seam to see: the row
+    /// simply shows the wrong container's text.
+    #[test]
+    fn a_recreate_part_way_through_a_progress_rewrite_still_breaks_the_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"downloading 50%\r");
+        s.adopt("web-1-second");
+        s.process(b"listening on 8080\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["downloading 50%", "listening on 8080"],
+            "the replacement overwrote the dead container's progress row"
+        );
+    }
+
+    /// Adopting the same container repeatedly is what every ordinary write
+    /// does, and it has to stay free of the buffer entirely -- a store that
+    /// re-recorded the ID on each write would be doing an allocation per chunk
+    /// for a value that changes once in the life of a container.
+    #[test]
+    fn re_adopting_the_same_container_leaves_the_buffer_alone() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        s.adopt("web-1-first");
+        s.process(b"half a line");
+
+        let before = s.raw.clone();
+        s.adopt("web-1-first");
+
+        assert_eq!(s.raw, before, "an unchanged identity touched the buffer");
     }
 }
 

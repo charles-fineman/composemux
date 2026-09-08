@@ -298,13 +298,36 @@ impl App {
 
     // ---- data ------------------------------------------------------------
 
-    /// Feeds container output into the right service's buffer.
-    pub fn ingest(&mut self, key: ServiceKey, bytes: &[u8]) {
+    /// Feeds one container's output into the right service's buffer.
+    ///
+    /// The key is `(service, replica)` and the buffer under it outlives the
+    /// container, which is what lets a pane keep its history across a compose
+    /// recreate. `container` is not part of the key and does not select a
+    /// buffer; it only tells the store whose bytes these are, so a row the
+    /// previous container left part way along is ended before the new one's
+    /// first chunk continues it. Hence `adopt` before `process` rather than a
+    /// second lookup: the store has to know the identity has changed while it
+    /// still holds the unfinished row.
+    pub fn ingest(&mut self, key: ServiceKey, container: &str, bytes: &[u8]) {
         let scrollback = self.scrollback;
-        self.stores
+        let store = self
+            .stores
             .entry(key)
-            .or_insert_with(|| LogStore::new(scrollback))
-            .process(bytes);
+            .or_insert_with(|| LogStore::new(scrollback));
+        store.adopt(container);
+        store.process(bytes);
+    }
+
+    /// Feeds output under a key from the container that key implies.
+    ///
+    /// Test-only. Repeated calls for one key come from one container -- the
+    /// ordinary case, where nothing has been recreated -- so a test that is
+    /// not about a recreate cannot cause one by accident. A test that is about
+    /// one names the IDs itself and calls [`App::ingest`].
+    #[cfg(test)]
+    pub fn ingest_steady(&mut self, key: ServiceKey, bytes: &[u8]) {
+        let container = format!("{}-{}", key.name, key.replica);
+        self.ingest(key, &container, bytes);
     }
 
     /// Replaces the known service list, preserving selection and pins.
@@ -1601,7 +1624,7 @@ mod tests {
         let mut app = app_with(&["a"]);
         let key = ServiceKey::new("a", 1);
         for i in 0..100 {
-            app.ingest(key.clone(), format!("line {i}\r\n").as_bytes());
+            app.ingest_steady(key.clone(), format!("line {i}\r\n").as_bytes());
         }
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter);
@@ -1861,7 +1884,7 @@ mod tests {
         let mut app = app_with(&["a"]);
         let key = ServiceKey::new("a", 1);
         for i in 0..100 {
-            app.ingest(key.clone(), format!("line {i}\r\n").as_bytes());
+            app.ingest_steady(key.clone(), format!("line {i}\r\n").as_bytes());
         }
         press(&mut app, KeyCode::Enter);
         app.resize_panes(&[(0, 10, 40)]);
@@ -1877,7 +1900,7 @@ mod tests {
         let mut app = app_with(&["a"]);
         let key = ServiceKey::new("a", 1);
         for i in 0..100 {
-            app.ingest(key.clone(), format!("line {i}\r\n").as_bytes());
+            app.ingest_steady(key.clone(), format!("line {i}\r\n").as_bytes());
         }
         press(&mut app, KeyCode::Enter);
         app.resize_panes(&[(0, 10, 40)]);
@@ -2168,13 +2191,89 @@ mod tests {
     #[test]
     fn output_is_routed_to_the_matching_service() {
         let mut app = app_with(&["a", "b"]);
-        app.ingest(ServiceKey::new("a", 1), b"hello from a\r\n");
+        app.ingest_steady(ServiceKey::new("a", 1), b"hello from a\r\n");
         let store = app.store(&ServiceKey::new("a", 1)).unwrap();
         assert!(store
             .visible_lines()
             .iter()
             .any(|l| l.contains("hello from a")));
         assert!(app.store(&ServiceKey::new("b", 1)).is_none());
+    }
+
+    /// A compose recreate sends the replacement's output under the same
+    /// `(service, replica)`, so it lands in the buffer the dead container was
+    /// filling. Two things have to be true at once, and this asserts both
+    /// because they pull against each other: the row the dead container left
+    /// part way along has to end, and everything it wrote before that has to
+    /// still be there.
+    ///
+    /// The history half is what #46 turned down keying the buffer on the
+    /// container ID to protect. Doing that would pass the splice half of this
+    /// test perfectly -- a fresh buffer cannot splice -- and fail the other
+    /// half, which is the point of asserting them together.
+    #[test]
+    fn a_recreated_container_neither_splices_nor_discards_the_pane_s_history() {
+        let mut app = app_with(&["web"]);
+        let key = ServiceKey::new("web", 1);
+
+        app.ingest(key.clone(), "web-1-first", b"serving requests\r\n");
+        app.ingest(key.clone(), "web-1-first", b"Error: shutting");
+        app.ingest(key.clone(), "web-1-second", b"listening on 8080\r\n");
+
+        let store = app.store(&key).expect("a buffer");
+        let lines: Vec<String> = store
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["serving requests", "Error: shutting", "listening on 8080"],
+            "a recreate either spliced a row or reset the pane"
+        );
+    }
+
+    /// `compose up` on a scaled service recreates every replica, and their
+    /// output interleaves. Each replica's held row has to end on its own
+    /// replacement and on nothing else -- one identity shared across the app
+    /// would read every alternation between replicas as a change and cut
+    /// `held by one` in half.
+    ///
+    /// The two replicas alternate before the recreate as well as across it,
+    /// which is what makes that visible. Grouping the calls instead would pass
+    /// either way, because then the identity really does change on every write.
+    #[test]
+    fn replicas_recreated_together_neither_cross_nor_inherit() {
+        let mut app = app_with(&["web"]);
+        let one = ServiceKey::new("web", 1);
+        let two = ServiceKey::new("web", 2);
+
+        app.ingest(one.clone(), "web-1-first", b"held by ");
+        app.ingest(two.clone(), "web-2-first", b"held by ");
+        app.ingest(one.clone(), "web-1-first", b"one");
+        app.ingest(two.clone(), "web-2-first", b"two");
+        app.ingest(one.clone(), "web-1-second", b"one is back\r\n");
+        app.ingest(two.clone(), "web-2-second", b"two is back\r\n");
+
+        for (key, held, back) in [
+            (&one, "held by one", "one is back"),
+            (&two, "held by two", "two is back"),
+        ] {
+            let store = app.store(key).expect("a buffer");
+            let lines: Vec<String> = store
+                .visible_lines()
+                .iter()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(
+                lines,
+                vec![held, back],
+                "replica {} was mixed up",
+                key.replica
+            );
+        }
     }
 
     // ---- releasing off-screen emulators ----
@@ -2193,7 +2292,7 @@ mod tests {
     /// restore and not merely a screen.
     fn fill(app: &mut App, key: &ServiceKey, lines: usize) {
         for i in 0..lines {
-            app.ingest(key.clone(), format!("line {i}\r\n").as_bytes());
+            app.ingest_steady(key.clone(), format!("line {i}\r\n").as_bytes());
         }
     }
 
@@ -2251,7 +2350,7 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('1'));
         refresh(&mut app, &["a", "b"]);
-        app.ingest(a.clone(), b"arrived while closed\r\n");
+        app.ingest_steady(a.clone(), b"arrived while closed\r\n");
 
         // The premise, not just the conclusion: without this the test would
         // keep passing if the housekeeping stopped releasing anything, and it
@@ -2510,7 +2609,7 @@ mod tests {
     #[test]
     fn focused_output_returns_the_panes_buffer() {
         let mut app = app_with(&["a"]);
-        app.ingest(ServiceKey::new("a", 1), b"hello\r\n");
+        app.ingest_steady(ServiceKey::new("a", 1), b"hello\r\n");
         press(&mut app, KeyCode::Enter);
         let text = app.focused_output().expect("a pane is focused");
         assert!(text.contains("hello"), "got {text:?}");
