@@ -188,10 +188,28 @@ impl LogStore {
     ///
     /// `raw`'s last byte is what says whether there is a row to end, because
     /// trimming only ever cuts from the front -- so the last byte of `raw` is
-    /// the last byte the store received, and bytes since the last newline are
-    /// exactly what `LineAssembler` holds in `partial` for the same decision.
+    /// the last byte the store received, and "has anything arrived since the
+    /// last newline" is the same question `LineAssembler` asks of `partial`.
+    /// Not the identical predicate: `push` empties `partial` at `MAX_PARTIAL`
+    /// with no newline in sight, so an unterminated run past a megabyte leaves
+    /// the fallback holding nothing while this still sees a row. Nothing turns
+    /// on the difference -- both are asking whether a line was left open.
+    ///
     /// An empty `raw` is a store nothing has been written to, which has no row
-    /// to end and must not be given a blank one.
+    /// to end and must not be given a blank one. `raw` cannot empty any other
+    /// way: `trim_point` never cuts the whole buffer away, which is the same
+    /// fact `release` relies on.
+    ///
+    /// The predicate over-approximates in one direction, deliberately. A
+    /// container whose last bytes after its final newline are escape-only -- a
+    /// `\x1b[0m` or a cursor-show on the way out -- has an empty row on screen
+    /// but a non-newline last byte, so the recreate costs a blank row and a
+    /// line of the retention budget. Telling that apart would mean parsing
+    /// `raw`'s tail rather than looking at one byte of it, and the fallback
+    /// makes exactly the same call: `LineAssembler` holds those same bytes in
+    /// `partial` and prints them as their own prefixed line. Diverging here to
+    /// save a blank row would be the two paths disagreeing about where a line
+    /// ends, which is the thing #50 and #60 are both about.
     pub fn adopt(&mut self, container: &str) {
         if self.container == container {
             return;
@@ -1901,9 +1919,12 @@ mod tests {
     }
 
     /// Adopting the same container repeatedly is what every ordinary write
-    /// does, and it has to stay free of the buffer entirely -- a store that
-    /// re-recorded the ID on each write would be doing an allocation per chunk
-    /// for a value that changes once in the life of a container.
+    /// does, and it has to leave the buffer entirely alone. The comparison is
+    /// not there to save the copy -- `clear` keeps the `String`'s capacity and
+    /// container IDs are all the same length, so re-recording the ID would cost
+    /// a `memcpy` and never an allocation. It is there because the write that
+    /// follows it is the row break, and a store that took every chunk for a new
+    /// container would cut every line that arrives in more than one piece.
     #[test]
     fn re_adopting_the_same_container_leaves_the_buffer_alone() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
