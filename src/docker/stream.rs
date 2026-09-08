@@ -99,7 +99,7 @@ pub enum SourceEvent {
         /// neither the line nor a duplicate of it. Stamped per attach so a
         /// consumer can end what it held, which is what keeps the cost of a
         /// reattach to the whole-line duplicate [`log_window`] accepts. The
-        /// fallback compares it; the TUI ignores it until #68.
+        /// fallback compares it, and since #68 so does the TUI.
         attach: u64,
         /// One piece of a log frame, no larger than [`MAX_CHUNK_BYTES`].
         bytes: Vec<u8>,
