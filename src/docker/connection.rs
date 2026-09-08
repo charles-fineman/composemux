@@ -375,6 +375,45 @@ mod tests {
             err: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         });
         assert_eq!(Outage::classify(&flat), Outage::Rejected, "flat");
+
+        // The frame the `nested` fixture above cannot have. In the real chain
+        // the hyper error sits inside `HyperLegacyError`, which is a bollard
+        // error that matches neither arm, so the walk has to go *past* a
+        // recognised-as-bollard-but-not-matched frame to reach the kind --
+        // which is why that match ends in `_ => {}` and not a verdict. Neither
+        // fixture above enters the bollard branch at all, so nothing held that
+        // `{}` in place: making it `_ => return Self::Unreachable` left the
+        // whole suite green while breaking the case #64 cares most about.
+        //
+        // Reproduced rather than borrowed, again because hyper's error cannot
+        // be built from outside hyper: `io::Error::other` takes an arbitrary
+        // payload, so an `IOError` of a kind this does not match carries the
+        // nesting and puts a bollard frame in the middle. `IOError` being
+        // transparent even makes it read as the hyper frame it stands in for.
+        let past_a_bollard_frame = anyhow::Error::from(bollard::errors::Error::IOError {
+            err: std::io::Error::other(Connect(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        })
+        .context("could not list containers");
+        // The premise: the middle frame really is a bollard error, and really
+        // does match neither arm, or this would be the `nested` case again.
+        let middle = past_a_bollard_frame
+            .chain()
+            .find_map(|c| c.downcast_ref::<bollard::errors::Error>())
+            .expect("a bollard frame in the middle, or this proves nothing");
+        assert!(
+            !matches!(
+                middle,
+                bollard::errors::Error::DockerResponseServerError { .. }
+            ),
+            "the middle frame has to be one the match falls through: {middle:?}"
+        );
+        assert_eq!(
+            Outage::classify(&past_a_bollard_frame),
+            Outage::Rejected,
+            "past an unrecognised bollard frame"
+        );
     }
 
     /// The other `io::ErrorKind`s, which really are nothing reached. Without
