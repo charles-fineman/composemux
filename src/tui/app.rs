@@ -298,36 +298,46 @@ impl App {
 
     // ---- data ------------------------------------------------------------
 
-    /// Feeds one container's output into the right service's buffer.
+    /// Feeds one attach's output into the right service's buffer.
     ///
     /// The key is `(service, replica)` and the buffer under it outlives the
     /// container, which is what lets a pane keep its history across a compose
-    /// recreate. `container` is not part of the key and does not select a
-    /// buffer; it only tells the store whose bytes these are, so a row the
-    /// previous container left part way along is ended before the new one's
+    /// recreate. `container` and `attach` are not part of the key and do not
+    /// select a buffer; they only tell the store whose bytes these are, so a
+    /// row the previous one left part way along is ended before the new one's
     /// first chunk continues it. Hence `adopt` before `process` rather than a
     /// second lookup: the store has to know the identity has changed while it
     /// still holds the unfinished row.
-    pub fn ingest(&mut self, key: ServiceKey, container: &str, bytes: &[u8]) {
+    ///
+    /// Both halves are passed because both can change on their own. A recreate
+    /// changes the container; a reattach to a container that never stopped
+    /// changes only the attach, and replays from a `since` that resolves to the
+    /// second -- so it can restart the entry the store is part way along while
+    /// the ID says nothing has happened.
+    pub fn ingest(&mut self, key: ServiceKey, container: &str, attach: u64, bytes: &[u8]) {
         let scrollback = self.scrollback;
         let store = self
             .stores
             .entry(key)
             .or_insert_with(|| LogStore::new(scrollback));
-        store.adopt(container);
+        store.adopt(container, attach);
         store.process(bytes);
     }
 
-    /// Feeds output under a key from the container that key implies.
+    /// Feeds output under a key from the container, and the attach, that key
+    /// implies.
     ///
-    /// Test-only. Repeated calls for one key come from one container -- the
-    /// ordinary case, where nothing has been recreated -- so a test that is
-    /// not about a recreate cannot cause one by accident. A test that is about
-    /// one names the IDs itself and calls [`App::ingest`].
+    /// Test-only. Repeated calls for one key come from one attach to one
+    /// container -- the ordinary case, where nothing has been recreated and
+    /// nothing has been reattached -- so a test that is not about either cannot
+    /// cause one by accident. A test that is about one names the identity
+    /// itself and calls [`App::ingest`]. The attach is held at one because
+    /// `AttachIds` hands out ids from one, and a store starts at zero to mean
+    /// "no attach seen yet".
     #[cfg(test)]
     pub fn ingest_steady(&mut self, key: ServiceKey, bytes: &[u8]) {
         let container = format!("{}-{}", key.name, key.replica);
-        self.ingest(key, &container, bytes);
+        self.ingest(key, &container, 1, bytes);
     }
 
     /// Replaces the known service list, preserving selection and pins.
@@ -2216,9 +2226,9 @@ mod tests {
         let mut app = app_with(&["web"]);
         let key = ServiceKey::new("web", 1);
 
-        app.ingest(key.clone(), "web-1-first", b"serving requests\r\n");
-        app.ingest(key.clone(), "web-1-first", b"Error: shutting");
-        app.ingest(key.clone(), "web-1-second", b"listening on 8080\r\n");
+        app.ingest(key.clone(), "web-1-first", 1, b"serving requests\r\n");
+        app.ingest(key.clone(), "web-1-first", 1, b"Error: shutting");
+        app.ingest(key.clone(), "web-1-second", 1, b"listening on 8080\r\n");
 
         let store = app.store(&key).expect("a buffer");
         let lines: Vec<String> = store
@@ -2249,12 +2259,12 @@ mod tests {
         let one = ServiceKey::new("web", 1);
         let two = ServiceKey::new("web", 2);
 
-        app.ingest(one.clone(), "web-1-first", b"held by ");
-        app.ingest(two.clone(), "web-2-first", b"held by ");
-        app.ingest(one.clone(), "web-1-first", b"one");
-        app.ingest(two.clone(), "web-2-first", b"two");
-        app.ingest(one.clone(), "web-1-second", b"one is back\r\n");
-        app.ingest(two.clone(), "web-2-second", b"two is back\r\n");
+        app.ingest(one.clone(), "web-1-first", 1, b"held by ");
+        app.ingest(two.clone(), "web-2-first", 1, b"held by ");
+        app.ingest(one.clone(), "web-1-first", 1, b"one");
+        app.ingest(two.clone(), "web-2-first", 1, b"two");
+        app.ingest(one.clone(), "web-1-second", 1, b"one is back\r\n");
+        app.ingest(two.clone(), "web-2-second", 1, b"two is back\r\n");
 
         for (key, held, back) in [
             (&one, "held by one", "one is back"),

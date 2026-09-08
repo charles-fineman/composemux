@@ -717,27 +717,28 @@ fn apply_poll(app: &mut App, poll: Poll) -> bool {
 /// Folds one event from the docker layer into the app.
 fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>) {
     match message {
-        // The ID does not pick the buffer -- that stays keyed on
+        // Neither half of the identity picks the buffer -- that stays keyed on
         // `(service, replica)`, which is what lets a pane keep its history when
         // compose recreates the container behind it, and is why #46 turned down
-        // keying it on the ID. It is passed alongside the key so the store can
-        // see that the container writing to it has changed and end the row the
-        // dead one left part way along, rather than let the replacement's first
-        // chunk continue it.
+        // keying it on the ID. Both are passed alongside the key so the store
+        // can see that the stream writing to it has changed and end the row the
+        // previous one left part way along, rather than let the new one's first
+        // chunk continue it. The container catches a recreate; the attach
+        // catches a reattach to a container that never stopped, which replays
+        // from a `since` that resolves to the second and so can restart the
+        // entry the cursor is part way along.
         SourceEvent::Output {
             service,
             replica,
             container,
-            // Still ignored, and now the only half of the identity that is.
-            // A reattach of one container replays at `since`'s one-second
-            // resolution, so it can restart the entry the cursor is part way
-            // along and continue that row with it. The container has not
-            // changed, so the break below does not fire on it; #68 tracks
-            // that, and would read this field into the mechanism `LogStore`
-            // now has rather than build a second one beside it.
-            attach: _,
+            attach,
             bytes,
-        } => app.ingest(ServiceKey::new(service, replica), &container, &bytes),
+        } => app.ingest(
+            ServiceKey::new(service, replica),
+            &container,
+            attach,
+            &bytes,
+        ),
         SourceEvent::Topology => refresh.notify_one(),
     }
 }
@@ -1949,8 +1950,9 @@ mod tests {
     /// throws the ID away again. Nothing separates the two events but the ID:
     /// the attach is held equal deliberately, so that the break under test can
     /// only have come from the container changing. A recreate does start a new
-    /// attach in practice, but the TUI does not read that field until #68, and
-    /// varying it here would leave the test passing on either signal.
+    /// attach in practice, and since #68 the store would break on that too --
+    /// varying it here would leave the test passing on either signal and stop
+    /// saying anything about the ID.
     #[tokio::test(start_paused = true)]
     async fn the_event_loop_carries_the_container_id_into_the_buffer() {
         let mut app = app_with_service("api");
@@ -1983,6 +1985,50 @@ mod tests {
             lines,
             vec!["Error: shutting", "listening on 8080"],
             "the recreated container's first chunk continued the dead one's row"
+        );
+    }
+
+    /// The other half of the identity, and the mirror of the test above. A
+    /// container's log task can end while the container keeps running, and the
+    /// resync that reattaches it resumes from `since = ended_at`, which
+    /// resolves to the second -- so the replay can restart the entry the store
+    /// is part way along. `apply_source_event` discarded `attach` until #68,
+    /// which left that replay running on into the held row.
+    ///
+    /// The container is held equal here for the reason the attach is held equal
+    /// there: it is the only way the break under test can be attributed to the
+    /// field this is about. Held equal to a *non-default* id besides, so that a
+    /// store comparing against its starting zero rather than against the id it
+    /// was given still has to get this right.
+    #[tokio::test(start_paused = true)]
+    async fn the_event_loop_carries_the_attach_id_into_the_buffer() {
+        let mut app = app_with_service("api");
+        let output = |attach: u64, bytes: &[u8]| SourceEvent::Output {
+            service: "api".into(),
+            replica: 1,
+            container: "api-1".into(),
+            attach,
+            bytes: bytes.to_vec(),
+        };
+        drive_event_loop(
+            &mut app,
+            Vec::new(),
+            vec![output(7, b"GET /one"), output(8, b"GET /one 200\r\n")],
+            Vec::new(),
+        )
+        .await;
+
+        let store = app.store(&ServiceKey::new("api", 1)).expect("a buffer");
+        let lines: Vec<String> = store
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["GET /one", "GET /one 200"],
+            "the reattach's replay continued the row the first attach held"
         );
     }
 
