@@ -172,6 +172,15 @@ impl LogStore {
     /// the break is written into the stream, so the dead container's tail stays
     /// on screen as its own line and the replacement starts on the next one.
     ///
+    /// With one exception, which is the emulator's and not this method's. A
+    /// container that dies part way through an escape sequence leaves the
+    /// parser mid-sequence, and the break is then consumed as a byte of that
+    /// sequence rather than executed -- inside an unterminated OSC it takes the
+    /// replacement's first line with it. Ending the row is not enough to fix
+    /// that and this deliberately does not try; #72 has the measurements. It is
+    /// not something the break introduced either: those bytes are swallowed the
+    /// same way with no recreate involved.
+    ///
     /// Fed through [`LogStore::process`] rather than to the parser directly, so
     /// the break is recorded in `raw` as well as on the grid. Anything else
     /// would splice again on the next resize, which replays `raw` from
@@ -1764,6 +1773,78 @@ mod tests {
         );
     }
 
+    /// The break ends a row; it does not insert one. Every other test here
+    /// reads the rows through `non_empty`, which discards exactly the blank a
+    /// doubled break would leave -- so on the one path where a break actually
+    /// happens, the hazard the boundary test names goes unwatched unless it is
+    /// watched here.
+    ///
+    /// Both halves are needed. The rendered rows catch a blank in the pane; the
+    /// newline count catches one that is only in `raw`, which costs a line of
+    /// the retention budget per recreate whether or not a pane is open to show
+    /// where it went.
+    #[test]
+    fn the_break_a_recreate_makes_costs_exactly_one_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"Error: shutting");
+        s.adopt("web-1-second");
+        s.process(b"listening on 8080\n");
+
+        let rows = s.visible_lines();
+        assert_eq!(rows[0].trim_end(), "Error: shutting");
+        assert_eq!(
+            rows[1].trim_end(),
+            "listening on 8080",
+            "a blank row was pushed between the two containers"
+        );
+        assert_eq!(
+            s.raw.iter().filter(|b| **b == b'\n').count(),
+            2,
+            "the break spent more than one line of the retention budget"
+        );
+    }
+
+    /// The break is written as a bare `\n` and left to `normalise_newlines` to
+    /// dress, rather than as a `\r\n` of its own. Nothing about the rendered
+    /// rows can tell the two apart -- a `\r` at column 0 moves nothing -- so
+    /// this reads the bytes, which is where the difference lives and where a
+    /// replay will find it.
+    ///
+    /// The held row ends on a carriage return, which is the case that
+    /// discriminates: `pending_cr` is set, so the stream needs the `\n` alone.
+    /// A break that supplied its own `\r` would put one in `raw` that no
+    /// container wrote, and one that bypassed the normalisation altogether
+    /// would leave the carry set -- which the last write here catches, because
+    /// a chunk opening on a newline is exactly what a stale carry swallows.
+    #[test]
+    fn the_break_is_the_stream_s_own_newline() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first");
+        s.process(b"downloading 50%\r");
+        s.adopt("web-1-second");
+
+        assert_eq!(
+            s.raw, b"downloading 50%\r\n",
+            "the break wrote a carriage return no container sent"
+        );
+        assert!(
+            !s.pending_cr,
+            "the break left the carry claiming a carriage return is still open"
+        );
+
+        s.process(b"\nlistening on 8080\n");
+        assert_eq!(
+            non_empty(&s),
+            vec!["downloading 50%", "listening on 8080"],
+            "a stale carry swallowed the newline opening the next chunk"
+        );
+    }
+
     /// The break has to be in `raw`, not only on the grid. A resize throws the
     /// grid away and replays `raw` from scratch, so a break written only to the
     /// emulator would splice the two containers back together the first time
@@ -1797,6 +1878,13 @@ mod tests {
     /// comes back, and while released the parser is skipped altogether (#58).
     /// So a recreate that happens with no pane open has only `raw` to record it
     /// in, and the row it broke has to still be broken when someone looks.
+    ///
+    /// The premise is asserted, not assumed. `release` declines a store it
+    /// could not rebuild, so if its conditions ever change this would quietly
+    /// stop being about the released path and become a second copy of the
+    /// replay test above -- passing, and covering nothing the other does not.
+    /// Read through `released_grid`, which is the deliberate test-only
+    /// exception for looking at a grid a release left behind.
     #[test]
     fn a_recreate_while_released_still_breaks_the_row() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
@@ -1805,6 +1893,12 @@ mod tests {
         s.process(b"Error: shutting");
 
         s.release();
+        assert_eq!(
+            s.released_grid().size(),
+            (MIN_ROWS, MIN_COLS),
+            "the store was never released, so this is only the replay test again"
+        );
+
         s.adopt("web-1-second");
         s.process(b"listening on 8080\n");
         s.resize(10, 40);
@@ -1821,6 +1915,11 @@ mod tests {
     /// `MAX_CHUNK_BYTES` with no regard for content, so breaking on every write
     /// instead of on a change of identity would pass the recreate tests above
     /// and break every line that arrives in two pieces.
+    ///
+    /// `raw` is checked as well as the rows, because an unchanged identity has
+    /// to leave the retained buffer alone and not merely leave the pane looking
+    /// right: a break that landed in `raw` and nowhere else would render
+    /// correctly now and split the line on the next resize.
     #[test]
     fn one_container_s_row_is_still_joined_across_chunks() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
@@ -1832,6 +1931,10 @@ mod tests {
         s.process(b" 200\n");
 
         assert_eq!(non_empty(&s), vec!["GET /one 200"]);
+        assert_eq!(
+            s.raw, b"GET /one 200\r\n",
+            "an unchanged identity wrote a break into the retained buffer"
+        );
     }
 
     /// A recreate that catches the dead container between lines has no row part
@@ -1893,14 +1996,18 @@ mod tests {
 
     /// A chunk can end between a `\r` and its `\n`, and can end on a `\r` a
     /// progress rewrite meant to keep. Either way the store is part way along a
-    /// row, so a recreate there has a row to end -- and has to end it through
-    /// the same ONLCR normalisation the rest of the stream goes through, or the
-    /// `pending_cr` carry decides that the newline it wrote was the completion
-    /// of the container's own carriage return.
+    /// row, so a recreate there has a row to end.
     ///
-    /// Without the break the replacement's chunk overwrites the progress line
-    /// from column 0, which is a splice that leaves no seam to see: the row
-    /// simply shows the wrong container's text.
+    /// This is the splice that leaves no seam to see. Elsewhere the two
+    /// containers' text runs together and the join is visible in the result;
+    /// here the replacement writes from column 0 over a row the dead container
+    /// had already returned the cursor to, so the row simply shows the wrong
+    /// container's text and nothing looks wrong at all.
+    ///
+    /// What the break has to do with the carry is a separate question, settled
+    /// in `the_break_is_the_stream_s_own_newline` -- this scenario cannot ask
+    /// it, because the replacement's chunk opens on a printable byte and a
+    /// mishandled carry is only visible to a chunk opening on a newline.
     #[test]
     fn a_recreate_part_way_through_a_progress_rewrite_still_breaks_the_row() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
@@ -1918,24 +2025,75 @@ mod tests {
         );
     }
 
-    /// Adopting the same container repeatedly is what every ordinary write
-    /// does, and it has to leave the buffer entirely alone. The comparison is
-    /// not there to save the copy -- `clear` keeps the `String`'s capacity and
-    /// container IDs are all the same length, so re-recording the ID would cost
-    /// a `memcpy` and never an allocation. It is there because the write that
-    /// follows it is the row break, and a store that took every chunk for a new
-    /// container would cut every line that arrives in more than one piece.
+    /// The predicate reads one byte -- `raw`'s last -- and the argument that
+    /// this is the last byte the store received rests entirely on trimming only
+    /// ever cutting from the front. Nothing exercised that: every other recreate
+    /// test here runs on a buffer far too small to trim.
+    ///
+    /// So the budget is set to one line and forty are sent through it, which
+    /// makes `retain` cut repeatedly before the held tail arrives. If a trim
+    /// ever took bytes from the end, or dropped a partial tail on the way past,
+    /// the predicate would read a byte that is not the last one written and the
+    /// break would go missing.
     #[test]
-    fn re_adopting_the_same_container_leaves_the_buffer_alone() {
+    fn a_recreate_after_the_buffer_has_been_trimmed_still_breaks_the_row() {
+        let mut s = LogStore::new(1);
+        s.resize(MIN_ROWS, MIN_COLS);
+
+        s.adopt("web-1-first");
+        for i in 0..40 {
+            s.process(format!("line {i}\n").as_bytes());
+        }
+        // The premise: trimming really did run, so the assertion below is about
+        // a trimmed buffer rather than about a buffer that never filled.
+        assert!(
+            s.raw.len() < 40 * 8,
+            "the budget was never tight enough to trim: {} bytes retained",
+            s.raw.len()
+        );
+        s.process(b"held tail");
+
+        s.adopt("web-1-second");
+        s.process(b"new container\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["held tail", "new container"],
+            "a trimmed buffer lost the break"
+        );
+    }
+
+    /// A recreate is not a reason to move a reader who has scrolled up. The
+    /// break adds a row, and `vt100` advances the scroll offset as rows evict
+    /// into scrollback so that the same content stays in view -- the same
+    /// mechanism `process` relies on for ordinary output, which `LogStore`
+    /// deliberately does not compensate for by hand.
+    ///
+    /// Asserted on the rendered rows rather than on the offset, because it is
+    /// the rows the reader is looking at, and the offset changing while they
+    /// hold still is the correct outcome rather than the failure.
+    #[test]
+    fn a_recreate_does_not_move_a_scrolled_up_reader() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
         s.adopt("web-1-first");
-        s.process(b"half a line");
+        for i in 0..50 {
+            s.process(format!("line {i}\n").as_bytes());
+        }
+        s.process(b"held tail");
+        s.scroll_up(20);
+        // The premise: the reader really is up in the scrollback, not pinned at
+        // the bottom where nothing could move them anyway.
+        assert!(s.scroll_offset() > 0, "the reader never left the bottom");
 
-        let before = s.raw.clone();
-        s.adopt("web-1-first");
+        let before = s.visible_lines();
+        s.adopt("web-1-second");
 
-        assert_eq!(s.raw, before, "an unchanged identity touched the buffer");
+        assert_eq!(
+            s.visible_lines(),
+            before,
+            "a recreate moved a scrolled-up reader's view"
+        );
     }
 }
 
