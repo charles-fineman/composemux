@@ -41,10 +41,15 @@ pub enum Outage {
     /// wait for it, without either answering or failing. The daemon may be
     /// wedged, or merely slower than anything we would call healthy.
     NotAnswering,
-    /// Something on the other end answered, and said no: the daemon returned
-    /// an error of its own, or the socket refused us permission. The daemon
-    /// is running and is being reached, so neither of the other two notes is
-    /// true, and both would send the user to start something already started.
+    /// The request was refused rather than lost: the daemon answered with an
+    /// error of its own, or the socket would not let us open it.
+    ///
+    /// Only the first of those establishes that a daemon is running -- a
+    /// refusal by the socket's permissions happens in the kernel, before a
+    /// byte is exchanged, and says only that the socket node is there. What
+    /// the two share is the remedy they rule out: neither is fixed by
+    /// starting Docker, which is where both of the other notes send the user.
+    /// The note says only that the request was rejected, for that reason.
     Rejected,
 }
 
@@ -60,10 +65,15 @@ impl Outage {
     ///   which it declines with a 400 rather than by dropping the connection.
     /// * a [`std::io::Error`] of kind
     ///   [`PermissionDenied`](std::io::ErrorKind::PermissionDenied), which is
-    ///   the socket being there and refusing to let us have it -- the "user
-    ///   is not in the docker group" case. A path we cannot traverse lands
-    ///   here too, and is welcome to: the remedy is the same one, and it is
-    ///   not "start Docker".
+    ///   the socket refusing to be opened -- the "user is not in the docker
+    ///   group" case. A path we cannot traverse lands here too, and is
+    ///   welcome to: the remedy is the same one, and it is not "start
+    ///   Docker". So does the case this gets wrong -- `connect(2)` also gives
+    ///   `EACCES` when a firewall rule or a MAC policy blocks the connection,
+    ///   which is genuinely nothing reached. That needs a `tcp://` or `ssh://`
+    ///   host to reach at all, and the error carries nothing to tell it from
+    ///   a socket's own permissions, so it is left misfiled rather than
+    ///   guessed at.
     ///
     /// Everything else stays [`Unreachable`](Self::Unreachable), which is
     /// where it has always been.
@@ -84,10 +94,10 @@ impl Outage {
     /// so the kind is three deep, under a hyper error, and the bollard
     /// variant holding it is `HyperLegacyError` rather than the `IOError` its
     /// name suggests. Matching the `io::Error` wherever it is found is what
-    /// makes this independent of which transport bollard used and of which of
-    /// its variants is cargo-feature gated -- `HyperLegacyError` is one of
-    /// the gated ones, so naming it here would not compile everywhere this
-    /// does.
+    /// makes this independent of which transport bollard chose. Naming the
+    /// variant instead would also mean naming hyper's error type to reach the
+    /// kind, and that one cannot be built from outside hyper -- which is why
+    /// the test for this has to reproduce the nesting rather than borrow it.
     ///
     /// `IOError` is then checked on the bollard value as well, and not
     /// because two ways of spelling it is tidy: it is declared

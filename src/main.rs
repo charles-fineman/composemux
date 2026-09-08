@@ -110,10 +110,12 @@ const MAX_DRAIN_PER_FRAME: usize = 512;
 /// looking at the terminal, and does not need the headroom over an honest slow
 /// daemon that a diagnosis does.
 ///
-/// Five seconds, measured the same way `POLL_TIMEOUT` was. Startup is
-/// `connect` -- one round trip to negotiate an API version -- and then one
-/// `list_services`, which is one list plus one inspect per container at
-/// `INSPECT_CONCURRENCY` 8. Against the real daemon, median of ten runs, with
+/// Five seconds, measured the same way `POLL_TIMEOUT` was. What is being
+/// waited on is `connect` -- one round trip to negotiate an API version --
+/// and then one `list_services`, which is one list plus one inspect per
+/// container at `INSPECT_CONCURRENCY` 8. (A project with no services costs a
+/// `list_projects` on top, but only on its way to giving up, so it is not the
+/// case this is sized for.) Against the real daemon, median of ten runs, with
 /// a proxy inserting the round trip:
 ///
 /// | containers | local | 10ms | 50ms | 200ms |
@@ -455,9 +457,11 @@ async fn refresh_loop<S: ServiceSource>(
                 // A request that already went quiet on us and has now errored
                 // out is the wedged daemon we have been naming all along, not
                 // a newly unreachable one. That takes precedence over what the
-                // error itself says: bollard ends a held request with a
-                // timeout of its own, and the daemon has been silent for two
-                // minutes by then whatever it finally says.
+                // error says, and deliberately: this round has already been
+                // reported as `NotAnswering`, and however the request finally
+                // ends, it did go quiet for at least `POLL_TIMEOUT` first. A
+                // late answer taking that back would flap the note between two
+                // claims about one unchanging daemon.
                 Err(if overran {
                     Outage::NotAnswering
                 } else {
@@ -577,17 +581,18 @@ where
         // opportunity, and that a test of the shutdown path can assert that
         // rather than repeat until it happens.
         //
-        // Which makes the written order a priority order, so it is chosen
-        // rather than inherited. The rule is that an arm may only sit above
-        // one it cannot starve, and starving needs an arm that is ready at
-        // nearly every poll. Cancellation is ready once and returns. Input
-        // arrives at whatever rate a person produces it. A poll lands every
-        // `REFRESH`, and a tick every `TICK`. Log output has no such ceiling
-        // -- a chatty service can outrun the drain bound below and leave this
-        // arm ready every time -- so it goes last, where being always ready
-        // costs the arms above it nothing. Under the old order it sat above
-        // the poll and the tick, and biasing that would have let a flood
-        // freeze the throbber, the uptimes and the auto-exit countdown.
+        // Which makes the written order a priority order, so it is worth
+        // saying why this one is safe. The arm to worry about is `log_rx`: it
+        // sits above the poll and the tick, and a chatty service can make it
+        // ready far more often than either. What stops it starving them is the
+        // drain below, which empties the channel every time this arm wins, so
+        // the next poll finds it pending and reaches the arms under it. The
+        // two below are level-triggered and stay ready until they are taken,
+        // so a turn deferred is not a turn lost. Measured against a service
+        // flooding the channel for a second, the loop still ticked 7-10 times
+        // out of a possible 10; with the drain removed so the channel is never
+        // emptied, it ticked 0, which is what
+        // `a_flood_of_logs_does_not_stop_the_clock` pins.
         tokio::select! {
             biased;
 
@@ -610,22 +615,6 @@ where
                 }
             }
 
-            polled = svc_rx.recv() => {
-                if let Some(poll) = polled {
-                    // Pins wait for a poll the daemon answered, which is what
-                    // the old code waited for too. An answered poll carrying
-                    // no services still counts: a project really can have
-                    // none, and holding the pins back forever would be worse
-                    // than applying them to an empty list.
-                    if apply_poll(app, poll) && !pinned_applied {
-                        pinned_applied = true;
-                        app.apply_startup_pins();
-                    }
-                }
-            }
-
-            _ = ticker.tick() => app.tick(Instant::now()),
-
             message = log_rx.recv() => {
                 let Some(message) = message else { continue };
                 apply_source_event(app, message, refresh);
@@ -643,6 +632,23 @@ where
                     }
                 }
             }
+
+            polled = svc_rx.recv() => {
+                if let Some(poll) = polled {
+                    // Pins wait for a poll the daemon answered, which is what
+                    // the old code waited for too. An answered poll carrying
+                    // no services still counts: a project really can have
+                    // none, and holding the pins back forever would be worse
+                    // than applying them to an empty list.
+                    if apply_poll(app, poll) && !pinned_applied {
+                        pinned_applied = true;
+                        app.apply_startup_pins();
+                    }
+                }
+            }
+
+            _ = ticker.tick() => app.tick(Instant::now()),
+
         }
     }
 }
@@ -1076,7 +1082,14 @@ mod tests {
     }
 
     /// The usual case, where nothing is set and bollard falls back to the
-    /// platform socket. An empty value is the same case: bollard ignores it.
+    /// platform socket.
+    ///
+    /// An empty value is folded in with it, which is a choice rather than a
+    /// description: `connect_with_defaults` only substitutes the default when
+    /// the variable is *absent*, so an empty one is passed through, matches no
+    /// scheme and fails at once with `UnsupportedURISchemeError`. That path
+    /// never reaches this notice at all. Naming the socket is what is left to
+    /// say if it ever does.
     #[test]
     fn the_notice_says_which_socket_when_no_host_is_set() {
         for host in [None, Some("")] {
@@ -1597,6 +1610,11 @@ mod tests {
     /// is what lets a test tell a pane that was sized from one that was not.
     const TEST_FRAME: (u16, u16) = (200, 40);
 
+    /// How long `a_flood_of_logs_does_not_stop_the_clock` floods for. Ten
+    /// ticks' worth, which is what leaves room for a threshold well clear of
+    /// both the zero a stopped clock gives and the noise of a loaded machine.
+    const FLOOD: Duration = Duration::from_secs(1);
+
     /// One key press, as the input stream carries it.
     fn key(code: crossterm::event::KeyCode) -> Event {
         Event::Key(crossterm::event::KeyEvent::new(
@@ -1919,19 +1937,30 @@ mod tests {
         }
     }
 
-    /// The order the `biased` above turns into a priority order, and the
-    /// reason the log arm is last. This one does not fail against the code
-    /// before #66 -- unbiased, every arm gets a turn -- it fails against the
-    /// obvious way to do #66, which is to write `biased` and leave the arms
-    /// where they were, with `log_rx` above the poll and the tick.
+    /// What makes it safe to bias a select whose log arm sits above the poll
+    /// and the tick: the drain empties the channel every time that arm wins,
+    /// so the next poll finds it pending and the arms under it get their turn.
     ///
-    /// Real time rather than paused, because the point is an arm that is
-    /// ready at every poll: under a paused clock the flooding task is never
-    /// idle, so the clock would never move and the ticker would never come
-    /// due whatever the order. Half a second is five ticks' worth, and the
-    /// assertion only needs one.
-    #[tokio::test]
-    async fn a_flood_of_logs_does_not_starve_the_rest_of_the_loop() {
+    /// This is a guard on that reasoning rather than a test of #66 -- it
+    /// passes on the code before it too, where the random order gave every
+    /// arm a turn anyway. What it fails against is the drain going away, which
+    /// is what would make the bias bite. Measured over the second below:
+    /// 7-10 ticks of a possible 10 as it stands, and 0 with the drain removed,
+    /// six runs each.
+    ///
+    /// Real time rather than paused, because the point is an arm that is ready
+    /// at every poll: under a paused clock the flooding task is never idle, so
+    /// the clock would never move and the ticker would never come due whatever
+    /// the order.
+    ///
+    /// Multi-threaded, like `main`'s runtime, and for the reason that runtime
+    /// exists. On one thread there is nothing to measure: the drain empties
+    /// the channel with `try_recv` and the loop reaches the next `select!`
+    /// without ever yielding, so the log arm is polled empty however fast the
+    /// producer is. It takes a producer running while the loop draws -- which
+    /// is the real one, since `LogSupervisor` streams from its own task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flood_of_logs_does_not_stop_the_clock() {
         let mut app = app_with_service("api");
         let backend = ratatui::backend::TestBackend::new(TEST_FRAME.0, TEST_FRAME.1);
         let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
@@ -1960,7 +1989,7 @@ mod tests {
         });
         let stopping = cancel.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(FLOOD).await;
             stopping.cancel();
         });
 
@@ -1979,12 +2008,21 @@ mod tests {
             matches!(exit, Ok(ExitReason::Interrupt)),
             "the flood must not have kept the loop from stopping: {exit:?}"
         );
+        // Two of the ten the second could hold. The reading being ruled out is
+        // a clock that stopped, and the drain's removal gives exactly zero --
+        // so the margin is wanted below, not above. Set at half the ten it was
+        // flaky under a loaded machine, which is the wrong thing to be
+        // sensitive to: this test shares a runtime with the rest of the suite,
+        // and external load slows the flood and the ticker alike. Two is
+        // reached by a loop managing two iterations in a second.
+        //
         // The tick is what advances the throbber and the uptimes and paces the
-        // auto-exit countdown, so a starved ticker is a frozen bar for as long
-        // as the service keeps talking.
+        // auto-exit countdown, so a clock stopped here is a bar frozen for as
+        // long as the service keeps talking.
+        let ticks = app.throbber() - before;
         assert!(
-            app.throbber() > before,
-            "the ticker never got a turn across half a second of logs"
+            ticks >= 2,
+            "the clock all but stopped under the flood: {ticks} ticks"
         );
     }
 

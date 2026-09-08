@@ -203,10 +203,15 @@ you to different places:
 - `Docker daemon not answering - retrying` — the request was taken and never
   came back. Docker is running; it's wedged, and restarting composemux won't
   help.
-- `Docker daemon rejected the request - retrying` — Docker answered, with an
-  error. It's running and reachable, and the usual cause is that your user
-  can't open the socket. Run with `COMPOSEMUX_DEBUG=1` and the actual error is
-  written to `composemux.log` in your temp directory.
+- `Docker daemon rejected the request - retrying` — the request was refused
+  rather than lost: Docker answered with an error of its own, or the socket
+  wouldn't let composemux open it. Starting Docker is the one remedy this
+  rules out. Run with `COMPOSEMUX_DEBUG=1` and the actual error is written to
+  `composemux.log` in your temp directory.
+
+  Being unable to open the socket usually stops you before this, at startup,
+  with the error printed rather than a note in the bar — this is the note for
+  a daemon that starts refusing while composemux is already running.
 
 Statuses and logs stay at their last known values until it answers again, at
 which point the note clears on its own. It takes a short run of failed polls to
