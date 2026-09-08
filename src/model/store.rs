@@ -172,14 +172,18 @@ impl LogStore {
     /// the break is written into the stream, so the dead container's tail stays
     /// on screen as its own line and the replacement starts on the next one.
     ///
-    /// With one exception, which is the emulator's and not this method's. A
-    /// container that dies part way through an escape sequence leaves the
-    /// parser mid-sequence, and the break is then consumed as a byte of that
-    /// sequence rather than executed -- inside an unterminated OSC it takes the
-    /// replacement's first line with it. Ending the row is not enough to fix
-    /// that and this deliberately does not try; #72 has the measurements. It is
-    /// not something the break introduced either: those bytes are swallowed the
-    /// same way with no recreate involved.
+    /// With one exception, which is the emulator's and not this method's, and
+    /// which is narrower than "died mid-escape-sequence". A container that dies
+    /// inside a *string* sequence -- OSC, DCS, APC, PM -- leaves the parser in
+    /// a state that ignores C0 controls rather than executing them, so the
+    /// break is swallowed and takes the replacement's first line with it.
+    /// Mid-CSI and mid-ESC are not that case, and they are the common one,
+    /// since every SGR colour run is a CSI: there the break is executed and the
+    /// row does end, and the sequence goes on to consume the replacement's
+    /// first byte as its final. Neither is something the break introduced --
+    /// those bytes go the same way with no recreate involved -- and ending the
+    /// row is not enough to fix either, so this deliberately does not try. #72
+    /// has the measurements.
     ///
     /// Fed through [`LogStore::process`] rather than to the parser directly, so
     /// the break is recorded in `raw` as well as on the grid. Anything else
@@ -199,10 +203,12 @@ impl LogStore {
     /// trimming only ever cuts from the front -- so the last byte of `raw` is
     /// the last byte the store received, and "has anything arrived since the
     /// last newline" is the same question `LineAssembler` asks of `partial`.
-    /// Not the identical predicate: `push` empties `partial` at `MAX_PARTIAL`
-    /// with no newline in sight, so an unterminated run past a megabyte leaves
-    /// the fallback holding nothing while this still sees a row. Nothing turns
-    /// on the difference -- both are asking whether a line was left open.
+    /// Not the identical predicate: `push` cuts `partial` at `MAX_PARTIAL` with
+    /// no newline in sight, so an unterminated run that lands on an exact
+    /// multiple of the cap can leave the fallback holding nothing while this
+    /// still sees a row. Only an exact multiple -- a run of any other length
+    /// leaves the remainder in `partial` and the two agree. Nothing turns on
+    /// the difference either way: both are asking whether a line was left open.
     ///
     /// An empty `raw` is a store nothing has been written to, which has no row
     /// to end and must not be given a blank one. `raw` cannot empty any other
@@ -1814,11 +1820,20 @@ mod tests {
     /// replay will find it.
     ///
     /// The held row ends on a carriage return, which is the case that
-    /// discriminates: `pending_cr` is set, so the stream needs the `\n` alone.
-    /// A break that supplied its own `\r` would put one in `raw` that no
-    /// container wrote, and one that bypassed the normalisation altogether
-    /// would leave the carry set -- which the last write here catches, because
-    /// a chunk opening on a newline is exactly what a stale carry swallows.
+    /// discriminates: `pending_cr` is set, so the stream needs the `\n` alone
+    /// and a break supplying its own `\r` would put one in `raw` that no
+    /// container sent.
+    ///
+    /// The carry the break leaves behind is checked directly rather than
+    /// through its effects, because here it has none to check. A break that
+    /// bypassed the normalisation would leave the carry set, and a stale carry
+    /// suppresses the `\r` in front of the next chunk's opening newline -- but
+    /// the break has just put the cursor at column 0, so a bare line feed and a
+    /// carriage-return-plus-line-feed land in the same place and the rows come
+    /// out identical. The damage a stale carry does is an indent, and an indent
+    /// needs a cursor that is somewhere else. So the flag is asserted, and the
+    /// write that follows is asserted on the retained bytes, where the missing
+    /// `\r` does show and where a replay would eventually find it.
     #[test]
     fn the_break_is_the_stream_s_own_newline() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
@@ -1839,9 +1854,8 @@ mod tests {
 
         s.process(b"\nlistening on 8080\n");
         assert_eq!(
-            non_empty(&s),
-            vec!["downloading 50%", "listening on 8080"],
-            "a stale carry swallowed the newline opening the next chunk"
+            s.raw, b"downloading 50%\r\n\r\nlistening on 8080\r\n",
+            "the carry the break left behind ate the next chunk's carriage return"
         );
     }
 
