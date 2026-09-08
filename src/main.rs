@@ -1488,7 +1488,11 @@ mod tests {
     ///
     /// Driven through the loop rather than through `App::ingest`, because a
     /// store that ends the row correctly is no use if the destructure here
-    /// throws the ID away again. Nothing separates the two events but the ID.
+    /// throws the ID away again. Nothing separates the two events but the ID:
+    /// the attach is held equal deliberately, so that the break under test can
+    /// only have come from the container changing. A recreate does start a new
+    /// attach in practice, but the TUI does not read that field until #68, and
+    /// varying it here would leave the test passing on either signal.
     #[tokio::test(start_paused = true)]
     async fn the_event_loop_carries_the_container_id_into_the_buffer() {
         let mut app = app_with_service("api");
@@ -1496,6 +1500,7 @@ mod tests {
             service: "api".into(),
             replica: 1,
             container: container.into(),
+            attach: 1,
             bytes: bytes.to_vec(),
         };
         drive_event_loop(
