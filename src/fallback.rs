@@ -70,6 +70,20 @@ const _: () = assert!(MAX_CHUNK_BYTES < MAX_PARTIAL);
 /// enough.
 const PRUNE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Where one piece of output was read from: the container, and which attach to
+/// it delivered these bytes.
+///
+/// Two fields because they carry two guarantees, not because both are needed
+/// to answer today's question -- [`LineAssembler::adopt`] sets out which half
+/// does what, and why the redundant one is kept.
+#[derive(Clone, Copy, Debug)]
+struct Origin<'a> {
+    /// ID of the container the bytes were read from.
+    container: &'a str,
+    /// Which attach to that container delivered them.
+    attach: u64,
+}
+
 /// Buffers partial lines so a chunk boundary never splits output mid-line.
 #[derive(Default)]
 struct LineAssembler {
@@ -81,6 +95,11 @@ struct LineAssembler {
     /// container ID -- and would not matter if it could, since there is
     /// nothing held to splice at that point.
     container: String,
+    /// Which attach `partial` was read from.
+    ///
+    /// Zero until the first chunk arrives; the supervisor hands out ids from
+    /// one, so no attach can be mistaken for that starting state.
+    attach: u64,
 }
 
 impl LineAssembler {
@@ -123,33 +142,58 @@ impl LineAssembler {
         lines
     }
 
-    /// Hands the assembler to `container`, returning the tail the previous
-    /// one left behind if this is a different container.
+    /// Hands the assembler to `origin`, returning the tail the previous attach
+    /// left behind if this is a different one.
     ///
     /// The map is keyed on `(service, replica)` because that is what the
-    /// output is labelled with, but compose recreates containers rather than
-    /// restarting them and gives the replacement the same
-    /// `container-number`, so the key outlives the container. A `web-1` that
-    /// stopped mid-line leaves its tail here, and without this the next
-    /// `web-1`'s first chunk is appended to it and the two are printed as one
-    /// line neither container wrote.
+    /// output is labelled with, and the key outlives both the container and
+    /// the attach to it. Two things end up on it that the key cannot separate:
     ///
-    /// The identity travels with the bytes, so the split happens on the
-    /// replacement's very first chunk, without waiting on a listing, a
-    /// topology event or a timer. That is not the more reliable of two
-    /// routes: the reclaim in `prune_assemblers` never reaches a recreate at
-    /// all, because the key stays in the listing right through one.
-    /// [`PRUNE_INTERVAL`] carries the measurement.
+    /// * A recreate. Compose replaces containers rather than restarting them
+    ///   and gives the replacement the same `container-number`, so a `web-1`
+    ///   that stopped mid-line leaves its tail here for the next `web-1`'s
+    ///   first chunk to be appended to -- one line neither container wrote.
+    /// * A reattach. The container's log task ends while it keeps running and
+    ///   the supervisor resumes it from `since = ended_at`, which resolves to
+    ///   the second, so the replay can restart the very entry this is holding
+    ///   a piece of: `GET /one` held, `GET /one 200\n` replayed, printed as
+    ///   `GET /oneGET /one 200`. Same container, so its ID cannot see this at
+    ///   all.
+    ///
+    /// The attach id alone would answer both today: `LogSupervisor::attach`
+    /// takes a fresh id every time it runs, so a new container is always a new
+    /// attach and the id is strictly the finer identity. It is the *container*
+    /// half that could not stand alone -- that is the pre-fix code, and it is
+    /// silent on a reattach. Both are compared so that the recreate guarantee
+    /// does not come to rest on a stamp continuing to move, one line away in
+    /// another module; the pair costs one comparison.
+    ///
+    /// Ending the line makes a reattach cost the whole-line duplicate
+    /// `log_window` already accepts, and the held piece is printed rather than
+    /// dropped, so nothing that was delivered goes unprinted. Where the replay
+    /// does *not* reach back this far -- the held piece's entry predating
+    /// `since` -- the rest of that entry is gone whichever way this goes, and
+    /// the cost is the piece printed as a line of its own instead of being
+    /// joined to output it never belonged to. Either way the fix can only
+    /// print a line more, never a byte fewer.
+    ///
+    /// The identity travels with the bytes, so the split happens on the new
+    /// attach's very first chunk, without waiting on a listing, a topology
+    /// event or a timer. That is not the more reliable of two routes: the
+    /// reclaim in `prune_assemblers` never reaches a recreate at all, because
+    /// the key stays in the listing right through one. [`PRUNE_INTERVAL`]
+    /// carries the measurement.
     ///
     /// Returning the tail rather than printing it keeps this method free of
     /// the prefix column, and the caller emits it immediately before the new
-    /// container's first line -- which is also where it belongs in time.
-    fn adopt(&mut self, container: &str) -> Option<String> {
-        if self.container == container {
+    /// attach's first line -- which is also where it belongs in time.
+    fn adopt(&mut self, origin: Origin<'_>) -> Option<String> {
+        if self.container == origin.container && self.attach == origin.attach {
             return None;
         }
         self.container.clear();
-        self.container.push_str(container);
+        self.container.push_str(origin.container);
+        self.attach = origin.attach;
         self.finish()
     }
 
@@ -219,7 +263,7 @@ fn handle_output(
     prefixes: &mut Prefixes,
     service: String,
     replica: u32,
-    container: &str,
+    origin: Origin<'_>,
     bytes: &[u8],
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -245,12 +289,12 @@ fn handle_output(
     // them is still holding onto the head of the other's next chunk, emitting
     // a line neither of them ever wrote.
     let assembler = assemblers.entry((service, replica)).or_default();
-    // A recreated container lands on the dead one's key, so the entry can be
-    // holding a tail that belongs to a container that no longer exists. It is
-    // printed under the same label, because the label is the same -- it is the
-    // *line* that has to end here rather than run on into the replacement's
-    // first chunk.
-    if let Some(tail) = assembler.adopt(container) {
+    // A recreated container, or a reattach of the same one, lands on the
+    // entry the previous attach was using, so it can be holding a tail that
+    // nothing arriving now belongs to. It is printed under the same label,
+    // because the label is the same -- it is the *line* that has to end here
+    // rather than run on into the next attach's first chunk.
+    if let Some(tail) = assembler.adopt(origin) {
         writeln!(out, "{prefix}{tail}")?;
     }
     for line in assembler.push(bytes) {
@@ -452,12 +496,21 @@ where
                 // but leaving here spins on it for the life of the process.
                 let Some(message) = message else { break };
                 match message {
-                    SourceEvent::Output { service, replica, container, bytes } => handle_output(
+                    SourceEvent::Output {
+                        service,
+                        replica,
+                        container,
+                        attach,
+                        bytes,
+                    } => handle_output(
                         &mut assemblers,
                         &mut prefixes,
                         service,
                         replica,
-                        &container,
+                        Origin {
+                            container: &container,
+                            attach,
+                        },
                         &bytes,
                         out,
                     )?,
@@ -969,6 +1022,13 @@ mod tests {
         prefixes: Prefixes,
         /// Where the prefixed lines land.
         out: Sink,
+        /// The attach in force for each container ID, so repeated calls for
+        /// one container arrive under one attach the way the supervisor
+        /// stamps them, and [`Stream::reattach`] can give one container a
+        /// second.
+        attaches: HashMap<String, u64>,
+        /// The last id handed out, counted the way `AttachIds` counts.
+        last_attach: u64,
     }
 
     impl Stream {
@@ -993,16 +1053,38 @@ mod tests {
         /// containers' output under one `(service, replica)` the way a compose
         /// recreate does.
         fn emit_from(&mut self, container: &str, service: &str, replica: u32, bytes: &[u8]) {
+            let attach = match self.attaches.get(container).copied() {
+                Some(attach) => attach,
+                None => self.open_attach(container),
+            };
             handle_output(
                 &mut self.assemblers,
                 &mut self.prefixes,
                 service.to_string(),
                 replica,
-                container,
+                Origin { container, attach },
                 bytes,
                 &mut self.out,
             )
             .expect("writing to a Vec cannot fail");
+        }
+
+        /// Reattaches to a container that is already streaming, as the
+        /// supervisor does when a log task ends while its container keeps
+        /// running. Everything emitted for it afterwards comes from the new
+        /// attach; nothing about the container changes, because nothing about
+        /// it has.
+        fn reattach(&mut self, container: &str) {
+            self.open_attach(container);
+        }
+
+        /// Starts an attach to `container` and returns its id, counting from
+        /// one so that no id collides with an assembler's starting state.
+        fn open_attach(&mut self, container: &str) -> u64 {
+            self.last_attach += 1;
+            self.attaches
+                .insert(container.to_string(), self.last_attach);
+            self.last_attach
         }
     }
 
@@ -1053,6 +1135,99 @@ mod tests {
 
         assert_eq!(
             s.lines(),
+            vec!["web-1  | Error: shutting", "web-1  | listening on 8080"],
+            "the dead container's tail ran on into its replacement's first line"
+        );
+    }
+
+    /// The same splice with nothing recreated. A container's log task can end
+    /// while the container keeps running -- the log stream dropping, a daemon
+    /// hiccup -- and the next resync reattaches that same container from
+    /// `since = ended_at`. `since` resolves to the second, so the replay can
+    /// begin at or before the entry the assembler is holding a piece of, and
+    /// hand it that entry whole.
+    ///
+    /// Nothing about the container has changed, so its ID cannot separate the
+    /// two; only the attach can. Without it the printed line is
+    /// `web-1  | GET /oneGET /one 200`, which is neither the line the
+    /// container wrote nor the duplicate `log_window` says it accepts.
+    ///
+    /// The held piece is printed rather than dropped, so what the reattach
+    /// costs stays a duplicate: nothing that was delivered goes unprinted.
+    #[test]
+    fn a_reattach_does_not_splice_its_replay_onto_the_held_line() {
+        let mut s = Stream::default();
+
+        s.emit_from("web-1", "web", 1, b"GET /one");
+        s.reattach("web-1");
+        s.emit_from("web-1", "web", 1, b"GET /one 200\n");
+
+        assert_eq!(
+            s.lines(),
+            vec!["web-1  | GET /one", "web-1  | GET /one 200"],
+            "the reattach's replay ran on into the piece the assembler held"
+        );
+    }
+
+    /// A reattach that catches the stream between lines has nothing to hand
+    /// over and must not manufacture a line: an empty `partial` is nothing to
+    /// print, not a blank line. The matched pair is
+    /// [`a_recreate_on_a_line_boundary_prints_nothing_extra`], which is the
+    /// same two whole lines with the identity changing for the other reason.
+    #[test]
+    fn a_reattach_on_a_line_boundary_prints_nothing_extra() {
+        let mut s = Stream::default();
+
+        s.emit_from("web-1", "web", 1, b"GET /one 200\n");
+        s.reattach("web-1");
+        s.emit_from("web-1", "web", 1, b"GET /two 404\n");
+
+        assert_eq!(
+            s.lines(),
+            vec!["web-1  | GET /one 200", "web-1  | GET /two 404"]
+        );
+    }
+
+    /// The container half of `adopt`'s comparison, on its own.
+    ///
+    /// The supervisor cannot emit this pair: it takes a fresh id for every
+    /// attach, so a new container is always a new attach. Nothing here is a
+    /// case that occurs, and it is deliberately written against
+    /// [`handle_output`] rather than [`Stream`], which models the supervisor
+    /// and will not hand two containers one id.
+    ///
+    /// What it pins is what the recreate guarantee is worth if the stamp ever
+    /// stops moving -- the reason the comparison keeps a half it does not need
+    /// today. Its counterpart is
+    /// [`a_reattach_does_not_splice_its_replay_onto_the_held_line`], which is
+    /// the half that cannot be dropped.
+    #[test]
+    fn a_recreate_is_still_split_when_the_attach_stamp_does_not_move() {
+        let mut assemblers = HashMap::new();
+        let mut prefixes = Prefixes::default();
+        let mut out = Sink::default();
+
+        for (container, bytes) in [
+            ("web-1-first", b"Error: shutting".as_slice()),
+            ("web-1-second", b"listening on 8080\n".as_slice()),
+        ] {
+            handle_output(
+                &mut assemblers,
+                &mut prefixes,
+                "web".to_string(),
+                1,
+                Origin {
+                    container,
+                    attach: 1,
+                },
+                bytes,
+                &mut out,
+            )
+            .expect("writing to a Vec cannot fail");
+        }
+
+        assert_eq!(
+            out.lines(),
             vec!["web-1  | Error: shutting", "web-1  | listening on 8080"],
             "the dead container's tail ran on into its replacement's first line"
         );
@@ -1199,7 +1374,10 @@ mod tests {
             &mut Prefixes::default(),
             "api".to_string(),
             1,
-            "api-1",
+            Origin {
+                container: "api-1",
+                attach: 1,
+            },
             b"a line\n",
             &mut Closed,
         )
@@ -1239,7 +1417,10 @@ mod tests {
             &mut Prefixes::default(),
             "api".to_string(),
             1,
-            "api-1",
+            Origin {
+                container: "api-1",
+                attach: 1,
+            },
             b"a line\n",
             &mut out,
         )
@@ -1265,6 +1446,7 @@ mod tests {
             service: "web".to_string(),
             replica: 2,
             container: "web-2".to_string(),
+            attach: 1,
             bytes: b"served\n".to_vec(),
         })
         .await
@@ -1325,6 +1507,7 @@ mod tests {
             service: "api".to_string(),
             replica: 1,
             container: "api-1".to_string(),
+            attach: 1,
             bytes: b"a line\n".to_vec(),
         })
         .await
@@ -1352,6 +1535,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1391,6 +1575,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1449,6 +1634,7 @@ mod tests {
                     service: service.to_string(),
                     replica,
                     container: format!("{service}-{replica}"),
+                    attach: 1,
                     bytes: byte.as_bytes().to_vec(),
                 })
                 .await
@@ -1502,6 +1688,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"held".to_vec(),
         })
         .await
@@ -1511,6 +1698,7 @@ mod tests {
             service: "api".to_string(),
             replica: 1,
             container: "api-1".to_string(),
+            attach: 1,
             bytes: b"a line\n".to_vec(),
         })
         .await
@@ -1658,6 +1846,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -1669,6 +1858,7 @@ mod tests {
             service: "api".to_string(),
             replica: 1,
             container: "api-1".to_string(),
+            attach: 1,
             bytes: b"still here\n".to_vec(),
         })
         .await
@@ -1707,6 +1897,11 @@ mod tests {
     ///
     /// The listing is asserted on as well, so the test fails rather than
     /// quietly passing for the wrong reason if the reclaim stops running here.
+    ///
+    /// The replacement arrives under a new attach, because the supervisor
+    /// attaches it and never reuses an id. That is the identity the split
+    /// reads: the container ID changes here too, but it is not what is
+    /// compared -- see [`LineAssembler::adopt`].
     #[tokio::test]
     async fn a_recreate_the_reclaim_cannot_see_still_splits_the_line() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -1714,6 +1909,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1-first".to_string(),
+            attach: 1,
             bytes: b"Error: shutting".to_vec(),
         })
         .await
@@ -1725,6 +1921,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1-second".to_string(),
+            attach: 2,
             bytes: b"listening on 8080\n".to_vec(),
         })
         .await
@@ -1756,11 +1953,66 @@ mod tests {
         );
     }
 
+    /// #57 through the loop rather than through `handle_output` alone. The
+    /// two are separated by one field name -- `run` unpacks the stamp from the
+    /// event and hands it on -- and a loop that dropped it on the way past
+    /// leaves every other test here green, because they all stream under one
+    /// attach.
+    ///
+    /// Nothing about the container changes across the two events, which is the
+    /// point: the container ID is the same string on both, so only the stamp
+    /// can end the held line.
+    #[tokio::test]
+    async fn a_reattach_arriving_through_the_loop_still_ends_the_held_line() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            container: "web-1".to_string(),
+            attach: 1,
+            bytes: b"GET /one".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        // The log task ended and the next resync reattached the same
+        // container, which replays from `since = ended_at` -- the entry the
+        // assembler is holding a piece of, from the start.
+        tx.send(SourceEvent::Output {
+            service: "web".to_string(),
+            replica: 1,
+            container: "web-1".to_string(),
+            attach: 2,
+            bytes: b"GET /one 200\n".to_vec(),
+        })
+        .await
+        .expect("the receiver is alive");
+        drop(tx);
+
+        let listings = Listings::live(&[("web", 1)]);
+        let mut out = Sink::default();
+        let cancel = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_events(&mut rx, &cancel, || listings.list(), &mut out),
+        )
+        .await
+        .expect("the loop did not stop when the last sender was dropped")
+        .expect("writing to a Vec cannot fail");
+
+        assert_eq!(
+            out.lines(),
+            vec!["web-1  | GET /one", "web-1  | GET /one 200"],
+            "a reattach arriving through the loop did not end the held line"
+        );
+    }
+
     /// A recreate whose replacement is itself still mid-line when the run
     /// ends, so the two tails leave by different doors: the dead container's
     /// on the replacement's first chunk, the replacement's own on the shutdown
     /// drain. Nothing else pins the pair together, and before this they were
     /// one line printed once, at shutdown.
+    ///
+    /// The replacement is a new attach, as one is on the real path.
     #[tokio::test]
     async fn a_recreate_before_the_drain_leaves_two_tails_rather_than_one() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -1768,6 +2020,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1-first".to_string(),
+            attach: 1,
             bytes: b"old tail".to_vec(),
         })
         .await
@@ -1776,6 +2029,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1-second".to_string(),
+            attach: 2,
             bytes: b"new tail".to_vec(),
         })
         .await
@@ -1809,6 +2063,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"half a".to_vec(),
         })
         .await
@@ -1820,6 +2075,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b" line\n".to_vec(),
         })
         .await
@@ -1874,6 +2130,7 @@ mod tests {
             service: "api".to_string(),
             replica: 1,
             container: "api-1".to_string(),
+            attach: 1,
             bytes: b"seed\n".to_vec(),
         })
         .await
@@ -1889,6 +2146,7 @@ mod tests {
             service: "api".to_string(),
             replica: 1,
             container: "api-1".to_string(),
+            attach: 1,
             bytes: b"marker\n".to_vec(),
         })
         .await
@@ -1973,6 +2231,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -2052,6 +2311,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -2094,6 +2354,7 @@ mod tests {
             service: "gateway".to_string(),
             replica: 12,
             container: "gateway-12".to_string(),
+            attach: 1,
             bytes: b"boot".to_vec(),
         })
         .await
@@ -2102,6 +2363,7 @@ mod tests {
             service: "db".to_string(),
             replica: 1,
             container: "db-1".to_string(),
+            attach: 1,
             bytes: b"ready\n".to_vec(),
         })
         .await
@@ -2110,6 +2372,7 @@ mod tests {
             service: "db".to_string(),
             replica: 1,
             container: "db-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -2149,6 +2412,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -2179,6 +2443,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"Error: exiting".to_vec(),
         })
         .await
@@ -2192,6 +2457,7 @@ mod tests {
             service: "api".to_string(),
             replica: 1,
             container: "api-1".to_string(),
+            attach: 1,
             bytes: b"still here\n".to_vec(),
         })
         .await
@@ -2245,6 +2511,7 @@ mod tests {
             service: "web".to_string(),
             replica: 1,
             container: "web-1".to_string(),
+            attach: 1,
             bytes: b"held".to_vec(),
         })
         .await
@@ -2300,6 +2567,7 @@ mod tests {
                 service: "web".to_string(),
                 replica: 1,
                 container: "web-1".to_string(),
+                attach: 1,
                 bytes,
             })
             .await
