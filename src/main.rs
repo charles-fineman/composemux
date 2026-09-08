@@ -2141,6 +2141,7 @@ mod tests {
                     service: "api".into(),
                     replica: 1,
                     container: "api-1".into(),
+                    attach: 1,
                     bytes: b"chatter\r\n".to_vec(),
                 };
                 if log_tx.send(event).await.is_err() {
