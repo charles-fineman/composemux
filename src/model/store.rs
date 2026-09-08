@@ -2710,7 +2710,7 @@ mod tests {
         s.process(&blob);
         assert!(
             s.raw.starts_with(b"\x1b[r\x1b8"),
-            "the trim did not land inside the handover, so nothing is under test"
+            "the cut did not orphan a cursor restore, so nothing is under test"
         );
 
         let tail = s.raw.clone();
