@@ -1873,6 +1873,103 @@ mod tests {
         );
     }
 
+    /// The byte ceiling can bind while a store is off screen, and `trim_point`
+    /// then takes its second path: cut back to the ceiling, preferring a line
+    /// boundary. Released, the reopen's replay is the only parse those bytes
+    /// will ever get, so what that cut leaves is exactly what the pane comes
+    /// back showing.
+    ///
+    /// The two limits had not been tested together.
+    /// `under_the_byte_ceiling_a_release_costs_history_a_reopen_used_to_keep`
+    /// crosses the ceiling *before* the release, and the released-store tests
+    /// exercise only the line budget.
+    ///
+    /// Carriage-return padding, and one write rather than six hundred, for the
+    /// reasons that test spells out: each `\r` costs a byte and no row, and
+    /// past the ceiling every write rescans the whole buffer for its trim
+    /// point.
+    #[test]
+    fn crossing_the_byte_ceiling_while_released_reopens_on_the_newest_content() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        s.process(b"before the release\r\n");
+        s.release();
+
+        let padding = "\r".repeat(15_000);
+        let mut payload = Vec::new();
+        for i in 0..600 {
+            payload.extend_from_slice(format!("line {i}{padding}\r\n").as_bytes());
+        }
+        s.process(&payload);
+
+        // The premise: the *byte* ceiling is what trimmed, not the line budget.
+        // Fewer lines retained than the budget allows is what proves it.
+        assert!(
+            s.lines < s.keep_lines,
+            "the byte ceiling never bound: {} lines against a budget of {}",
+            s.lines,
+            s.keep_lines
+        );
+        assert!(
+            s.raw.len() <= MAX_RAW_BYTES,
+            "retained {} bytes against a {MAX_RAW_BYTES} byte ceiling",
+            s.raw.len()
+        );
+        // And it took the line boundary the second path prefers rather than
+        // cutting flat at the ceiling. Nothing else covers that: the boundary
+        // assertion in `the_retained_buffer_is_bounded_and_cut_at_a_line_boundary`
+        // is reached through `trim_point`'s *first* path, where the line budget
+        // is what cuts.
+        assert!(
+            s.raw.starts_with(b"line "),
+            "the ceiling cut ignored the line boundary on offer: {:?}",
+            String::from_utf8_lossy(&s.raw[..20.min(s.raw.len())])
+        );
+
+        s.resize(10, 40);
+        let visible = non_empty(&s);
+        assert!(
+            visible.iter().any(|l| l == "line 599"),
+            "the newest line did not come back: {visible:?}"
+        );
+    }
+
+    /// A ceiling cut that would take the whole buffer with it.
+    ///
+    /// `trim_point` prefers a line boundary at or after the ceiling, and the
+    /// only boundary on offer can be the buffer's last byte -- output with no
+    /// newline for eight megabytes and then one at the very end. Taking it
+    /// would leave `raw` empty with `has_output` set. For a store on screen
+    /// that costs history but nothing visible: `resize` keeps the grid it has,
+    /// which still holds the output. Released, there is no such grid -- the
+    /// placeholder is empty and the replay is all there is -- so the pane comes
+    /// back blank, and `resize`'s own assertion says so. The `filter` rejecting
+    /// that cut is what this covers.
+    ///
+    /// Padded with `\r` rather than with printable bytes so the replay is eight
+    /// megabytes of column-zero returns rather than two hundred thousand rows
+    /// of scrolling.
+    #[test]
+    fn a_ceiling_cut_at_the_very_end_does_not_empty_a_released_buffer() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        s.process(b"before the release\r\n");
+        s.release();
+
+        let mut payload = vec![b'\r'; MAX_RAW_BYTES];
+        payload.extend_from_slice(b"tail line\r\n");
+        s.process(&payload);
+
+        assert!(!s.raw.is_empty(), "the ceiling cut took the whole buffer");
+
+        s.resize(10, 40);
+        assert_eq!(
+            non_empty(&s),
+            vec!["tail line".to_string()],
+            "the newest line did not come back"
+        );
+    }
+
     /// A store with output it cannot reproduce must keep the grid it has.
     ///
     /// No public sequence reaches this: `trim_point` never cuts the whole
