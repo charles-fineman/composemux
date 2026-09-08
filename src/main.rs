@@ -592,7 +592,7 @@ where
         // inherited cannot be biased as it stands. `log_rx` sat above the poll
         // and the tick, and it is the one arm with no ceiling on how often it
         // can be ready: the drain below bounds a frame's work at
-        // `MAX_DRAIN_PER_FRAME`, but the channel behind it is `4096`, eight
+        // `MAX_DRAIN_PER_FRAME`, 512, but `LOG_CHANNEL` behind it is eight
         // times that, so a backlog past the bound leaves this arm ready at
         // every poll and nothing below it is ever reached. Measured against a
         // service flooding a production-depth channel for a second, ticks out
