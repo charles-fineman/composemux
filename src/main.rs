@@ -577,6 +577,12 @@ fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>
             // different mechanism in `LogStore`; #60 tracks it, and the field
             // ignored here is the identity that fix would read.
             container: _,
+            // Ignored for the same reason, and the same row is the reason.
+            // A reattach of one container replays at `since`'s one-second
+            // resolution, so it can restart the entry the cursor is part way
+            // along and continue that row with it; #68 tracks it, on top of
+            // #60's mechanism for ending a row.
+            attach: _,
             bytes,
         } => app.ingest(ServiceKey::new(service, replica), &bytes),
         SourceEvent::Topology => refresh.notify_one(),
@@ -714,6 +720,7 @@ mod tests {
                 service: "api".into(),
                 replica: 1,
                 container: "api-1".into(),
+                attach: 1,
                 bytes: b"hello\r\n".to_vec(),
             },
             &refresh,
@@ -1462,6 +1469,7 @@ mod tests {
                 service: "api".into(),
                 replica: 1,
                 container: "api-1".into(),
+                attach: 1,
                 bytes: b"hello from the loop\r\n".to_vec(),
             }],
             Vec::new(),
@@ -1528,6 +1536,7 @@ mod tests {
                 service: "api".into(),
                 replica: 1,
                 container: "api-1".into(),
+                attach: 1,
                 bytes: format!("{line}\r\n").into_bytes(),
             }],
             Vec::new(),
