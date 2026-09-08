@@ -301,6 +301,10 @@ fn spawn_refresher<S: ServiceSource>(
 /// Generic over [`ServiceSource`] for the same reason: the two cases worth
 /// pinning here are a daemon that fails and one that never answers, and
 /// neither can be asked of a real daemon.
+///
+/// Returns once `cancel` fires, whatever it is waiting on at the time. A
+/// caller that supplies its own channel gets that without also having to drop
+/// the receiver to stop the loop.
 async fn refresh_loop<S: ServiceSource>(
     source: Arc<S>,
     project: String,
@@ -363,8 +367,25 @@ async fn refresh_loop<S: ServiceSource>(
             }
         };
         if let Some(poll) = poll_outcome(outcome, &mut health) {
-            if tx.send(poll).await.is_err() {
-                return;
+            // Every other await in this loop watches `cancel`; this one has to
+            // as well. A send that waits on a full channel is a place nothing
+            // polls the token, which is the hole `forward_frame` had and closed
+            // the same way. The only reader in the shipped wiring is the event
+            // loop, which returns on this same token, so a poll delivered after
+            // it is set changes nothing that outlives the shutdown.
+            tokio::select! {
+                // Biased so a token that is already cancelled wins
+                // deterministically rather than depending on whether the
+                // channel happens to have room. Dropping the poll is the right
+                // outcome for the same reason, and is what
+                // `a_cancelled_refresher_drops_the_poll_in_hand` pins.
+                biased;
+                () = cancel.cancelled() => return,
+                sent = tx.send(poll) => {
+                    if sent.is_err() {
+                        return;
+                    }
+                }
             }
         }
         if !request_finished {
@@ -1049,6 +1070,122 @@ mod tests {
             between < REFRESH,
             "a topology event must not wait out the whole refresh period: {between:?}"
         );
+    }
+
+    /// A poll that fills the channel must not pin the refresher once the app
+    /// has been asked to stop.
+    ///
+    /// The same shape `forward_frame` had: a send is an await like any other,
+    /// and unwrapped it is the one place left in this loop where a set token
+    /// goes unnoticed. The live impact is bounded -- `run_tui` drops the
+    /// receiver on its way out, which unblocks the send -- but the loop is
+    /// injectable now, and its contract is that `cancel` ends it, not that
+    /// whoever holds the other end drops it in time.
+    ///
+    /// Paused, unlike the test it mirrors, because this loop has 500ms, 2s and
+    /// 10s timers in it and real time would make it slow and load-sensitive.
+    /// That changes what a timeout here proves, which is why the two below say
+    /// what they are actually for.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_refresher_stops_waiting_on_a_full_channel() {
+        // Capacity one, and already full, so the refresher's first send blocks.
+        let (tx, _rx) = mpsc::channel::<Poll>(1);
+        tx.send(Poll::Services(Vec::new())).await.unwrap();
+        // The premise, asserted rather than assumed: with room to spare the
+        // send would simply succeed and the test would pass on nothing.
+        assert_eq!(
+            tx.capacity(),
+            0,
+            "the channel has to be full to mean anything"
+        );
+
+        let cancel = CancellationToken::new();
+        let refreshing = refresh_loop(
+            FakeDaemon::new(Behaviour::Answers(vec![service("api")])),
+            "demo".to_string(),
+            Config::default(),
+            tx,
+            Arc::new(Notify::new()),
+            cancel.clone(),
+        );
+        tokio::pin!(refreshing);
+
+        // Only that the loop is still running when the cancel lands -- it
+        // would also expire on one of the rests. What says the wait is at the
+        // send is the full channel above with nothing draining it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut refreshing)
+                .await
+                .is_err(),
+            "the refresher should still be waiting, not already returned"
+        );
+
+        let at_cancel = tokio::time::Instant::now();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), refreshing)
+            .await
+            .expect("cancelling must release the refresher, not wait for a reader");
+        // The clock is paused, so it moves only while every task is idle.
+        // Finishing without it moving is what rules out the loop leaving by
+        // some other route that waits first -- a bare `timeout` would pass on
+        // any escape at all, including one that never reads the token.
+        assert_eq!(
+            tokio::time::Instant::now(),
+            at_cancel,
+            "the token must be what releases the send, not a timer it outlived"
+        );
+    }
+
+    /// The `biased` on that send, which the test above cannot pin: with the
+    /// channel full the send branch is pending either way, so the token wins
+    /// with or without it.
+    ///
+    /// Here both arms are ready at the same poll -- the receive frees the
+    /// permit the send is parked on and wakes it, and nothing is awaited
+    /// between that and the cancel -- so an unbiased select picks at random.
+    /// Correct code passes every round; it is the broken one that only shows
+    /// up about half the time, which is what the rounds are for. Twenty of
+    /// them leave roughly one chance in a million of missing it, at no
+    /// measurable cost under a paused clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_refresher_drops_the_poll_in_hand() {
+        for round in 0..20 {
+            let (tx, mut rx) = mpsc::channel::<Poll>(1);
+            tx.send(Poll::Services(Vec::new())).await.unwrap();
+
+            let cancel = CancellationToken::new();
+            let refreshing = refresh_loop(
+                FakeDaemon::new(Behaviour::Answers(vec![service("api")])),
+                "demo".to_string(),
+                Config::default(),
+                tx,
+                Arc::new(Notify::new()),
+                cancel.clone(),
+            );
+            tokio::pin!(refreshing);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut refreshing)
+                    .await
+                    .is_err(),
+                "round {round}: the refresher should still be waiting"
+            );
+
+            // The loop is a future this task polls, not a task of its own, so
+            // neither of these lets it run: it next sees a freed permit and a
+            // set token together.
+            rx.recv().await.expect("the filler this test queued");
+            cancel.cancel();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), refreshing)
+                    .await
+                    .is_ok(),
+                "round {round}: cancelling must release the refresher"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "round {round}: a cancelled refresher delivered the poll it held"
+            );
+        }
     }
 
     /// `POLL_TIMEOUT`'s doc argues for ten seconds from measurements, the same
