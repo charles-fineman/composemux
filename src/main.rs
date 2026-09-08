@@ -717,32 +717,27 @@ fn apply_poll(app: &mut App, poll: Poll) -> bool {
 /// Folds one event from the docker layer into the app.
 fn apply_source_event(app: &mut App, message: SourceEvent, refresh: &Arc<Notify>) {
     match message {
+        // The ID does not pick the buffer -- that stays keyed on
+        // `(service, replica)`, which is what lets a pane keep its history when
+        // compose recreates the container behind it, and is why #46 turned down
+        // keying it on the ID. It is passed alongside the key so the store can
+        // see that the container writing to it has changed and end the row the
+        // dead one left part way along, rather than let the replacement's first
+        // chunk continue it.
         SourceEvent::Output {
             service,
             replica,
-            // Ignored on purpose. A pane's buffer is keyed on
-            // `(service, replica)` and is meant to outlive the container: that
-            // shared buffer is what lets a pane keep its history when compose
-            // recreates the container behind it. #46 turned down keying it on
-            // the ID, proposed as #36, for exactly that reason -- it would
-            // hand every recreate a fresh empty buffer and discard the history
-            // that surviving a recreate is the point of.
-            //
-            // Which is not to say this path is free of #50. It holds a partial
-            // line too, as a row its emulator's cursor is part way along
-            // rather than as a byte buffer, and a recreate splices into it the
-            // same way. Ending that row without discarding the buffer is a
-            // different mechanism in `LogStore`; #60 tracks it, and the field
-            // ignored here is the identity that fix would read.
-            container: _,
-            // Ignored for the same reason, and the same row is the reason.
+            container,
+            // Still ignored, and now the only half of the identity that is.
             // A reattach of one container replays at `since`'s one-second
             // resolution, so it can restart the entry the cursor is part way
-            // along and continue that row with it; #68 tracks it, on top of
-            // #60's mechanism for ending a row.
+            // along and continue that row with it. The container has not
+            // changed, so the break below does not fire on it; #68 tracks
+            // that, and would read this field into the mechanism `LogStore`
+            // now has rather than build a second one beside it.
             attach: _,
             bytes,
-        } => app.ingest(ServiceKey::new(service, replica), &bytes),
+        } => app.ingest(ServiceKey::new(service, replica), &container, &bytes),
         SourceEvent::Topology => refresh.notify_one(),
     }
 }
@@ -1940,6 +1935,54 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("hello from the loop")),
             "the log event never reached the buffer"
+        );
+    }
+
+    /// The container ID has to reach the buffer, not just the event. It is the
+    /// one part of the identity a compose recreate changes, and
+    /// `apply_source_event` dropped it on the floor until #60 -- so a
+    /// replacement's first chunk continued the row the dead container left part
+    /// way along, and the pane showed a line neither of them wrote.
+    ///
+    /// Driven through the loop rather than through `App::ingest`, because a
+    /// store that ends the row correctly is no use if the destructure here
+    /// throws the ID away again. Nothing separates the two events but the ID:
+    /// the attach is held equal deliberately, so that the break under test can
+    /// only have come from the container changing. A recreate does start a new
+    /// attach in practice, but the TUI does not read that field until #68, and
+    /// varying it here would leave the test passing on either signal.
+    #[tokio::test(start_paused = true)]
+    async fn the_event_loop_carries_the_container_id_into_the_buffer() {
+        let mut app = app_with_service("api");
+        let output = |container: &str, bytes: &[u8]| SourceEvent::Output {
+            service: "api".into(),
+            replica: 1,
+            container: container.into(),
+            attach: 1,
+            bytes: bytes.to_vec(),
+        };
+        drive_event_loop(
+            &mut app,
+            Vec::new(),
+            vec![
+                output("api-1-first", b"Error: shutting"),
+                output("api-1-second", b"listening on 8080\r\n"),
+            ],
+            Vec::new(),
+        )
+        .await;
+
+        let store = app.store(&ServiceKey::new("api", 1)).expect("a buffer");
+        let lines: Vec<String> = store
+            .visible_lines()
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["Error: shutting", "listening on 8080"],
+            "the recreated container's first chunk continued the dead one's row"
         );
     }
 
