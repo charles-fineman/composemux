@@ -294,7 +294,8 @@ impl LogStore {
     ///
     /// A row is not all that carries over, though, which is what #72 is about:
     /// the emulator's parse state, its pen and its screen selection are the
-    /// dead container's too, and none of them is undone by ending a row.
+    /// dead container's too, and none of them is undone by ending a row -- nor
+    /// is its scroll region, which #75 split out and then fixed.
     /// [`HANDOVER`] is what resets them and carries the reasoning for each
     /// sequence in it. It goes in ahead of the break rather than after it,
     /// because a container that died inside an OSC, DCS, APC or PM string
@@ -1976,11 +1977,11 @@ mod tests {
     ///
     /// Since #72 that is not only a question of what the break writes but of
     /// what the handover before it leaves behind. `process` re-derives the
-    /// carry from every write, and [`HANDOVER`] ends on an `m`, so without
-    /// `adopt` putting the carry back the break would find the flag clear and
-    /// supply the `\r` itself. `HANDOVER` is spliced into the expectation
-    /// rather than spelled out, because what this test is about is the byte
-    /// either side of it.
+    /// carry from every write, and [`HANDOVER`] ends on the `8` of a cursor
+    /// restore rather than a carriage return, so without `adopt` putting the
+    /// carry back the break would find the flag clear and supply the `\r`
+    /// itself. `HANDOVER` is spliced into the expectation rather than spelled
+    /// out, because what this test is about is the byte either side of it.
     ///
     /// The carry the break leaves behind is checked directly rather than
     /// through its effects, because here it has none to check. A break that
