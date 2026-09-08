@@ -181,8 +181,13 @@ impl LogStore {
     /// writes, and is not limited to its first line.
     /// Mid-CSI and mid-ESC are not that case, and they are the common one,
     /// since every SGR colour run is a CSI: there the break is executed and the
-    /// row does end, and the sequence goes on to consume the replacement's
-    /// first byte as its final. Neither is something the break introduced --
+    /// row does end. What follows it still goes, though, and mid-CSI goes by
+    /// more than a byte. An ESC eats exactly one. A CSI in parameter state eats
+    /// until a byte lands in `0x40..=0x7E`, absorbing digits and separators as
+    /// parameters on the way and executing C0 controls without ending -- so it
+    /// runs straight through newlines. A timestamped first line loses its whole
+    /// date prefix rather than one character, and a line of digits can carry it
+    /// into the line after. Neither case is something the break introduced --
     /// those bytes go the same way with no recreate involved -- and ending the
     /// row is not enough to fix either, so this deliberately does not try. #72
     /// has the measurements.
@@ -205,12 +210,13 @@ impl LogStore {
     /// trimming only ever cuts from the front -- so the last byte of `raw` is
     /// the last byte the store received, and "has anything arrived since the
     /// last newline" is the same question `LineAssembler` asks of `partial`.
-    /// Not the identical predicate: `push` cuts `partial` at `MAX_PARTIAL` with
-    /// no newline in sight, so an unterminated run that lands on an exact
-    /// multiple of the cap can leave the fallback holding nothing while this
-    /// still sees a row. Only an exact multiple -- a run of any other length
-    /// leaves the remainder in `partial` and the two agree. Nothing turns on
-    /// the difference either way: both are asking whether a line was left open.
+    /// The same question and, having twice been described here as merely a
+    /// similar one, the same answer at every input: `push`'s cap flush runs only
+    /// while strictly more bytes remain than it takes, so it always puts a
+    /// remainder back and never leaves `partial` empty part way along a line.
+    /// What `MAX_PARTIAL` changes is what the fallback *prints* -- a run past
+    /// the cap is emitted in pieces, none of them a line anyone wrote -- not
+    /// whether it believes a line is open.
     ///
     /// An empty `raw` is a store nothing has been written to, which has no row
     /// to end and must not be given a blank one. `raw` cannot empty any other
@@ -1781,12 +1787,15 @@ mod tests {
         );
     }
 
-    /// The break ends a row; it does not insert one. Every other test that
-    /// exercises an actual break reads its rows through `non_empty`, which
-    /// discards exactly the blank a doubled break would leave -- the tests that
-    /// do look at the rows as they sit are the two where no break is emitted at
-    /// all. So on the one path where a break happens, the hazard the boundary
-    /// test names goes unwatched unless it is watched here.
+    /// The break ends a row; it does not insert one. No other test asserts on
+    /// the un-filtered rows after a break: most read them through `non_empty`,
+    /// which discards exactly the blank a doubled break would leave, and the
+    /// two that index the rows directly are the ones where no break is emitted
+    /// at all. `a_recreate_does_not_move_a_scrolled_up_reader` does both --
+    /// unfiltered rows, after a break -- but compares them against a snapshot
+    /// rather than against text, and `vt100` advances the scroll offset by
+    /// however many rows evicted, so a doubled break moves the snapshot with it
+    /// and still compares equal.
     ///
     /// Both halves are needed. The rendered rows catch a blank in the pane; the
     /// newline count catches one that is only in `raw`, which costs a line of
@@ -2048,9 +2057,11 @@ mod tests {
     /// test here runs on a buffer far too small to trim.
     ///
     /// Trimming before the tail arrives is not enough to exercise it, though,
-    /// and an earlier version of this test made that mistake. A trim is
+    /// and an earlier version of this test made that mistake. A trim here is
     /// triggered by the line budget, so a write carrying no newline never
-    /// causes one -- send the lines and the tail separately and every trim has
+    /// causes one at these sizes -- `MAX_RAW_BYTES` is the other trigger and is
+    /// eight megabytes away. Send the lines and the tail separately and every
+    /// trim has
     /// already happened by the time a partial is being held, which is the one
     /// arrangement where nothing can go wrong. The tail has to arrive in the
     /// same write that overruns the budget, so the cut runs with the partial
