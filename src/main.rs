@@ -2006,7 +2006,10 @@ mod tests {
     /// what was given, not merely as a thing that is not the store's starting
     /// zero. Reviewed as an earlier one-write-each version, where an `adopt`
     /// comparing `self.attach == 0` instead of against its argument passed
-    /// this test and was caught only by `LogStore`'s own tests.
+    /// this test. The suite still caught it -- in `LogStore`'s own
+    /// `one_container_s_row_is_still_joined_across_chunks` and in `App`'s
+    /// `replicas_recreated_together_neither_cross_nor_inherit` -- so what was
+    /// wrong was this test's aim, not the net.
     #[tokio::test(start_paused = true)]
     async fn the_event_loop_carries_the_attach_id_into_the_buffer() {
         let mut app = app_with_service("api");

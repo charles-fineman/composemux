@@ -2227,6 +2227,41 @@ mod tests {
         );
     }
 
+    /// `adopt` compares the identity it was handed. It does not assume the ids
+    /// only ever climb, and this is what says so.
+    ///
+    /// Monotonicity is real but it belongs to `AttachIds`, a module away: one
+    /// counter, handed out by `LogSupervisor::attach`, which `resync` calls
+    /// only for a container whose previous task has already reported finished.
+    /// Resting on that would be the mistake `LineAssembler::adopt` explicitly
+    /// refuses on the fallback side -- it compares both halves of the identity
+    /// "so that the recreate guarantee does not come to rest on a stamp
+    /// continuing to move, one line away in another module". This is the same
+    /// refusal on this side, and it costs one test.
+    ///
+    /// No input reaches `LogStore` with a smaller id today: the supervisor and
+    /// the `App` holding the stores are built together in `run_tui` and die
+    /// together, so the counter cannot restart under a store that outlived it.
+    /// That is why this is written as a statement about `adopt`'s contract
+    /// rather than as a reproduction of anything -- an `adopt` comparing `>=`
+    /// passes every other test in the suite.
+    #[test]
+    fn an_attach_id_that_goes_backwards_still_ends_the_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1", 2);
+        s.process(b"GET /one");
+        s.adopt("web-1", 1);
+        s.process(b"GET /one 200\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["GET /one", "GET /one 200"],
+            "the row was held because the new attach id was not larger"
+        );
+    }
+
     /// The row break alone does not undo a half-written escape sequence, which
     /// is #72. A container that stopped after `\x1b[3` leaves vte in CSI
     /// parameter state; C0 controls execute from there without ending the
