@@ -59,7 +59,7 @@ const INITIAL_COLS: u16 = 80;
 /// Written into the retained stream when the store changes hands, ahead of the
 /// row break, to keep the dead container's emulator state off its successor.
 ///
-/// Four sequences, plus one thing that happens before any of them runs.
+/// Five sequences, plus one thing that happens before any of them runs.
 ///
 /// That first thing is the abort, and it is the leading `ESC` rather than a
 /// sequence of its own. `ESC` is an anywhere-transition in vte's state
@@ -135,8 +135,12 @@ const INITIAL_COLS: u16 = 80;
 ///
 /// What `ESC 7` overwrites is a saved cursor the dead container set, which is
 /// as dead as the rest of its state, and what replaces it is at worst
-/// harmless: the position the handover happens at, which is where the
-/// successor is about to write, and a default pen.
+/// harmless. A save is three things here, not one: the position the handover
+/// happens at, which is where the successor is about to write; the default pen
+/// the `CSI m` in front of it has just set; and, because `Grid::save_cursor`
+/// covers it too, the dead container's origin mode -- which is inert while the
+/// region stays full height, `set_pos` having nothing to offset by once
+/// `CSI r` has put `scroll_top` back to 0.
 ///
 /// A trim cannot orphan the restore into something worse. `trim_point`'s line
 /// budget cuts immediately after a `\n` and this carries none, so it takes the
@@ -2614,10 +2618,17 @@ mod tests {
     /// reason the region could not be reset at all; the `ESC 7` and `ESC 8`
     /// around it are what make it affordable.
     ///
-    /// Three rows, because the dead container's output has to be tall enough
-    /// for a homed cursor to land somewhere other than where the restored one
-    /// does. On a single row the two are the same place and the handover
-    /// looks correct either way.
+    /// Three rows is more than this needs, and what it needs is not rows.
+    /// `CSI r` homes to `(scroll_top, 0)`, so the homed cursor and the restored
+    /// one are told apart only where the dead container's row differs from the
+    /// top of its own region. A single `first\n` is enough: the trailing
+    /// newline leaves the cursor on row 1. `first` with no newline is not --
+    /// the cursor is still on row 0, and `adopt`'s own break then moves the
+    /// homed and the restored cursor to row 1 alike, column included, because
+    /// the break carries a `\r`. Measured across one, two and three rows with
+    /// and without the trailing newline: the five shapes that leave the cursor
+    /// off the region's top row all catch a bare `CSI r`, and the one that does
+    /// not, does not. Three rows are kept for reading, not for reach.
     #[test]
     fn resetting_the_scroll_region_does_not_move_the_cursor() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
