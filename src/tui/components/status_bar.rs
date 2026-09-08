@@ -128,15 +128,18 @@ fn context_line(app: &App) -> Line<'static> {
     // is about to close itself. Warning rather than error: the supervisor and
     // the poller both keep retrying, so this is a condition being handled.
     if let Some(outage) = app.daemon_outage() {
-        // Two notes, because they send the user to different places: an
-        // unreachable daemon is one to start, where one that is not answering
-        // has taken the request and gone quiet, and is very likely running.
-        // Calling that one "unreachable" would send the user to check
-        // something that is probably fine.
+        // Three notes, because they send the user to different places: an
+        // unreachable daemon is one to start, one that is not answering has
+        // taken the request and gone quiet and is very likely running, and one
+        // that rejected the request is running and talking to us. Calling
+        // either of the last two "unreachable" would send the user to check
+        // something that is fine. Which error the daemon gave does not fit
+        // here -- the debug log has it, and the README says so.
         return Line::from(Span::styled(
             match outage {
                 Outage::Unreachable => "Docker daemon unreachable - retrying",
                 Outage::NotAnswering => "Docker daemon not answering - retrying",
+                Outage::Rejected => "Docker daemon rejected the request - retrying",
             },
             Style::default().fg(THEME.warning),
         ));
@@ -373,6 +376,28 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("retrying"), "got {text:?}");
+    }
+
+    /// #64: a daemon that answered the request with an error of its own is
+    /// running and talking to us. Both of the other notes would send the user
+    /// to start something already started, and leave them with no next step.
+    #[test]
+    fn a_daemon_that_rejected_the_request_is_named_as_that() {
+        let mut app = app_with(&["a"]);
+        app.set_daemon_outage(Some(Outage::Rejected));
+        let text: String = context_line(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("rejected") && text.contains("retrying"),
+            "got {text:?}"
+        );
+        assert!(
+            !text.contains("unreachable") && !text.contains("not answering"),
+            "the daemon answered, so the bar must not say it did not: {text:?}"
+        );
     }
 
     /// #52: a daemon that accepted the connection and then went quiet is

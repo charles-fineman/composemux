@@ -194,12 +194,34 @@ the finest resolution the Engine API offers here. A couple of already-visible
 lines can reappear as a result. That's the deliberate trade: a duplicated line
 beats a missing one.
 
-If the daemon goes away entirely, composemux keeps retrying rather than
-exiting, and the status bar says `Docker daemon unreachable - retrying` so a
-frozen screen can't be mistaken for a quiet stack. Statuses and logs stay at
-their last known values until it answers again, at which point the note clears
-on its own. It takes a short run of failed polls to appear, so a single dropped
-request never flashes it.
+If the daemon stops answering, composemux keeps retrying rather than exiting,
+and the status bar says so, so a frozen screen can't be mistaken for a quiet
+stack. Which note you get depends on how it's failing, because the three send
+you to different places:
+
+- `Docker daemon unreachable - retrying` — nothing was reached. Start Docker.
+- `Docker daemon not answering - retrying` — the request was taken and never
+  came back. Docker is running; it's wedged, and restarting composemux won't
+  help.
+- `Docker daemon rejected the request - retrying` — the request was refused
+  rather than lost: Docker answered with an error of its own, or the socket
+  wouldn't let composemux open it. Starting Docker is the one remedy this
+  rules out. Run with `COMPOSEMUX_DEBUG=1` and the actual error is written to
+  `composemux.log` in your temp directory.
+
+  Being unable to open the socket usually stops you before this, at startup,
+  with the error printed rather than a note in the bar — this is the note for
+  a daemon that starts refusing while composemux is already running.
+
+Statuses and logs stay at their last known values until it answers again, at
+which point the note clears on its own. It takes a short run of failed polls to
+appear, so a single dropped request never flashes it.
+
+Startup has no status bar to write into, so a daemon that takes the connection
+and goes quiet used to leave you with a blank terminal. After five seconds it
+says on stderr that it's still waiting, and which `DOCKER_HOST` it's waiting
+on, repeating every thirty seconds. It keeps waiting either way: a daemon
+that's still coming up is a normal thing for a wrapper script to race.
 
 Everything then goes through a `vt100` terminal emulator before it reaches the
 screen, which is why colour, cursor movement and progress bars behave rather
