@@ -617,7 +617,14 @@ mod tests {
     /// a send blocks, so nothing there polls the token. Splitting frames made
     /// this worse rather than better: one wait per piece instead of one per
     /// frame.
-    #[tokio::test]
+    ///
+    /// Paused so the clock is an assertion rather than a delay. It only
+    /// advances while every task is idle, so a forward that completes without
+    /// moving it completed because the cancel woke it, and not because
+    /// something it was waiting on came round on a timer the outer bound
+    /// outlives. Waiting on the bound alone cannot tell those apart: it passes
+    /// against a `forward_frame` whose token arm is a plain `sleep`.
+    #[tokio::test(start_paused = true)]
     async fn a_cancelled_container_stops_forwarding_into_a_full_channel() {
         // Capacity one, and already full, so the very first send blocks.
         let (tx, _rx) = mpsc::channel::<SourceEvent>(1);
@@ -631,7 +638,9 @@ mod tests {
         let forwarding = forward_frame(&tx, &container, ATTACH, &frame, &cancel);
         tokio::pin!(forwarding);
 
-        // It is genuinely stuck: nothing drains the channel.
+        // It is genuinely stuck: nothing drains the channel, so this bound has
+        // to expire. Without it the test would pass against a forward that
+        // simply completed its sends.
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut forwarding)
                 .await
@@ -639,12 +648,73 @@ mod tests {
             "the send should be waiting on a full channel"
         );
 
+        let at_cancel = tokio::time::Instant::now();
         cancel.cancel();
         let finished = tokio::time::timeout(Duration::from_secs(5), forwarding).await;
         assert!(
             !finished.expect("cancelling should release the forward"),
             "a cancelled forward reports that it stopped early"
         );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            at_cancel,
+            "time passed between the cancel and the forward returning, so \
+             something other than the token released it"
+        );
+    }
+
+    /// The `biased` in that select, which the test above cannot see: with the
+    /// channel full the send is pending either way, so the token wins with or
+    /// without the keyword. What it buys is that an already-cancelled token
+    /// wins *even when the channel has room* -- the piece in hand is dropped
+    /// rather than delivered to a consumer that is going away.
+    ///
+    /// Both arms are made ready for one poll: draining the filler frees the
+    /// permit and wakes the parked send, and the cancel follows with no
+    /// `await` between them, so nothing polls the select until both are ready.
+    /// An unbiased select then picks at random, which is why this runs rounds
+    /// -- correct code passes every one, and deleting the keyword fails about
+    /// half of them.
+    #[tokio::test(start_paused = true)]
+    async fn an_already_cancelled_forward_drops_the_piece_rather_than_sending_it() {
+        /// Enough that an unbiased select failing half the time is caught with
+        /// certainty for any practical purpose, and cheap because the waits
+        /// are virtual.
+        const ROUNDS: usize = 20;
+
+        for round in 0..ROUNDS {
+            let (tx, mut rx) = mpsc::channel::<SourceEvent>(1);
+            tx.send(filler()).await.unwrap();
+
+            let cancel = CancellationToken::new();
+            let container = desc("a", true);
+            let frame = vec![b'x'; MAX_CHUNK_BYTES + 1];
+            let forwarding = forward_frame(&tx, &container, ATTACH, &frame, &cancel);
+            tokio::pin!(forwarding);
+
+            // Park the send on the full channel, so the permit it is waiting
+            // for is the only thing between it and a completed send.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut forwarding)
+                    .await
+                    .is_err(),
+                "round {round}: the send should be waiting on a full channel"
+            );
+
+            rx.try_recv()
+                .expect("the filler is what filled the channel");
+            cancel.cancel();
+
+            let finished = tokio::time::timeout(Duration::from_secs(5), forwarding).await;
+            assert!(
+                !finished.expect("cancelling should release the forward"),
+                "round {round}: a cancelled forward reports that it stopped early"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "round {round}: a piece was delivered after the cancel"
+            );
+        }
     }
 
     /// The allocation itself, at the one place that does it. A reattach that
