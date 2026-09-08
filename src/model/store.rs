@@ -176,7 +176,9 @@ impl LogStore {
     /// which is narrower than "died mid-escape-sequence". A container that dies
     /// inside a *string* sequence -- OSC, DCS, APC, PM -- leaves the parser in
     /// a state that ignores C0 controls rather than executing them, so the
-    /// break is swallowed and takes the replacement's first line with it.
+    /// break is swallowed and so is everything the replacement writes until
+    /// some byte terminates the sequence -- which may be nothing it ever
+    /// writes, and is not limited to its first line.
     /// Mid-CSI and mid-ESC are not that case, and they are the common one,
     /// since every SGR colour run is a CSI: there the break is executed and the
     /// row does end, and the sequence goes on to consume the replacement's
@@ -1779,11 +1781,12 @@ mod tests {
         );
     }
 
-    /// The break ends a row; it does not insert one. Every other test here
-    /// reads the rows through `non_empty`, which discards exactly the blank a
-    /// doubled break would leave -- so on the one path where a break actually
-    /// happens, the hazard the boundary test names goes unwatched unless it is
-    /// watched here.
+    /// The break ends a row; it does not insert one. Every other test that
+    /// exercises an actual break reads its rows through `non_empty`, which
+    /// discards exactly the blank a doubled break would leave -- the tests that
+    /// do look at the rows as they sit are the two where no break is emitted at
+    /// all. So on the one path where a break happens, the hazard the boundary
+    /// test names goes unwatched unless it is watched here.
     ///
     /// Both halves are needed. The rendered rows catch a blank in the pane; the
     /// newline count catches one that is only in `raw`, which costs a line of
@@ -2044,11 +2047,22 @@ mod tests {
     /// ever cutting from the front. Nothing exercised that: every other recreate
     /// test here runs on a buffer far too small to trim.
     ///
-    /// So the budget is set to one line and forty are sent through it, which
-    /// makes `retain` cut repeatedly before the held tail arrives. If a trim
-    /// ever took bytes from the end, or dropped a partial tail on the way past,
-    /// the predicate would read a byte that is not the last one written and the
-    /// break would go missing.
+    /// Trimming before the tail arrives is not enough to exercise it, though,
+    /// and an earlier version of this test made that mistake. A trim is
+    /// triggered by the line budget, so a write carrying no newline never
+    /// causes one -- send the lines and the tail separately and every trim has
+    /// already happened by the time a partial is being held, which is the one
+    /// arrangement where nothing can go wrong. The tail has to arrive in the
+    /// same write that overruns the budget, so the cut runs with the partial
+    /// already appended to `raw`. That is not a contrivance: a docker frame
+    /// routinely carries several complete lines and then stops part way along
+    /// the next one.
+    ///
+    /// What this then catches is a trim that drops the held partial on its way
+    /// past: the predicate reads a byte that is not the last one written and
+    /// the break goes missing. A trim that cut from the end instead would break
+    /// the same argument, but the retention tests already fail on that long
+    /// before it reached here.
     #[test]
     fn a_recreate_after_the_buffer_has_been_trimmed_still_breaks_the_row() {
         let mut s = LogStore::new(1);
@@ -2058,14 +2072,18 @@ mod tests {
         for i in 0..40 {
             s.process(format!("line {i}\n").as_bytes());
         }
-        // The premise: trimming really did run, so the assertion below is about
-        // a trimmed buffer rather than about a buffer that never filled.
+        let before = s.raw.len();
+        // Complete lines enough to overrun the budget, then a partial, in one
+        // write -- so `retain` cuts while the tail is held rather than before
+        // it exists.
+        s.process(b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nheld tail");
+        // The premise: that write really did trim. Without this the assertion
+        // below is about a buffer that was never cut at all.
         assert!(
-            s.raw.len() < 40 * 8,
-            "the budget was never tight enough to trim: {} bytes retained",
+            s.raw.len() < before,
+            "the write that left the tail did not trim: {before} bytes -> {}",
             s.raw.len()
         );
-        s.process(b"held tail");
 
         s.adopt("web-1-second");
         s.process(b"new container\n");
