@@ -139,8 +139,11 @@ const INITIAL_COLS: u16 = 80;
 /// happens at, which is where the successor is about to write; the default pen
 /// the `CSI m` in front of it has just set; and, because `Grid::save_cursor`
 /// covers it too, the dead container's origin mode -- which is inert while the
-/// region stays full height, `set_pos` having nothing to offset by once
-/// `CSI r` has put `scroll_top` back to 0.
+/// region stays full height. `Grid` reads the flag in exactly one place,
+/// `set_pos`, and all three uses collapse there once `CSI r` has put
+/// `scroll_top` back to 0: the offset adds nothing, `row_clamp_top` cannot fire
+/// against a top of 0, and `row_clamp_bottom`'s region bound is `size.rows - 1`,
+/// which is the bound it would have used anyway.
 ///
 /// A trim cannot orphan the restore into something worse. `trim_point`'s line
 /// budget cuts immediately after a `\n` and this carries none, so it takes the
@@ -2619,16 +2622,20 @@ mod tests {
     /// around it are what make it affordable.
     ///
     /// Three rows is more than this needs, and what it needs is not rows.
-    /// `CSI r` homes to `(scroll_top, 0)`, so the homed cursor and the restored
-    /// one are told apart only where the dead container's row differs from the
-    /// top of its own region. A single `first\n` is enough: the trailing
-    /// newline leaves the cursor on row 1. `first` with no newline is not --
-    /// the cursor is still on row 0, and `adopt`'s own break then moves the
-    /// homed and the restored cursor to row 1 alike, column included, because
-    /// the break carries a `\r`. Measured across one, two and three rows with
-    /// and without the trailing newline: the five shapes that leave the cursor
-    /// off the region's top row all catch a bare `CSI r`, and the one that does
-    /// not, does not. Three rows are kept for reading, not for reach.
+    /// `CSI r` resets the region to full height and ends by homing to
+    /// `(scroll_top, 0)`, which is now `(0, 0)`, so the homed cursor and the
+    /// restored one are told apart wherever the dead container's row is not row
+    /// 0 -- not, as this said twice before, wherever it is off the top of the
+    /// region the dead container had. The two coincide only for a region that
+    /// starts at row 0, which is the one this fixture uses. A single `first\n`
+    /// is enough: the trailing newline leaves the cursor on row 1. `first` with
+    /// no newline is not -- the cursor is still on row 0, and `adopt`'s own
+    /// break then moves the homed and the restored cursor to row 1 alike,
+    /// column included, because the break carries a `\r`. Measured across one,
+    /// two and three rows with and without the trailing newline, and again
+    /// across regions that do not start at row 0: every shape that leaves the
+    /// cursor off row 0 catches a bare `CSI r`, and every shape that does not,
+    /// does not. Three rows are kept for reading, not for reach.
     #[test]
     fn resetting_the_scroll_region_does_not_move_the_cursor() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
