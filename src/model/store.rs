@@ -59,19 +59,26 @@ const INITIAL_COLS: u16 = 80;
 /// Written into the retained stream when the store changes hands, ahead of the
 /// row break, to keep the dead container's emulator state off its successor.
 ///
-/// Three sequences, each doing one job that the row break does not.
+/// Two sequences, plus one thing that happens before either of them runs.
 ///
-/// `ESC \` is ST, and its value here is where it *leaves* the parser rather
-/// than what it does. `ESC` is an anywhere-transition in vte's state machine,
-/// so it aborts a half-written CSI, ESC or string sequence from whatever state
-/// that sequence had reached; the `\` that follows is then dispatched as an
-/// escape vt100 does not implement, which is a no-op. Ground state either way,
-/// and the sequences after it are parsed as themselves rather than eaten as
-/// somebody else's parameters. Without it a container that stopped after
-/// `\x1b[3` has its successor's first byte complete `\x1b[3n` and vanish, and
-/// one that stopped inside an OSC swallows everything the successor writes
-/// until some byte happens to terminate the string -- which may be nothing it
-/// ever writes. #72 has both measurements.
+/// That first thing is the abort, and it is the leading `ESC` rather than a
+/// sequence of its own. `ESC` is an anywhere-transition in vte's state
+/// machine, so whatever half-written sequence the dead container left open --
+/// a CSI part way through its parameters, a bare `ESC`, an unterminated OSC,
+/// DCS, APC or PM string -- ends at the first byte of `CSI ? 47 l`, and what
+/// follows is parsed as itself rather than eaten as somebody else's
+/// parameters. Without it a container that stopped after `\x1b[3` has its
+/// successor's first byte complete `\x1b[3n` and vanish, and one that stopped
+/// inside an OSC swallows everything the successor writes until some byte
+/// happens to terminate the string -- which may be nothing it ever writes.
+/// #72 has both measurements.
+///
+/// So this has to *lead* with an escape sequence, and the row break has to
+/// come after it rather than before: a string sequence collects C0 controls
+/// instead of executing them, so a break written first is swallowed with
+/// everything else. An explicit `ESC \` in front was tried and removed --
+/// with `CSI ? 47 l` behind it no test could tell the two apart, because the
+/// abort is the `ESC`, not the ST.
 ///
 /// `CSI ? 47 l` leaves the alternate screen. A container that entered it and
 /// died leaves the pane rendering an alternate grid that has no scrollback and
@@ -96,7 +103,7 @@ const INITIAL_COLS: u16 = 80;
 /// which is the pane history #46 exists to protect, and `CSI ! p` (DECSTR)
 /// reaches vt100's unhandled-CSI callback and does nothing at all. #75 tracks
 /// the scroll region.
-const HANDOVER: &[u8] = b"\x1b\\\x1b[?47l\x1b[m";
+const HANDOVER: &[u8] = b"\x1b[?47l\x1b[m";
 
 pub struct LogStore {
     parser: vt100::Parser,
