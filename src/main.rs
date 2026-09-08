@@ -1097,11 +1097,14 @@ mod tests {
             text.contains("tcp://build-box.internal:2375"),
             "got {text:?}"
         );
-        // The whole token, not "5s": a notice that had drifted to "15s" would
-        // contain that too, and the elapsed figure is the only part of this
-        // string nothing else checks.
+        // With the separator in front of it, because the figure is the only
+        // part of this string nothing else checks and a substring test on it
+        // has already been wrong once: "15s so far" contains "5s so far", so
+        // matching from the digit leaves a notice that had drifted by ten
+        // seconds passing. Anchoring on the comma is what makes the left edge
+        // of the number part of the match.
         assert!(
-            text.contains(&format!("{}s so far", STARTUP_NOTICE_AFTER.as_secs())),
+            text.contains(&format!(", {}s so far", STARTUP_NOTICE_AFTER.as_secs())),
             "the wait so far has to be in it, and be right: {text:?}"
         );
         // Not "gave up", not "failed": the request is still out there, and the
@@ -1440,6 +1443,7 @@ mod tests {
         // error lands and `overran` is set when it does.
         let quiet = POLL_TIMEOUT * 3 + Duration::from_secs(1);
         let daemon = FakeDaemon::new(Behaviour::QuietThenRejects(quiet));
+        let started = daemon.started.clone();
         let (tx, mut rx) = mpsc::channel::<Poll>(64);
         let cancel = CancellationToken::new();
         spawn_refresher(
@@ -1464,6 +1468,15 @@ mod tests {
         assert!(
             !seen.is_empty(),
             "the refresher must report the wedge at all"
+        );
+        // A second request means the first one ended, which for this daemon
+        // means its 500 landed. Without this the test would still pass if the
+        // watch window closed before the error arrived -- it would then be
+        // looking at nothing but pure overruns, with no classification to
+        // disagree with, which is a different test from the one named here.
+        assert!(
+            started.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the late error never landed, so nothing here disagreed with overran"
         );
         assert!(
             seen.iter()
@@ -2084,6 +2097,22 @@ mod tests {
     /// its own task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_flood_of_logs_does_not_stop_the_clock() {
+        // The premise, asserted rather than assumed, because it is exactly what
+        // this test lacked before. It degrades before it dies -- at a depth of
+        // 256 the wrong arm order is caught six times in eight, at 16 not at
+        // all -- and it dies silently, so the ratio is checked rather than
+        // left to be read off two constants 500 lines apart. In a `const`
+        // block, so a depth that would make this test vacuous does not compile
+        // rather than passing quietly.
+        const {
+            assert!(
+                LOG_CHANNEL > MAX_DRAIN_PER_FRAME,
+                "a channel no deeper than the drain bound is emptied every time \
+                 the log arm wins, so the arm is pending at the next poll \
+                 wherever it sits and this test passes in either order"
+            )
+        };
+
         let mut app = app_with_service("api");
         let backend = ratatui::backend::TestBackend::new(TEST_FRAME.0, TEST_FRAME.1);
         let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
