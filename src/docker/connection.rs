@@ -94,10 +94,9 @@ impl Outage {
     /// so the kind is three deep, under a hyper error, and the bollard
     /// variant holding it is `HyperLegacyError` rather than the `IOError` its
     /// name suggests. Matching the `io::Error` wherever it is found is what
-    /// makes this independent of which transport bollard chose. Naming the
-    /// variant instead would also mean naming hyper's error type to reach the
-    /// kind, and that one cannot be built from outside hyper -- which is why
-    /// the test for this has to reproduce the nesting rather than borrow it.
+    /// makes this independent of which transport bollard chose. (Hyper's own
+    /// error cannot be built from outside hyper, which is why the test for
+    /// this has to reproduce the nesting rather than borrow it.)
     ///
     /// `IOError` is then checked on the bollard value as well, and not
     /// because two ways of spelling it is tidy: it is declared

@@ -98,6 +98,13 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// faster than we can render would keep the drain loop from ever returning, and
 /// the UI would stop responding to keys.
 const MAX_DRAIN_PER_FRAME: usize = 512;
+/// How many log messages may be queued for the render loop.
+///
+/// Named rather than written at the channel, because how it compares with
+/// `MAX_DRAIN_PER_FRAME` is what decides whether `event_loop`'s log arm can be
+/// ready at every poll -- which is the whole of the ordering argument on that
+/// select, and what its test has to be built at to mean anything.
+const LOG_CHANNEL: usize = 4096;
 
 /// How long startup will wait for the daemon in silence before saying that it
 /// is waiting.
@@ -337,7 +344,7 @@ async fn run_tui(
     let client = Arc::new(client);
     let mut app = App::new(&project, &cfg);
 
-    let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(4096);
+    let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(LOG_CHANNEL);
     let supervisor = LogSupervisor::new(&client, &project, cfg.tail, log_tx);
     let supervisor_cancel = cancel.clone();
     spawn_supervised(cancel.clone(), async move {
@@ -581,23 +588,24 @@ where
         // opportunity, and that a test of the shutdown path can assert that
         // rather than repeat until it happens.
         //
-        // Which makes the written order a priority order, so it is worth
-        // saying why this one is safe. The arm to worry about is `log_rx`: it
-        // sits above the poll and the tick, and a chatty service can make it
-        // ready far more often than either. What stops it starving them is the
-        // drain below, which takes everything queued up to
-        // `MAX_DRAIN_PER_FRAME` -- so unless more than that is waiting, the
-        // next poll finds this arm pending and reaches the arms under it. Both
-        // of those stay ready until they are taken, so neither is starved.
+        // Which makes the written order a priority order, and the order this
+        // inherited cannot be biased as it stands. `log_rx` sat above the poll
+        // and the tick, and it is the one arm with no ceiling on how often it
+        // can be ready: the drain below bounds a frame's work at
+        // `MAX_DRAIN_PER_FRAME`, but the channel behind it is `4096`, eight
+        // times that, so a backlog past the bound leaves this arm ready at
+        // every poll and nothing below it is ever reached. Measured against a
+        // service flooding a production-depth channel for a second, ticks out
+        // of a possible ten: 9-10 unbiased, which is where `main` is; 0 biased
+        // with the arm where it was; 10 biased with it here.
         //
-        // Deferred is not free for the ticker, though: it is
-        // `MissedTickBehavior::Skip`, so a tick it was late for is dropped
-        // rather than delivered behind. Measured against a service flooding
-        // the channel for a second, the loop ticked 7-10 times out of a
-        // possible 10, against 10 with this arm moved below the two -- the
-        // difference #74 is about. With the drain removed so the channel is
-        // never emptied it ticked 0, which is the starvation this reasoning
-        // rules out and what `a_flood_of_logs_does_not_stop_the_clock` pins.
+        // So it goes last, where being ready at every poll costs the arms
+        // above it nothing, and they cost it at most one iteration each --
+        // input at whatever rate a person types, a poll no oftener than
+        // `MIN_REFRESH`, a tick every `TICK`. Zero is not a stutter: the tick
+        // advances the throbber and the uptimes and paces the auto-exit
+        // countdown, so it is the bar stopping for as long as the service
+        // keeps talking. `a_flood_of_logs_does_not_stop_the_clock` pins it.
         tokio::select! {
             biased;
 
@@ -620,6 +628,22 @@ where
                 }
             }
 
+            polled = svc_rx.recv() => {
+                if let Some(poll) = polled {
+                    // Pins wait for a poll the daemon answered, which is what
+                    // the old code waited for too. An answered poll carrying
+                    // no services still counts: a project really can have
+                    // none, and holding the pins back forever would be worse
+                    // than applying them to an empty list.
+                    if apply_poll(app, poll) && !pinned_applied {
+                        pinned_applied = true;
+                        app.apply_startup_pins();
+                    }
+                }
+            }
+
+            _ = ticker.tick() => app.tick(Instant::now()),
+
             message = log_rx.recv() => {
                 let Some(message) = message else { continue };
                 apply_source_event(app, message, refresh);
@@ -637,22 +661,6 @@ where
                     }
                 }
             }
-
-            polled = svc_rx.recv() => {
-                if let Some(poll) = polled {
-                    // Pins wait for a poll the daemon answered, which is what
-                    // the old code waited for too. An answered poll carrying
-                    // no services still counts: a project really can have
-                    // none, and holding the pins back forever would be worse
-                    // than applying them to an empty list.
-                    if apply_poll(app, poll) && !pinned_applied {
-                        pinned_applied = true;
-                        app.apply_startup_pins();
-                    }
-                }
-            }
-
-            _ = ticker.tick() => app.tick(Instant::now()),
 
         }
     }
@@ -1765,7 +1773,7 @@ mod tests {
         for poll in polls {
             svc_tx.try_send(poll).expect("room for the queued polls");
         }
-        let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(16);
+        let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(LOG_CHANNEL);
         for log in logs {
             log_tx.try_send(log).expect("room for the queued events");
         }
@@ -2049,16 +2057,21 @@ mod tests {
         }
     }
 
-    /// What makes it safe to bias a select whose log arm sits above the poll
-    /// and the tick: the drain empties the channel every time that arm wins,
-    /// so the next poll finds it pending and the arms under it get their turn.
+    /// The ordering on `event_loop`'s biased select, which is not a
+    /// preference: with the log arm where it used to sit, above the poll and
+    /// the tick, a sustained backlog stops the clock outright.
     ///
-    /// This is a guard on that reasoning rather than a test of #66 -- it
-    /// passes on the code before it too, where the random order gave every
-    /// arm a turn anyway. What it fails against is the drain going away, which
-    /// is what would make the bias bite. Measured over the second below:
-    /// 7-10 ticks of a possible 10 as it stands, and 0 with the drain removed,
-    /// six runs each.
+    /// The condition is `LOG_CHANNEL` against `MAX_DRAIN_PER_FRAME` -- 4096
+    /// against 512 -- so this builds the channel at the real depth. Sixteen,
+    /// which is what this test had first, can never exceed the drain bound, so
+    /// the drain always empties it, the log arm is pending at the next poll
+    /// whatever its position, and the test passed in either order while
+    /// claiming to tell them apart. Ticks out of a possible ten at the real
+    /// depth, three runs each: 10 as the arms now stand, 0 with the log arm
+    /// moved back above the poll and the tick, and 9-10 with `biased` removed
+    /// altogether. Zero is what makes the order a correctness question rather
+    /// than a preference -- unbiased code ticks, and biasing the old order
+    /// would have stopped it.
     ///
     /// Real time rather than paused, because the point is an arm that is ready
     /// at every poll: under a paused clock the flooding task is never idle, so
@@ -2066,18 +2079,17 @@ mod tests {
     /// the order.
     ///
     /// Multi-threaded, like `main`'s runtime, and for the reason that runtime
-    /// exists. On one thread there is nothing to measure: the drain empties
-    /// the channel with `try_recv` and the loop reaches the next `select!`
-    /// without ever yielding, so the log arm is polled empty however fast the
-    /// producer is. It takes a producer running while the loop draws -- which
-    /// is the real one, since `LogSupervisor` streams from its own task.
+    /// exists. On one thread the producer only runs when the loop yields, so it
+    /// cannot get ahead of the drain; it takes a producer running while the
+    /// loop draws -- which is the real one, since `LogSupervisor` streams from
+    /// its own task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_flood_of_logs_does_not_stop_the_clock() {
         let mut app = app_with_service("api");
         let backend = ratatui::backend::TestBackend::new(TEST_FRAME.0, TEST_FRAME.1);
         let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
         let (_svc_tx, mut svc_rx) = mpsc::channel::<Poll>(4);
-        let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(16);
+        let (log_tx, mut log_rx) = mpsc::channel::<SourceEvent>(LOG_CHANNEL);
         let refresh = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let mut input = futures::stream::pending::<std::io::Result<Event>>();
@@ -2121,12 +2133,13 @@ mod tests {
             "the flood must not have kept the loop from stopping: {exit:?}"
         );
         // Two of the ten the second could hold. The reading being ruled out is
-        // a clock that stopped, and the drain's removal gives exactly zero --
-        // so the margin is wanted below, not above. Set at half the ten it was
-        // flaky under a loaded machine, which is the wrong thing to be
-        // sensitive to: this test shares a runtime with the rest of the suite,
-        // and external load slows the flood and the ticker alike. Two is
-        // reached by a loop managing two iterations in a second.
+        // a clock that stopped, and the wrong order gives exactly zero -- so
+        // the margin is wanted below, not above, and anything short of a
+        // freeze is #74's business rather than this test's. Two is reached by
+        // a loop managing two iterations in a second, which leaves this
+        // insensitive to a loaded machine; it shares a runtime with the rest
+        // of the suite, and external load slows the flood and the ticker
+        // alike.
         //
         // The tick is what advances the throbber and the uptimes and paces the
         // auto-exit countdown, so a clock stopped here is a bar frozen for as
