@@ -1787,15 +1787,22 @@ mod tests {
         );
     }
 
-    /// The break ends a row; it does not insert one. No other test asserts on
-    /// the un-filtered rows after a break: most read them through `non_empty`,
-    /// which discards exactly the blank a doubled break would leave, and the
-    /// two that index the rows directly are the ones where no break is emitted
-    /// at all. `a_recreate_does_not_move_a_scrolled_up_reader` does both --
-    /// unfiltered rows, after a break -- but compares them against a snapshot
-    /// rather than against text, and `vt100` advances the scroll offset by
-    /// however many rows evicted, so a doubled break moves the snapshot with it
-    /// and still compares equal.
+    /// The break ends a row; it does not insert one. This is the only test
+    /// whose *rendered-row* assertion can catch a blank one on a break path.
+    /// Most of the others read their rows through `non_empty`, which discards
+    /// exactly the blank a doubled break would leave; the two that index the
+    /// rows directly emit no break at all; and
+    /// `a_recreate_does_not_move_a_scrolled_up_reader`, which does read
+    /// unfiltered rows after a break, compares them against a snapshot rather
+    /// than against text -- `vt100` advances the scroll offset by however many
+    /// rows evicted, so a doubled break moves the snapshot with it and still
+    /// compares equal.
+    ///
+    /// The newline count is not the same watch twice over, but it is not the
+    /// only one either: `the_break_is_the_stream_s_own_newline` compares whole
+    /// `raw` buffers and so catches a doubled break in the bytes as well. What
+    /// it does not catch is a break doubled on the grid alone, which is why
+    /// both halves are here.
     ///
     /// Both halves are needed. The rendered rows catch a blank in the pane; the
     /// newline count catches one that is only in `raw`, which costs a line of
