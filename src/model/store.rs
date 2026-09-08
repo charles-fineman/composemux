@@ -2231,8 +2231,11 @@ mod tests {
     /// only ever climb, and this is what says so.
     ///
     /// Monotonicity is real but it belongs to `AttachIds`, a module away: one
-    /// counter, handed out by `LogSupervisor::attach`, which `resync` calls
-    /// only for a container whose previous task has already reported finished.
+    /// counter, handed out by `LogSupervisor::attach`, and `plan_attachments`
+    /// asks for a *second* id for a container only once that container's
+    /// previous task has reported finished, so no two live attaches to it
+    /// overlap. A container it has never attached is the other branch, and
+    /// takes its first id from the same climbing counter.
     /// Resting on that would be the mistake `LineAssembler::adopt` explicitly
     /// refuses on the fallback side -- it compares both halves of the identity
     /// "so that the recreate guarantee does not come to rest on a stamp
