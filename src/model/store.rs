@@ -139,11 +139,12 @@ const INITIAL_COLS: u16 = 80;
 /// happens at, which is where the successor is about to write; the default pen
 /// the `CSI m` in front of it has just set; and, because `Grid::save_cursor`
 /// covers it too, the dead container's origin mode -- which is inert while the
-/// region stays full height. `Grid` reads the flag in exactly one place,
-/// `set_pos`, and all three uses collapse there once `CSI r` has put
-/// `scroll_top` back to 0: the offset adds nothing, `row_clamp_top` cannot fire
-/// against a top of 0, and `row_clamp_bottom`'s region bound is `size.rows - 1`,
-/// which is the bound it would have used anyway.
+/// region stays full height. `Grid` reads the flag four times, and that save is
+/// one of them. The other three are in `set_pos` and are the only ones with any
+/// geometric effect, and all three collapse once `CSI r` has put `scroll_top`
+/// back to 0: the offset adds nothing, `row_clamp_top` cannot fire against a
+/// top of 0, and `row_clamp_bottom`'s region bound is `size.rows - 1`, which is
+/// the bound it would have used anyway.
 ///
 /// A trim cannot orphan the restore into something worse. `trim_point`'s line
 /// budget cuts immediately after a `\n` and this carries none, so it takes the
