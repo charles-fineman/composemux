@@ -99,7 +99,7 @@ pub enum SourceEvent {
         /// neither the line nor a duplicate of it. Stamped per attach so a
         /// consumer can end what it held, which is what keeps the cost of a
         /// reattach to the whole-line duplicate [`log_window`] accepts. The
-        /// fallback compares it; the TUI ignores it until #68.
+        /// fallback compares it, and since #68 so does the TUI.
         attach: u64,
         /// One piece of a log frame, no larger than [`MAX_CHUNK_BYTES`].
         bytes: Vec<u8>,
@@ -155,8 +155,9 @@ pub struct LogWindow<'a> {
 /// worse than a duplicate: the replay runs on from the middle of that line.
 /// `SourceEvent::Output` carries the attach it was read from so a consumer can
 /// end the held line when the reattach's first bytes arrive, which leaves it
-/// with only the duplicate above. The fallback does; the TUI holds its partial
-/// line as a row in an emulator and does not yet -- #68.
+/// with only the duplicate above. Both consumers do, since #68 -- the fallback
+/// by ending a byte buffer, the TUI by writing a break into the stream it
+/// retains, because what it holds part way along is a row in an emulator.
 pub fn log_window(since: Option<i64>, tail: &str) -> LogWindow<'_> {
     match since {
         // The Engine API models this field as a 32-bit count of seconds, so

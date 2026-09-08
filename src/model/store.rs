@@ -56,6 +56,55 @@ const MIN_COLS: u16 = 20;
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 
+/// Written into the retained stream when the store changes hands, ahead of the
+/// row break, to keep the dead container's emulator state off its successor.
+///
+/// Two sequences, plus one thing that happens before either of them runs.
+///
+/// That first thing is the abort, and it is the leading `ESC` rather than a
+/// sequence of its own. `ESC` is an anywhere-transition in vte's state
+/// machine, so whatever half-written sequence the dead container left open --
+/// a CSI part way through its parameters, a bare `ESC`, an unterminated OSC,
+/// DCS, APC or PM string -- ends at the first byte of `CSI ? 47 l`, and what
+/// follows is parsed as itself rather than eaten as somebody else's
+/// parameters. Without it a container that stopped after `\x1b[3` has its
+/// successor's first byte complete `\x1b[3n` and vanish, and one that stopped
+/// inside an OSC swallows everything the successor writes until some byte
+/// happens to terminate the string -- which may be nothing it ever writes.
+/// #72 has both measurements.
+///
+/// So this has to *lead* with an escape sequence, and the row break has to
+/// come after it rather than before: a string sequence collects C0 controls
+/// instead of executing them, so a break written first is swallowed with
+/// everything else. An explicit `ESC \` in front was tried and removed --
+/// with `CSI ? 47 l` behind it no test could tell the two apart, because the
+/// abort is the `ESC`, not the ST.
+///
+/// `CSI ? 47 l` leaves the alternate screen. A container that entered it and
+/// died leaves the pane rendering an alternate grid that has no scrollback and
+/// none of the service's history in it, and its successor writing into that
+/// same grid; the pane looks empty and stays that way. `47` rather than the
+/// `1049` an application would have entered with, because vt100 keeps one
+/// `MODE_ALTERNATE_SCREEN` bit for both -- so this clears the mode however it
+/// was set -- while its `1049` reset also restores the saved cursor, which
+/// would move the cursor to a row that already has output on it and let the
+/// successor overwrite the pane's history.
+///
+/// `CSI m` resets the pen. This is the half that does not need a half-written
+/// sequence to bite: a container that sets a colour and exits cleanly on a
+/// newline leaves the pen set, and every line its successor writes comes out in
+/// the dead container's colour.
+///
+/// What is deliberately not here is a reset of the scroll region. `CSI r` is
+/// the only sequence vt100 implements that would do it, and `set_scroll_region`
+/// ends by homing the cursor -- so the successor would start writing over the
+/// top of the visible pane. The full resets are worse still: `ESC c` (RIS)
+/// rebuilds the screen from nothing, discarding the grid *and* the scrollback,
+/// which is the pane history #46 exists to protect, and `CSI ! p` (DECSTR)
+/// reaches vt100's unhandled-CSI callback and does nothing at all. #75 tracks
+/// the scroll region.
+const HANDOVER: &[u8] = b"\x1b[?47l\x1b[m";
+
 pub struct LogStore {
     parser: vt100::Parser,
     /// Rows of scrollback the parser retains; needed to rebuild it on resize.
@@ -78,6 +127,11 @@ pub struct LogStore {
     /// real container ID -- and would not matter if it could, since there is
     /// no row part way through at that point to break.
     container: String,
+    /// Which attach to that container the output is currently coming from.
+    ///
+    /// Zero until the first [`LogStore::adopt`]; `AttachIds` hands out ids from
+    /// one, so no attach can be mistaken for that starting state.
+    attach: u64,
     /// Set when the parser holds a size it was never given content at -- a
     /// replay that had to be skipped, or an emulator released while off-screen
     /// -- so the next resize replays instead of short-circuiting on the size.
@@ -111,6 +165,7 @@ impl LogStore {
             lines: 0,
             pending_cr: false,
             container: String::new(),
+            attach: 0,
             pen: Vec::new(),
             replay_pending: false,
             has_output: false,
@@ -156,8 +211,8 @@ impl LogStore {
         self.parser.screen_mut()
     }
 
-    /// Hands the store to `container`, ending the row the previous one left
-    /// part way along.
+    /// Hands the store to one attach to one container, ending the row and the
+    /// emulator state the previous one left behind.
     ///
     /// A store is keyed on `(service, replica)` and is meant to outlive the
     /// container: that shared buffer is what lets a pane keep its history when
@@ -168,33 +223,33 @@ impl LogStore {
     /// Without this the replacement's first chunk continues that row and the
     /// pane shows one line neither container wrote.
     ///
+    /// The ID does not answer that on its own, which is what #68 is about. A
+    /// container's log task can end while the container keeps running, and the
+    /// next resync reattaches the *same* container from `since = ended_at`.
+    /// `since` resolves to the second, so the replay can restart the very entry
+    /// the cursor is part way along and continue that row with it: `GET /one`
+    /// on screen, `GET /one 200` replayed, one row reading
+    /// `GET /oneGET /one 200`. Nothing about the container changed, so the pair
+    /// is compared rather than the ID alone -- the same pair, for the same
+    /// reason, that `LineAssembler::adopt` compares in the fallback.
+    ///
     /// It is the *row* that ends here, not the buffer. Nothing is discarded:
     /// the break is written into the stream, so the dead container's tail stays
     /// on screen as its own line and the replacement starts on the next one.
     ///
-    /// With one exception, which is the emulator's and not this method's, and
-    /// which is narrower than "died mid-escape-sequence". A container that dies
-    /// inside a *string* sequence -- OSC, DCS, APC, PM -- leaves the parser in
-    /// a state that ignores C0 controls rather than executing them, so the
-    /// break is swallowed and so is everything the replacement writes until
-    /// some byte terminates the sequence -- which may be nothing it ever
-    /// writes, and is not limited to its first line.
-    /// Mid-CSI and mid-ESC are not that case, and they are the common one,
-    /// since every SGR colour run is a CSI: there the break is executed and the
-    /// row does end. What follows it still goes, though, and mid-CSI goes by
-    /// more than a byte. An ESC eats exactly one. A CSI in parameter state eats
-    /// until a byte lands in `0x40..=0x7E`, absorbing digits and separators as
-    /// parameters on the way and executing C0 controls without ending -- so it
-    /// runs straight through newlines. A timestamped first line loses its whole
-    /// date prefix rather than one character, and a line of digits can carry it
-    /// into the line after. Neither case is something the break introduced --
-    /// those bytes go the same way with no recreate involved -- and ending the
-    /// row is not enough to fix either, so this deliberately does not try. #72
-    /// has the measurements.
+    /// A row is not all that carries over, though, which is what #72 is about:
+    /// the emulator's parse state, its pen and its screen selection are the
+    /// dead container's too, and none of them is undone by ending a row.
+    /// [`HANDOVER`] is what resets them and carries the reasoning for each
+    /// sequence in it. It goes in ahead of the break rather than after it,
+    /// because a container that died inside an OSC, DCS, APC or PM string
+    /// leaves the parser in a state that collects C0 controls instead of
+    /// executing them -- a break written first is swallowed along with
+    /// everything else until the string ends.
     ///
-    /// Fed through [`LogStore::process`] rather than to the parser directly, so
-    /// the break is recorded in `raw` as well as on the grid. Anything else
-    /// would splice again on the next resize, which replays `raw` from
+    /// Both writes go through [`LogStore::process`] rather than to the parser
+    /// directly, so they are recorded in `raw` as well as on the grid. Anything
+    /// else would splice again on the next resize, which replays `raw` from
     /// scratch -- and would do nothing at all for a released store, whose grid
     /// is rebuilt from `raw` when a pane next shows it.
     ///
@@ -205,6 +260,13 @@ impl LogStore {
     /// not show the difference -- a `\r` at column 0 moves nothing -- but `raw`
     /// is replayed, and adopting the ONLCR rule wholesale is what keeps this
     /// from having a second opinion about it.
+    ///
+    /// The handover write is what makes that decision need help. `process`
+    /// re-derives the carry from the bytes it is given, and [`HANDOVER`] ends on
+    /// an `m`, so by the time the break is written the flag describes our bytes
+    /// rather than the container's and the `\r` goes back in. The carry is put
+    /// back where the container left it so that the two writes together retain
+    /// exactly the bytes the break alone used to.
     ///
     /// `raw`'s last byte is what says whether there is a row to end, because
     /// trimming only ever cuts from the front -- so the last byte of `raw` is
@@ -219,9 +281,13 @@ impl LogStore {
     /// whether it believes a line is open.
     ///
     /// An empty `raw` is a store nothing has been written to, which has no row
-    /// to end and must not be given a blank one. `raw` cannot empty any other
-    /// way: `trim_point` never cuts the whole buffer away, which is the same
-    /// fact `release` relies on.
+    /// to end and must not be given a blank one -- nor a handover, which would
+    /// be the first bytes the store ever received and would set `has_output`,
+    /// replacing the pane's "waiting" placeholder with a blank screen before
+    /// any container had written a byte. It has no emulator state to reset
+    /// either, having parsed nothing. `raw` cannot empty any other way:
+    /// `trim_point` never cuts the whole buffer away, which is the same fact
+    /// `release` relies on.
     ///
     /// The predicate over-approximates in one direction, deliberately. A
     /// container whose last bytes after its final newline are escape-only -- a
@@ -233,13 +299,22 @@ impl LogStore {
     /// `partial` and prints them as their own prefixed line. Diverging here to
     /// save a blank row would be the two paths disagreeing about where a line
     /// ends, which is the thing #50 and #60 are both about.
-    pub fn adopt(&mut self, container: &str) {
-        if self.container == container {
+    pub fn adopt(&mut self, container: &str, attach: u64) {
+        if self.container == container && self.attach == attach {
             return;
         }
         self.container.clear();
         self.container.push_str(container);
-        if self.raw.last().is_some_and(|byte| *byte != b'\n') {
+        self.attach = attach;
+        // Read before anything is written, because the handover appends to
+        // `raw` and would otherwise be the last byte this asks about.
+        let Some(last) = self.raw.last().copied() else {
+            return;
+        };
+        let carry = self.pending_cr;
+        self.process(HANDOVER);
+        self.pending_cr = carry;
+        if last != b'\n' {
             self.process(b"\n");
         }
     }
@@ -1775,9 +1850,9 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"Error: shutting");
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"listening on 8080\n");
 
         assert_eq!(
@@ -1813,9 +1888,9 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"Error: shutting");
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"listening on 8080\n");
 
         let rows = s.visible_lines();
@@ -1843,6 +1918,14 @@ mod tests {
     /// and a break supplying its own `\r` would put one in `raw` that no
     /// container sent.
     ///
+    /// Since #72 that is not only a question of what the break writes but of
+    /// what the handover before it leaves behind. `process` re-derives the
+    /// carry from every write, and [`HANDOVER`] ends on an `m`, so without
+    /// `adopt` putting the carry back the break would find the flag clear and
+    /// supply the `\r` itself. `HANDOVER` is spliced into the expectation
+    /// rather than spelled out, because what this test is about is the byte
+    /// either side of it.
+    ///
     /// The carry the break leaves behind is checked directly rather than
     /// through its effects, because here it has none to check. A break that
     /// bypassed the normalisation would leave the carry set, and a stale carry
@@ -1858,12 +1941,15 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"downloading 50%\r");
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
 
+        let mut expected = b"downloading 50%\r".to_vec();
+        expected.extend_from_slice(HANDOVER);
+        expected.push(b'\n');
         assert_eq!(
-            s.raw, b"downloading 50%\r\n",
+            s.raw, expected,
             "the break wrote a carriage return no container sent"
         );
         assert!(
@@ -1872,8 +1958,9 @@ mod tests {
         );
 
         s.process(b"\nlistening on 8080\n");
+        expected.extend_from_slice(b"\r\nlistening on 8080\r\n");
         assert_eq!(
-            s.raw, b"downloading 50%\r\n\r\nlistening on 8080\r\n",
+            s.raw, expected,
             "the carry the break left behind ate the next chunk's carriage return"
         );
     }
@@ -1893,9 +1980,9 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 80);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"Error: shutting");
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"listening on 8080\n");
 
         s.resize(10, 40);
@@ -1922,7 +2009,7 @@ mod tests {
     fn a_recreate_while_released_still_breaks_the_row() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"Error: shutting");
 
         s.release();
@@ -1932,7 +2019,7 @@ mod tests {
             "the store was never released, so this is only the replay test again"
         );
 
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"listening on 8080\n");
         s.resize(10, 40);
 
@@ -1958,9 +2045,9 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"GET /one");
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b" 200\n");
 
         assert_eq!(non_empty(&s), vec!["GET /one 200"]);
@@ -1984,9 +2071,9 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"clean exit\n");
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"listening on 8080\n");
 
         let rows = s.visible_lines();
@@ -2012,7 +2099,7 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"listening on 8080\n");
 
         assert_eq!(
@@ -2046,9 +2133,9 @@ mod tests {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         s.process(b"downloading 50%\r");
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"listening on 8080\n");
 
         assert_eq!(
@@ -2085,7 +2172,7 @@ mod tests {
         let mut s = LogStore::new(1);
         s.resize(MIN_ROWS, MIN_COLS);
 
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         for i in 0..40 {
             s.process(format!("line {i}\n").as_bytes());
         }
@@ -2102,13 +2189,334 @@ mod tests {
             s.raw.len()
         );
 
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
         s.process(b"new container\n");
 
         assert_eq!(
             non_empty(&s),
             vec!["held tail", "new container"],
             "a trimmed buffer lost the break"
+        );
+    }
+
+    /// The container ID is not the whole identity, which is #68. A container's
+    /// log task can end while the container keeps running -- the event stream
+    /// or the log stream dropping, a daemon hiccup -- and the next resync
+    /// reattaches the same container from `since = ended_at`. `since` resolves
+    /// to the second, so the replay can begin at or before the entry the
+    /// emulator's cursor is part way along and deliver that entry whole. The ID
+    /// has not changed, so nothing but the attach can see it.
+    ///
+    /// This is the exact shape #57 fixed in the fallback, where it printed
+    /// `GET /oneGET /one 200`. Here the same fabricated line is rendered into
+    /// the grid.
+    #[test]
+    fn a_reattach_of_the_same_container_does_not_continue_the_held_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1", 1);
+        s.process(b"GET /one");
+        s.adopt("web-1", 2);
+        s.process(b"GET /one 200\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["GET /one", "GET /one 200"],
+            "the reattach's replay ran on into the row the first attach held"
+        );
+    }
+
+    /// `adopt` compares the identity it was handed. It does not assume the ids
+    /// only ever climb, and this is what says so.
+    ///
+    /// Monotonicity is real but it belongs to `AttachIds`, a module away: one
+    /// counter, handed out by `LogSupervisor::attach`, which `resync` calls
+    /// only for a container whose previous task has already reported finished.
+    /// Resting on that would be the mistake `LineAssembler::adopt` explicitly
+    /// refuses on the fallback side -- it compares both halves of the identity
+    /// "so that the recreate guarantee does not come to rest on a stamp
+    /// continuing to move, one line away in another module". This is the same
+    /// refusal on this side, and it costs one test.
+    ///
+    /// No input reaches `LogStore` with a smaller id today: the supervisor and
+    /// the `App` holding the stores are built together in `run_tui` and die
+    /// together, so the counter cannot restart under a store that outlived it.
+    /// That is why this is written as a statement about `adopt`'s contract
+    /// rather than as a reproduction of anything -- an `adopt` comparing `>=`
+    /// passes every other test in the suite.
+    #[test]
+    fn an_attach_id_that_goes_backwards_still_ends_the_row() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1", 2);
+        s.process(b"GET /one");
+        s.adopt("web-1", 1);
+        s.process(b"GET /one 200\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["GET /one", "GET /one 200"],
+            "the row was held because the new attach id was not larger"
+        );
+    }
+
+    /// The row break alone does not undo a half-written escape sequence, which
+    /// is #72. A container that stopped after `\x1b[3` leaves vte in CSI
+    /// parameter state; C0 controls execute from there without ending the
+    /// sequence, so the break does end the row, and then the replacement's
+    /// first byte lands as that sequence's final byte and disappears --
+    /// `new line` rendered as `ew line`.
+    ///
+    /// A CSI in parameter state eats until a byte lands in `0x40..=0x7E`, so
+    /// what it takes is not bounded at one character: a timestamped first line
+    /// loses its whole date prefix, and a line of digits carries the sequence
+    /// past its own newline into the line after.
+    ///
+    /// Three parser states rather than one, because [`HANDOVER`] claims all of
+    /// them and one of them is not a CSI at all. A bare `ESC` and an `ESC` that
+    /// has taken an intermediate are reached by a container dying one and two
+    /// bytes into a sequence respectively, and they leave vte somewhere else --
+    /// which is the point, since what recovers all three is the same
+    /// anywhere-transition rather than anything specific to a CSI.
+    #[test]
+    fn a_recreate_does_not_leave_the_replacement_inside_a_half_written_sequence() {
+        for (state, tail) in [
+            ("a CSI part way through its parameters", &b"tail\x1b[3"[..]),
+            ("a bare ESC", &b"tail\x1b"[..]),
+            ("an ESC that has taken an intermediate", &b"tail\x1b("[..]),
+        ] {
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(10, 40);
+
+            s.adopt("web-1-first", 1);
+            s.process(tail);
+            s.adopt("web-1-second", 1);
+            s.process(b"new line\n");
+
+            assert_eq!(
+                non_empty(&s),
+                vec!["tail", "new line"],
+                "{state}: the dead container's unfinished sequence ate the \
+                 replacement's output"
+            );
+        }
+    }
+
+    /// The string sequences are the severe half of #72. OSC, DCS, APC and PM
+    /// put vte in a state that *collects* C0 controls rather than executing
+    /// them, so the row break is swallowed along with everything the
+    /// replacement writes, until some byte happens to terminate the string --
+    /// which may be nothing it ever writes. The pane stops updating and stays
+    /// stopped.
+    ///
+    /// A title-setting OSC is the ordinary way to reach this: a service that
+    /// announces itself in the window title and is killed part way through the
+    /// write leaves exactly this. All four are exercised rather than the one,
+    /// because vte reaches them by different routes -- `SosPmApcString` is a
+    /// state of its own, and DCS passes through a hook the others do not -- and
+    /// because [`HANDOVER`] names all four.
+    ///
+    /// Two lines are written afterwards, not one. A swallow is unbounded: what
+    /// fails here is not a first line arriving damaged but output stopping, so
+    /// the assertion has to be able to tell "the pane came back" from "the pane
+    /// came back for one line".
+    #[test]
+    fn a_recreate_inside_a_string_sequence_does_not_swallow_the_replacement() {
+        for (introducer, tail) in [
+            ("OSC", &b"tail\x1b]0;serv"[..]),
+            ("DCS", &b"tail\x1bPq#0"[..]),
+            ("APC", &b"tail\x1b_data"[..]),
+            ("PM", &b"tail\x1b^msg"[..]),
+        ] {
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(10, 40);
+
+            s.adopt("web-1-first", 1);
+            s.process(tail);
+            s.adopt("web-1-second", 1);
+            s.process(b"new line\nand another\n");
+
+            assert_eq!(
+                non_empty(&s),
+                vec!["tail", "new line", "and another"],
+                "{introducer}: the dead container's unterminated string \
+                 swallowed the replacement"
+            );
+        }
+    }
+
+    /// The pen is the half of #72 that needs no accident at all to bite. A
+    /// container that sets a colour and exits cleanly on a newline leaves the
+    /// pen set, and every line its replacement writes comes out in the dead
+    /// container's colour -- a stopped service's red carried on to a healthy
+    /// one's startup line.
+    ///
+    /// So this is also the case that pins the handover as unconditional. `raw`
+    /// ends on a newline here, so there is no row to break and the #60
+    /// mechanism writes nothing; a handover gated on the break would leave the
+    /// pen exactly as it found it.
+    ///
+    /// The dead container's own row is asserted coloured first. Without that
+    /// premise a fix that reset nothing and a screen that was never coloured
+    /// look the same from the second assertion.
+    #[test]
+    fn a_recreate_does_not_render_the_replacement_in_the_dead_container_s_pen() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[31mError: exiting\n");
+        s.adopt("web-1-second", 1);
+        s.process(b"listening on 8080\n");
+
+        let dead = s.screen().cell(0, 0).expect("the dead container's row");
+        assert_ne!(
+            dead.fgcolor(),
+            vt100::Color::Default,
+            "the dead container never set a colour, so nothing here is under test"
+        );
+        let replacement = s.screen().cell(1, 0).expect("the replacement's row");
+        assert_eq!(
+            replacement.fgcolor(),
+            vt100::Color::Default,
+            "the replacement is rendering in the dead container's colour"
+        );
+    }
+
+    /// The alternate screen is the third of the states #72 names, and the one
+    /// whose symptom is a blank pane rather than a wrong line. A container that
+    /// switched to it and died leaves the emulator showing an alternate grid,
+    /// which has none of the service's history in it and no scrollback to reach
+    /// it by; the replacement then writes into that same grid. Nothing brings
+    /// the pane back, because `raw` replays the switch on every resize.
+    ///
+    /// The premise is asserted, because a `vt100` that ignored the switch would
+    /// make the second assertion pass on a store that was never in the
+    /// alternate screen at all.
+    ///
+    /// The blank row between the two is the accepted cost: `raw` ends on the
+    /// switch's `h` rather than a newline, so the handover's break fires, and
+    /// it fires against the primary grid the exit has just restored -- where
+    /// the cursor was already at column 0. `non_empty` is what discards it, and
+    /// the row it costs is far cheaper than the pane it buys back.
+    #[test]
+    fn a_recreate_brings_a_pane_back_from_the_alternate_screen() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"serving requests\n");
+        s.process(b"\x1b[?1049h");
+        assert!(
+            non_empty(&s).is_empty(),
+            "the switch to the alternate screen did nothing, so nothing is under test"
+        );
+
+        s.adopt("web-1-second", 1);
+        s.process(b"listening on 8080\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["serving requests", "listening on 8080"],
+            "the pane is still showing the dead container's alternate screen"
+        );
+    }
+
+    /// The handover has to be in `raw`, not only on the grid, for the same
+    /// reason the break does: a resize throws the grid away and replays `raw`
+    /// from scratch, so a reset applied to the live parser alone is undone the
+    /// first time the pane changes size -- and the pane a store was created for
+    /// is almost always a different size from the one it starts at.
+    #[test]
+    fn the_handover_a_recreate_makes_survives_a_replay() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 80);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[31mtail\x1b[3");
+        s.adopt("web-1-second", 1);
+        s.process(b"new line\n");
+
+        s.resize(10, 40);
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["tail", "new line"],
+            "the replay put the replacement back inside the dead container's sequence"
+        );
+        let replacement = s.screen().cell(1, 0).expect("the replacement's row");
+        assert_eq!(
+            replacement.fgcolor(),
+            vt100::Color::Default,
+            "the replay put the dead container's colour back on the replacement"
+        );
+    }
+
+    /// The off-screen case, which is the one a live-parser reset misses
+    /// entirely rather than merely temporarily. While a store is released (#58)
+    /// `process` skips the parser altogether, so a recreate that happens with
+    /// no pane open has only `raw` to record it in, and the reset has to still
+    /// be there when someone looks.
+    ///
+    /// The premise is asserted, not assumed. `release` declines a store it
+    /// could not rebuild, so if its conditions ever change this would quietly
+    /// stop being about the released path and become a second copy of the
+    /// replay test above.
+    #[test]
+    fn a_recreate_while_released_still_resets_the_emulator() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[31mtail\x1b[3");
+
+        s.release();
+        assert_eq!(
+            s.released_grid().size(),
+            (MIN_ROWS, MIN_COLS),
+            "the store was never released, so this is only the replay test again"
+        );
+
+        s.adopt("web-1-second", 1);
+        s.process(b"new line\n");
+        s.resize(10, 40);
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["tail", "new line"],
+            "a recreate that happened off-screen left the sequence open"
+        );
+        let replacement = s.screen().cell(1, 0).expect("the replacement's row");
+        assert_eq!(
+            replacement.fgcolor(),
+            vt100::Color::Default,
+            "a recreate that happened off-screen left the pen set"
+        );
+    }
+
+    /// A store nothing has written to has no emulator state to reset and must
+    /// not be given bytes for it. The handover would be the first bytes the
+    /// store ever received, and `process` marks any write as output -- so the
+    /// pane would swap its "waiting" placeholder for a blank screen before any
+    /// container had written a byte.
+    ///
+    /// `the_first_container_to_write_gets_no_leading_break` does not catch
+    /// this: it counts newlines in `raw`, and the handover carries none.
+    #[test]
+    fn adopting_a_store_nothing_has_written_to_writes_nothing() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+
+        assert!(
+            s.raw.is_empty(),
+            "the handover was written before any container had"
+        );
+        assert!(
+            !s.has_output(),
+            "the pane's waiting placeholder was replaced by a blank screen"
         );
     }
 
@@ -2125,7 +2533,7 @@ mod tests {
     fn a_recreate_does_not_move_a_scrolled_up_reader() {
         let mut s = LogStore::new(DEFAULT_SCROLLBACK);
         s.resize(10, 40);
-        s.adopt("web-1-first");
+        s.adopt("web-1-first", 1);
         for i in 0..50 {
             s.process(format!("line {i}\n").as_bytes());
         }
@@ -2136,7 +2544,7 @@ mod tests {
         assert!(s.scroll_offset() > 0, "the reader never left the bottom");
 
         let before = s.visible_lines();
-        s.adopt("web-1-second");
+        s.adopt("web-1-second", 1);
 
         assert_eq!(
             s.visible_lines(),
