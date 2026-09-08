@@ -2238,21 +2238,35 @@ mod tests {
     /// what it takes is not bounded at one character: a timestamped first line
     /// loses its whole date prefix, and a line of digits carries the sequence
     /// past its own newline into the line after.
+    ///
+    /// Three parser states rather than one, because [`HANDOVER`] claims all of
+    /// them and one of them is not a CSI at all. A bare `ESC` and an `ESC` that
+    /// has taken an intermediate are reached by a container dying one and two
+    /// bytes into a sequence respectively, and they leave vte somewhere else --
+    /// which is the point, since what recovers all three is the same
+    /// anywhere-transition rather than anything specific to a CSI.
     #[test]
     fn a_recreate_does_not_leave_the_replacement_inside_a_half_written_sequence() {
-        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
-        s.resize(10, 40);
+        for (state, tail) in [
+            ("a CSI part way through its parameters", &b"tail\x1b[3"[..]),
+            ("a bare ESC", &b"tail\x1b"[..]),
+            ("an ESC that has taken an intermediate", &b"tail\x1b("[..]),
+        ] {
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(10, 40);
 
-        s.adopt("web-1-first", 1);
-        s.process(b"tail\x1b[3");
-        s.adopt("web-1-second", 1);
-        s.process(b"new line\n");
+            s.adopt("web-1-first", 1);
+            s.process(tail);
+            s.adopt("web-1-second", 1);
+            s.process(b"new line\n");
 
-        assert_eq!(
-            non_empty(&s),
-            vec!["tail", "new line"],
-            "the dead container's unfinished sequence ate the replacement's output"
-        );
+            assert_eq!(
+                non_empty(&s),
+                vec!["tail", "new line"],
+                "{state}: the dead container's unfinished sequence ate the \
+                 replacement's output"
+            );
+        }
     }
 
     /// The string sequences are the severe half of #72. OSC, DCS, APC and PM
@@ -2264,22 +2278,38 @@ mod tests {
     ///
     /// A title-setting OSC is the ordinary way to reach this: a service that
     /// announces itself in the window title and is killed part way through the
-    /// write leaves exactly this.
+    /// write leaves exactly this. All four are exercised rather than the one,
+    /// because vte reaches them by different routes -- `SosPmApcString` is a
+    /// state of its own, and DCS passes through a hook the others do not -- and
+    /// because [`HANDOVER`] names all four.
+    ///
+    /// Two lines are written afterwards, not one. A swallow is unbounded: what
+    /// fails here is not a first line arriving damaged but output stopping, so
+    /// the assertion has to be able to tell "the pane came back" from "the pane
+    /// came back for one line".
     #[test]
     fn a_recreate_inside_a_string_sequence_does_not_swallow_the_replacement() {
-        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
-        s.resize(10, 40);
+        for (introducer, tail) in [
+            ("OSC", &b"tail\x1b]0;serv"[..]),
+            ("DCS", &b"tail\x1bPq#0"[..]),
+            ("APC", &b"tail\x1b_data"[..]),
+            ("PM", &b"tail\x1b^msg"[..]),
+        ] {
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(10, 40);
 
-        s.adopt("web-1-first", 1);
-        s.process(b"tail\x1b]0;serv");
-        s.adopt("web-1-second", 1);
-        s.process(b"new line\nand another\n");
+            s.adopt("web-1-first", 1);
+            s.process(tail);
+            s.adopt("web-1-second", 1);
+            s.process(b"new line\nand another\n");
 
-        assert_eq!(
-            non_empty(&s),
-            vec!["tail", "new line", "and another"],
-            "the dead container's unterminated string swallowed the replacement"
-        );
+            assert_eq!(
+                non_empty(&s),
+                vec!["tail", "new line", "and another"],
+                "{introducer}: the dead container's unterminated string \
+                 swallowed the replacement"
+            );
+        }
     }
 
     /// The pen is the half of #72 that needs no accident at all to bite. A

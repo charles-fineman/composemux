@@ -1997,9 +1997,16 @@ mod tests {
     ///
     /// The container is held equal here for the reason the attach is held equal
     /// there: it is the only way the break under test can be attributed to the
-    /// field this is about. Held equal to a *non-default* id besides, so that a
-    /// store comparing against its starting zero rather than against the id it
-    /// was given still has to get this right.
+    /// field this is about.
+    ///
+    /// Two writes on the first attach and then the reattach, rather than one
+    /// each, because a break in the wrong place and a break in the right place
+    /// both come out of a test that only ever sees the id change. The middle
+    /// write has to *join* -- so the id is read as a thing to compare against
+    /// what was given, not merely as a thing that is not the store's starting
+    /// zero. Reviewed as an earlier one-write-each version, where an `adopt`
+    /// comparing `self.attach == 0` instead of against its argument passed
+    /// this test and was caught only by `LogStore`'s own tests.
     #[tokio::test(start_paused = true)]
     async fn the_event_loop_carries_the_attach_id_into_the_buffer() {
         let mut app = app_with_service("api");
@@ -2013,7 +2020,11 @@ mod tests {
         drive_event_loop(
             &mut app,
             Vec::new(),
-            vec![output(7, b"GET /one"), output(8, b"GET /one 200\r\n")],
+            vec![
+                output(7, b"GET /one"),
+                output(7, b" (cached)"),
+                output(8, b"GET /one (cached) 200\r\n"),
+            ],
             Vec::new(),
         )
         .await;
@@ -2027,8 +2038,8 @@ mod tests {
             .collect();
         assert_eq!(
             lines,
-            vec!["GET /one", "GET /one 200"],
-            "the reattach's replay continued the row the first attach held"
+            vec!["GET /one (cached)", "GET /one (cached) 200"],
+            "the attach id was not read as an identity to compare"
         );
     }
 
