@@ -21,6 +21,30 @@ pub const DEFAULT_SCROLLBACK: usize = 1_000;
 /// kilobytes, which is where a bytes-per-row estimate used to give out.
 const MAX_RAW_BYTES: usize = 8 * 1024 * 1024;
 
+/// Whether `dropped` can have moved the pen away from wherever it stood.
+///
+/// What this claims is about vte's framing rather than about which attributes
+/// exist: only an escape sequence changes attribute state, and below `0x80`
+/// nothing but `ESC` starts one. C0 controls move the cursor and printable
+/// bytes write cells in the pen already set, so a run of plain seven-bit output
+/// leaves the pen exactly where it was.
+/// `no_seven_bit_byte_but_escape_moves_the_pen` puts that to the crate rather
+/// than asserting it, so it fails if `vt100` ever gives one of those bytes an
+/// effect on attributes -- which is the same reason `attributes_formatted` is
+/// used below rather than a list of attributes.
+///
+/// Bytes at or above `0x80` are excluded rather than reasoned about, and that
+/// half is defensive rather than load-bearing. `vt100` 0.16.2 drives vte in
+/// UTF-8 mode, where `0x9B` is a bad UTF-8 lead byte rather than the C1 CSI it
+/// is in an eight-bit stream, so no high byte moves the pen today and no test
+/// can make this half of the condition bite. It is here because that is a fact
+/// about a mode rather than about the protocol, and the cost of not depending
+/// on it is only that a service whose logs are not plain ASCII pays what every
+/// service pays today.
+fn can_move_the_pen(dropped: &[u8]) -> bool {
+    dropped.iter().any(|b| *b == 0x1b || *b >= 0x80)
+}
+
 /// The SGR sequence reproducing the styling left active after `prefix` and then
 /// `dropped` are parsed.
 ///
@@ -29,6 +53,14 @@ const MAX_RAW_BYTES: usize = 8 * 1024 * 1024;
 /// serialised by `attributes_formatted`, which diffs the parser's own attribute
 /// state against the default. Hand-enumerating attributes is what dropped `dim`
 /// once already, and would drop the next one the crate learns about.
+///
+/// Unconditional: `prefix` and `dropped` are parsed whatever is in them. The
+/// caller is where a parse gets skipped, because skipping one is only sound
+/// against a `prefix` that leaves vte in its ground state, and this function
+/// has no way to know that it does. `the_carried_pen_reproduces_every_attribute`
+/// splits a run of SGR sequences at an arbitrary byte, so it reaches this with
+/// a `prefix` ending mid-sequence -- and caught exactly that when the guard
+/// lived here.
 fn pen_after(prefix: &[u8], dropped: &[u8]) -> Vec<u8> {
     let mut scratch = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
     scratch.process(prefix);
@@ -444,7 +476,30 @@ impl LogStore {
         if cut == 0 {
             return;
         }
-        self.pen = pen_after(&self.pen, &self.raw[..cut]);
+        // The parse is what a trim costs, and a trim drops about as many lines
+        // as were ingested since the last one -- so amortised it is one scratch
+        // parse per line of output, for every store, on-screen or off. Widening
+        // the hysteresis band above does not touch that: it trims less often
+        // and drops more each time, leaving the bytes parsed per byte ingested
+        // where they were.
+        //
+        // Skipping it is sound *here* in a way it would not be inside
+        // `pen_after`: `self.pen` is only ever that function's own
+        // `attributes_formatted` output or the empty vector it starts as, both
+        // of which leave vte in its ground state, so bytes that cannot move the
+        // pen cannot be swallowed as somebody else's parameters either. And
+        // `self.pen` already spells out where the pen stands, so there is
+        // nothing to recompute.
+        //
+        // `bench_the_pen_carried_across_a_trim` measures it on 61-byte log
+        // lines, in release, on one machine: over a plain dropped prefix the
+        // scan costs 0.03 us per line against 0.7-0.8 for the parse it
+        // replaces, and a released store's whole ingest falls from 1.2-1.4 us
+        // per line to 0.33-0.36. For output with SGR in it neither figure
+        // moves: the scan stops at the first escape byte and the parse runs.
+        if can_move_the_pen(&self.raw[..cut]) {
+            self.pen = pen_after(&self.pen, &self.raw[..cut]);
+        }
         self.lines -= bytecount(&self.raw[..cut]);
         // `drain` would leave the old capacity behind: one oversized chunk can
         // hold many times the ceiling for the life of the store. `split_off`
@@ -576,11 +631,12 @@ impl LogStore {
     /// closes".
     ///
     /// What stops is the feed into this store's own grid, not the ingest.
-    /// Output keeps arriving for a closed pane and keeps being retained, and
-    /// `retain` still runs the bytes that age out of `raw` through a scratch
-    /// emulator to carry `pen` forward -- so an off-screen service still costs
-    /// the bytes, the line accounting and that scratch parse. What it stops
-    /// paying for is a parse into a grid nothing will read.
+    /// Output keeps arriving for a closed pane and keeps being retained, so an
+    /// off-screen service still costs the bytes and the line accounting. It
+    /// costs the scratch parse `retain` carries `pen` forward with as well, but
+    /// only over a dropped prefix with an escape byte somewhere in it: plain
+    /// output fails `can_move_the_pen` and skips it. What it stops paying for
+    /// either way is a parse into a grid nothing will read.
     ///
     /// Scroll position does not survive, and should not: the offset counts rows
     /// back from the bottom, and output kept arriving while the pane was
@@ -1231,6 +1287,36 @@ mod tests {
         );
     }
 
+    /// The styling a trim must carry is not always at the front of what it
+    /// drops. A service that runs plain for a while and then turns a colour on
+    /// has its SGR buried in the middle of the dropped prefix, which is where a
+    /// scan bounded to a window at either end of it would lose it -- the
+    /// heuristic `can_move_the_pen` deliberately is not.
+    ///
+    /// `styling_set_before_the_retained_window_survives_a_resize` and its
+    /// neighbours all set the colour before the first byte of output, so the
+    /// escape sits at offset zero in every prefix they drop.
+    #[test]
+    fn styling_set_part_way_through_the_dropped_prefix_survives_a_trim() {
+        let mut s = LogStore::new(16);
+        s.resize(5, 40);
+        let filler = "y".repeat(4096);
+        for _ in 0..10 {
+            s.process(format!("{filler}\n").as_bytes());
+        }
+        s.process(b"\x1b[31m");
+        for _ in 0..200 {
+            s.process(format!("{filler}\n").as_bytes());
+        }
+        assert!(!s.pen.is_empty(), "a trim should have happened");
+        s.resize(5, 100);
+        assert_eq!(
+            s.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1),
+            "a colour set inside the dropped prefix was lost"
+        );
+    }
+
     #[test]
     fn styling_that_was_reset_before_the_trim_is_not_resurrected() {
         // The pen must reflect the state at the trim boundary, not every
@@ -1239,6 +1325,222 @@ mod tests {
         assert_eq!(
             s.screen().cell(0, 0).unwrap().fgcolor(),
             vt100::Color::Default
+        );
+    }
+
+    /// The warrant for the guard in `pen_after`, asked of the crate rather than
+    /// asserted here: with every attribute it knows how to serialise set at
+    /// once, no seven-bit byte but `ESC` moves the pen.
+    ///
+    /// Each byte is fed repeatedly and interleaved with text, so a byte that
+    /// needed a second one to take vte out of its ground state would still get
+    /// there. `0x80` and above are outside the claim and outside the guard.
+    ///
+    /// This is what makes the guard the same kind of thing as
+    /// `attributes_formatted` rather than the hand-enumeration that dropped
+    /// `dim`: if a later `vt100` gives one of these bytes an effect on
+    /// attributes, this fails instead of the pen quietly going wrong.
+    #[test]
+    fn no_seven_bit_byte_but_escape_moves_the_pen() {
+        let set = b"\x1b[1;2;3;4;7;31;46m";
+        for byte in 0u8..=0x7f {
+            if byte == 0x1b {
+                continue;
+            }
+            let mut scratch = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+            scratch.process(set);
+            let before = scratch.screen().attributes_formatted();
+            for _ in 0..4 {
+                scratch.process(&[byte]);
+                scratch.process(b"text");
+                scratch.process(&[byte, byte]);
+            }
+            assert_eq!(
+                scratch.screen().attributes_formatted(),
+                before,
+                "byte {byte:#04x} moved the pen, which the guard in `pen_after` says it cannot"
+            );
+        }
+    }
+
+    /// What the guard in `retain` rests on: a dropped prefix that
+    /// `can_move_the_pen` clears leaves the pen where it was, so keeping
+    /// `self.pen` is what the parse would have produced.
+    ///
+    /// Compared through `pen_after`'s canonical spelling rather than as raw
+    /// bytes, because the pen a store starts with is the empty vector while the
+    /// parse would render the same default state as `ESC [ m`. Those are the
+    /// same pen and replay identically; only their spelling differs.
+    #[test]
+    fn a_dropped_prefix_that_cannot_move_the_pen_leaves_it_alone() {
+        let pens: [&[u8]; 6] = [
+            b"",
+            b"\x1b[31m",
+            b"\x1b[1;2;3;4;7m",
+            b"\x1b[38;5;200m",
+            b"\x1b[48;2;10;20;30m",
+            b"\x1b[91;42m",
+        ];
+        let plain: [&[u8]; 4] = [
+            b"",
+            b"plain output\r\n",
+            b"a line\r\nand another one\r\n",
+            // Every C0 control but ESC, which is the half of the guard that
+            // has to hold for real log output rather than for a mode.
+            b"\x07\x08\x09\x0b\x0c\x0d\x0e\x0f\x7f",
+        ];
+        for pen in pens {
+            // The pen as `retain` holds it: `pen_after`'s own output, or empty.
+            let carried = if pen.is_empty() {
+                Vec::new()
+            } else {
+                pen_after(pen, &[])
+            };
+            for dropped in plain {
+                assert!(
+                    !can_move_the_pen(dropped),
+                    "the guard flagged {:?}, so this case proves nothing",
+                    String::from_utf8_lossy(dropped).escape_debug().to_string()
+                );
+                assert_eq!(
+                    pen_after(&carried, dropped),
+                    pen_after(&carried, &[]),
+                    "pen {:?} moved across dropped bytes {:?}",
+                    String::from_utf8_lossy(&carried).escape_debug().to_string(),
+                    String::from_utf8_lossy(dropped).escape_debug().to_string(),
+                );
+            }
+        }
+    }
+
+    /// The guard is allowed to be conservative and not allowed to be wrong, so
+    /// anything carrying an escape byte has to reach the parse whether or not
+    /// it turns out to move the pen. The last case does not move it, and is
+    /// here because the guard cannot tell.
+    #[test]
+    fn anything_with_an_escape_byte_in_it_still_reaches_the_parse() {
+        let cases: [&[u8]; 4] = [
+            b"\x1b[32m",
+            b"\x1b[0mplain output\r\n",
+            b"line\r\n\x1b[1mline\r\n",
+            b"text \xc3\xa9 with a non-ascii byte\r\n",
+        ];
+        for dropped in cases {
+            assert!(
+                can_move_the_pen(dropped),
+                "{:?} skipped the parse",
+                String::from_utf8_lossy(dropped).escape_debug().to_string()
+            );
+        }
+    }
+
+    /// What a trim costs, and what the guard takes off it. Ignored by default:
+    /// it is a measurement, not a threshold, and a threshold on a shared
+    /// runner would be a flake.
+    ///
+    /// Run with `cargo test --release -- --ignored --nocapture
+    /// bench_the_pen_carried_across_a_trim`. Release matters: the debug figures
+    /// are an order of magnitude larger and in a different proportion.
+    ///
+    /// The minimum of several rounds rather than the mean of one: the mean over
+    /// a single burst moved by 40% run to run on the machine this was written
+    /// on, while the minimum held to a few percent.
+    #[test]
+    #[ignore = "measurement, not a threshold"]
+    fn bench_the_pen_carried_across_a_trim() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // One trim's worth of dropped prefix at the default scrollback and a
+        // 40-row pane, in the shape a service's logs come in.
+        let keep = keep_lines_for(DEFAULT_SCROLLBACK, 40);
+        let prefix = |coloured: bool| {
+            let mut v = Vec::new();
+            for i in 0..keep {
+                let line = if coloured && i % 8 == 0 {
+                    format!("2026-01-01T00:00:00.000Z \x1b[33mWARN \x1b[0m mod handled id={i}\r\n")
+                } else {
+                    format!("2026-01-01T00:00:00.000Z INFO  mod handled id={i} status=200\r\n")
+                };
+                v.extend_from_slice(line.as_bytes());
+            }
+            v
+        };
+        let plain = prefix(false);
+        let coloured = prefix(true);
+
+        let per_line = |f: &dyn Fn()| {
+            let round = || {
+                let t = Instant::now();
+                for _ in 0..20 {
+                    f();
+                }
+                t.elapsed().as_secs_f64() / 20.0 / keep as f64 * 1e6
+            };
+            for _ in 0..5 {
+                round();
+            }
+            (0..12).map(|_| round()).fold(f64::MAX, f64::min)
+        };
+
+        println!("bytes per line: {}", plain.len() / keep);
+        // What the guard replaces, and what it costs, over the same prefix.
+        println!(
+            "pen_after over a plain prefix                {:.4} us/line",
+            per_line(&|| {
+                black_box(pen_after(black_box(b"\x1b[33m"), black_box(&plain)));
+            })
+        );
+        println!(
+            "can_move_the_pen over the same prefix        {:.4} us/line",
+            per_line(&|| {
+                black_box(can_move_the_pen(black_box(&plain)));
+            })
+        );
+        println!(
+            "pen_after over a coloured prefix             {:.4} us/line",
+            per_line(&|| {
+                black_box(pen_after(black_box(b"\x1b[33m"), black_box(&coloured)));
+            })
+        );
+
+        // Whole-store ingest, so the parse sits next to what it is a share of.
+        // Released, because that is the store #58 left this as the residual
+        // cost of.
+        let ingest = |body: &dyn Fn(usize) -> Vec<u8>| {
+            let n = 40_000;
+            let lines: Vec<Vec<u8>> = (0..n).map(body).collect();
+            let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+            s.resize(40, 120);
+            s.process(b"x\r\n");
+            s.release();
+            let t = Instant::now();
+            for l in &lines {
+                s.process(l);
+            }
+            t.elapsed().as_secs_f64() / n as f64 * 1e6
+        };
+        // Same reason as `per_line`: one pass over 40,000 lines moved by 20%
+        // run to run, which is wider than some of the differences it is here
+        // to show.
+        let ingest =
+            |body: &dyn Fn(usize) -> Vec<u8>| (0..5).map(|_| ingest(body)).fold(f64::MAX, f64::min);
+        println!(
+            "released ingest, plain output                {:.4} us/line",
+            ingest(
+                &|i| format!("2026-01-01T00:00:00.000Z INFO  mod handled id={i} status=200\n")
+                    .into_bytes()
+            )
+        );
+        println!(
+            "released ingest, one line in eight coloured  {:.4} us/line",
+            ingest(&|i| if i % 8 == 0 {
+                format!("2026-01-01T00:00:00.000Z \x1b[33mWARN \x1b[0m mod handled id={i}\n")
+                    .into_bytes()
+            } else {
+                format!("2026-01-01T00:00:00.000Z INFO  mod handled id={i} status=200\n")
+                    .into_bytes()
+            })
         );
     }
 
