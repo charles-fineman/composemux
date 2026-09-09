@@ -36,10 +36,15 @@ const MAX_RAW_BYTES: usize = 8 * 1024 * 1024;
 /// Bytes at or above `0x80` are excluded rather than reasoned about, and that
 /// half is defensive rather than load-bearing. `vt100` 0.16.2 drives vte in
 /// UTF-8 mode, where `0x9B` is a bad UTF-8 lead byte rather than the C1 CSI it
-/// is in an eight-bit stream, so no high byte moves the pen today and no test
-/// can make this half of the condition bite. It is here because that is a fact
-/// about a mode rather than about the protocol, and the cost of not depending
-/// on it is only that a service whose logs are not plain ASCII pays what every
+/// is in an eight-bit stream, so no high byte moves the pen today: there is no
+/// pen this half saves, and no test can show one. It is here because that is a
+/// fact about a mode rather than about the protocol.
+///
+/// Which makes it exactly the kind of condition someone mutation-testing their
+/// way through this function deletes as dead. So it is pinned at the predicate
+/// instead of at a pen: `anything_with_an_escape_byte_in_it_still_reaches_the_
+/// parse` fails on its non-ASCII case if the half goes. The cost of keeping it
+/// is only that a service whose logs are not plain ASCII pays what every
 /// service pays today.
 fn can_move_the_pen(dropped: &[u8]) -> bool {
     dropped.iter().any(|b| *b == 0x1b || *b >= 0x80)
@@ -634,9 +639,11 @@ impl LogStore {
     /// Output keeps arriving for a closed pane and keeps being retained, so an
     /// off-screen service still costs the bytes and the line accounting. It
     /// costs the scratch parse `retain` carries `pen` forward with as well, but
-    /// only over a dropped prefix with an escape byte somewhere in it: plain
-    /// output fails `can_move_the_pen` and skips it. What it stops paying for
-    /// either way is a parse into a grid nothing will read.
+    /// only over a dropped prefix with an escape or non-ASCII byte somewhere in
+    /// it: plain ASCII output fails `can_move_the_pen` and skips it. Non-ASCII
+    /// is not exotic -- one `e`-acute or box-drawing character in a log line
+    /// puts that trim back on the full parse. What it stops paying for either
+    /// way is a parse into a grid nothing will read.
     ///
     /// Scroll position does not survive, and should not: the offset counts rows
     /// back from the bottom, and output kept arriving while the pane was
@@ -1328,9 +1335,21 @@ mod tests {
         );
     }
 
-    /// The warrant for the guard in `pen_after`, asked of the crate rather than
-    /// asserted here: with every attribute it knows how to serialise set at
-    /// once, no seven-bit byte but `ESC` moves the pen.
+    /// The warrant for the guard in `retain`, asked of the crate rather than
+    /// asserted here: with every attribute `vt100` knows how to serialise set,
+    /// no seven-bit byte but `ESC` moves the pen.
+    ///
+    /// Two states rather than one, because "every attribute at once" is not a
+    /// thing the crate can be put into. It keeps bold and dim in a single
+    /// field, so `CSI 1;2 m` leaves dim set and bold clear -- and a loop run
+    /// against one everything-at-once sequence would quietly be testing six
+    /// attributes while claiming seven. That is this file's own cautionary
+    /// tale: an attribute silently missing from the set under test is why
+    /// `pen_after` defers to `attributes_formatted` instead of a hand-written
+    /// list. Bold is also what the checked-in `codes = [1]` regression seed is
+    /// about, so it is the one least worth losing. The premise is pinned below
+    /// rather than assumed, so a `vt100` that separates the two fails here
+    /// instead of leaving a stale comment.
     ///
     /// Each byte is fed repeatedly and interleaved with text, so a byte that
     /// needed a second one to take vte out of its ground state would still get
@@ -1342,24 +1361,60 @@ mod tests {
     /// attributes, this fails instead of the pen quietly going wrong.
     #[test]
     fn no_seven_bit_byte_but_escape_moves_the_pen() {
-        let set = b"\x1b[1;2;3;4;7;31;46m";
-        for byte in 0u8..=0x7f {
-            if byte == 0x1b {
-                continue;
-            }
+        let bold = b"\x1b[1;3;4;7;31;46m".as_slice();
+        let dim = b"\x1b[2;3;4;7;31;46m".as_slice();
+
+        // The premise for splitting them: between the two, every attribute the
+        // crate exposes is set somewhere, and neither sequence sets both halves
+        // of the bold/dim field.
+        let attrs = |seq: &[u8]| {
             let mut scratch = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
-            scratch.process(set);
-            let before = scratch.screen().attributes_formatted();
-            for _ in 0..4 {
-                scratch.process(&[byte]);
-                scratch.process(b"text");
-                scratch.process(&[byte, byte]);
+            scratch.process(seq);
+            scratch.process(b"x");
+            let cell = scratch.screen().cell(0, 0).unwrap();
+            (
+                cell.bold(),
+                cell.dim(),
+                cell.italic(),
+                cell.underline(),
+                cell.inverse(),
+                cell.fgcolor(),
+                cell.bgcolor(),
+            )
+        };
+        let colours = (vt100::Color::Idx(1), vt100::Color::Idx(6));
+        assert_eq!(
+            attrs(bold),
+            (true, false, true, true, true, colours.0, colours.1),
+            "the bold half of the pair is not set, so the loop below does not cover it"
+        );
+        assert_eq!(
+            attrs(dim),
+            (false, true, true, true, true, colours.0, colours.1),
+            "the dim half of the pair is not set, so the loop below does not cover it"
+        );
+
+        for set in [bold, dim] {
+            for byte in 0u8..=0x7f {
+                if byte == 0x1b {
+                    continue;
+                }
+                let mut scratch = vt100::Parser::new(MIN_ROWS, MIN_COLS, 0);
+                scratch.process(set);
+                let before = scratch.screen().attributes_formatted();
+                for _ in 0..4 {
+                    scratch.process(&[byte]);
+                    scratch.process(b"text");
+                    scratch.process(&[byte, byte]);
+                }
+                assert_eq!(
+                    scratch.screen().attributes_formatted(),
+                    before,
+                    "byte {byte:#04x} moved the pen set by {:?}, which the guard in `retain` \
+                     says it cannot",
+                    String::from_utf8_lossy(set).escape_debug().to_string()
+                );
             }
-            assert_eq!(
-                scratch.screen().attributes_formatted(),
-                before,
-                "byte {byte:#04x} moved the pen, which the guard in `pen_after` says it cannot"
-            );
         }
     }
 
