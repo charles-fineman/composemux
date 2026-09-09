@@ -59,7 +59,7 @@ const INITIAL_COLS: u16 = 80;
 /// Written into the retained stream when the store changes hands, ahead of the
 /// row break, to keep the dead container's emulator state off its successor.
 ///
-/// Two sequences, plus one thing that happens before either of them runs.
+/// Five sequences, plus one thing that happens before any of them runs.
 ///
 /// That first thing is the abort, and it is the leading `ESC` rather than a
 /// sequence of its own. `ESC` is an anywhere-transition in vte's state
@@ -95,15 +95,70 @@ const INITIAL_COLS: u16 = 80;
 /// newline leaves the pen set, and every line its successor writes comes out in
 /// the dead container's colour.
 ///
-/// What is deliberately not here is a reset of the scroll region. `CSI r` is
-/// the only sequence vt100 implements that would do it, and `set_scroll_region`
-/// ends by homing the cursor -- so the successor would start writing over the
-/// top of the visible pane. The full resets are worse still: `ESC c` (RIS)
-/// rebuilds the screen from nothing, discarding the grid *and* the scrollback,
-/// which is the pane history #46 exists to protect, and `CSI ! p` (DECSTR)
-/// reaches vt100's unhandled-CSI callback and does nothing at all. #75 tracks
-/// the scroll region.
-const HANDOVER: &[u8] = b"\x1b[?47l\x1b[m";
+/// `ESC 7` `CSI r` `ESC 8` resets the scroll region, which is #75. A region
+/// left set is not a cosmetic inheritance: `Grid::scroll_up` pushes an evicted
+/// row into the scrollback only `if !self.scroll_region_active()`, so a
+/// successor writing inside a dead container's region scrolls within it and
+/// the pane accumulates no history at all.
+///
+/// `CSI r` is the only sequence vt100 0.16.2 implements that resets the
+/// primary grid's region without throwing the grid away with it, and with no
+/// parameters it is a reset at any pane size:
+/// `canonicalize_params_decstbm` defaults them to the full height, and
+/// `set_scroll_region` falls back to the full height on its `else` branch in
+/// any case. What made it unusable alone is its last two lines,
+/// `self.pos.row = self.scroll_top; self.pos.col = 0` -- the cursor homed to
+/// the top of the visible grid, where the successor would write over rows the
+/// dead container's output is still on. #75 read that as the reason the region
+/// had to be left set. The save and restore around it are what make it
+/// affordable: `ESC 7` and `ESC 8` are DECSC and DECRC, which vt100 routes to
+/// `Screen::save_cursor` and `Screen::restore_cursor`, so the position the
+/// homing throws away goes straight back -- and all three are plain bytes,
+/// which is what the replay constraint asks for.
+///
+/// The order of the three inside the handover is not free.
+///
+/// `ESC 7` has to come after `CSI ? 47 l`, because `saved_pos` lives on the
+/// `Grid` and vt100 reaches it through `grid_mut()`. Saved on the alternate
+/// grid and restored on the primary one, the restore reads a `saved_pos`
+/// nothing wrote and homes the cursor after all.
+/// `a_recreate_brings_a_pane_back_from_the_alternate_screen` does *not* catch
+/// that: it enters with `CSI ? 1049 h`, which takes a `decsc` on the primary
+/// grid on the way in, so the misplaced restore reads a `saved_pos` that
+/// happens to be right. `the_handover_saves_the_cursor_on_the_grid_it_puts_it_back_on`
+/// enters with `CSI ? 47 h`, which does not.
+///
+/// `CSI m` has to come before `ESC 7`, because `Screen::save_cursor` saves
+/// `self.attrs` alongside the position and `restore_cursor` puts both back.
+/// Saving first would park the dead container's pen in `saved_attrs`, where a
+/// successor's own `ESC 8` hands it straight back.
+///
+/// What `ESC 7` overwrites is a saved cursor the dead container set, which is
+/// as dead as the rest of its state, and what replaces it is at worst
+/// harmless. A save is three things here, not one: the position the handover
+/// happens at, which is where the successor is about to write; the default pen
+/// the `CSI m` in front of it has just set; and, because `Grid::save_cursor`
+/// covers it too, the dead container's origin mode -- which is inert while the
+/// region stays full height. `Grid` reads the flag four times, and that save is
+/// one of them. The other three are in `set_pos` and are the only ones with any
+/// geometric effect, and all three collapse once `CSI r` has put `scroll_top`
+/// back to 0: the offset adds nothing, `row_clamp_top` cannot fire against a
+/// top of 0, and `row_clamp_bottom`'s region bound is `size.rows - 1`, which is
+/// the bound it would have used anyway.
+///
+/// A trim cannot orphan the restore into something worse. `trim_point`'s line
+/// budget cuts immediately after a `\n` and this carries none, so it takes the
+/// whole handover or none of it; only the byte-ceiling fallback can land
+/// inside, and it cuts at the *front* of what survives -- where the cursor is
+/// at the origin and `saved_pos` is still `Pos::default()`, so an `ESC 8` with
+/// no `ESC 7` ahead of it restores the position the replay already has.
+///
+/// The full resets stay rejected. `ESC c` (RIS) rebuilds the screen from
+/// nothing, discarding the grid *and* the scrollback, which is the pane
+/// history #46 exists to protect, and it is in `raw`, so the replay discards
+/// it again. `CSI ! p` (DECSTR) reaches vt100's unhandled-CSI callback and
+/// does nothing at all.
+const HANDOVER: &[u8] = b"\x1b[?47l\x1b[m\x1b7\x1b[r\x1b8";
 
 pub struct LogStore {
     parser: vt100::Parser,
@@ -239,7 +294,8 @@ impl LogStore {
     ///
     /// A row is not all that carries over, though, which is what #72 is about:
     /// the emulator's parse state, its pen and its screen selection are the
-    /// dead container's too, and none of them is undone by ending a row.
+    /// dead container's too, and none of them is undone by ending a row -- nor
+    /// is its scroll region, which #75 split out and then fixed.
     /// [`HANDOVER`] is what resets them and carries the reasoning for each
     /// sequence in it. It goes in ahead of the break rather than after it,
     /// because a container that died inside an OSC, DCS, APC or PM string
@@ -263,10 +319,11 @@ impl LogStore {
     ///
     /// The handover write is what makes that decision need help. `process`
     /// re-derives the carry from the bytes it is given, and [`HANDOVER`] ends on
-    /// an `m`, so by the time the break is written the flag describes our bytes
-    /// rather than the container's and the `\r` goes back in. The carry is put
-    /// back where the container left it so that the two writes together retain
-    /// exactly the bytes the break alone used to.
+    /// the `8` of a cursor restore rather than a carriage return, so by the time
+    /// the break is written the flag describes our bytes rather than the
+    /// container's and the `\r` goes back in. The carry is put back where the
+    /// container left it so that the two writes together retain exactly the
+    /// bytes the break alone used to.
     ///
     /// `raw`'s last byte is what says whether there is a row to end, because
     /// trimming only ever cuts from the front -- so the last byte of `raw` is
@@ -1920,11 +1977,11 @@ mod tests {
     ///
     /// Since #72 that is not only a question of what the break writes but of
     /// what the handover before it leaves behind. `process` re-derives the
-    /// carry from every write, and [`HANDOVER`] ends on an `m`, so without
-    /// `adopt` putting the carry back the break would find the flag clear and
-    /// supply the `\r` itself. `HANDOVER` is spliced into the expectation
-    /// rather than spelled out, because what this test is about is the byte
-    /// either side of it.
+    /// carry from every write, and [`HANDOVER`] ends on the `8` of a cursor
+    /// restore rather than a carriage return, so without `adopt` putting the
+    /// carry back the break would find the flag clear and supply the `\r`
+    /// itself. `HANDOVER` is spliced into the expectation rather than spelled
+    /// out, because what this test is about is the byte either side of it.
     ///
     /// The carry the break leaves behind is checked directly rather than
     /// through its effects, because here it has none to check. A break that
@@ -2424,6 +2481,274 @@ mod tests {
             non_empty(&s),
             vec!["serving requests", "listening on 8080"],
             "the pane is still showing the dead container's alternate screen"
+        );
+    }
+
+    /// `ESC 7` is taken after `CSI ? 47 l`, not before it. `saved_pos` lives on
+    /// the `Grid` and vt100 reaches both halves through `grid_mut()`, so a save
+    /// taken while the dead container's alternate grid is still selected is not
+    /// the one the restore reads once `CSI ? 47 l` has switched back -- the
+    /// restore finds the primary grid's `Pos::default()` and homes the cursor,
+    /// which is the whole thing the save exists to prevent.
+    ///
+    /// `CSI ? 47 h` rather than the `CSI ? 1049 h` an application would really
+    /// use, and that is the point of this test rather than an oversight.
+    /// vt100's `1049` takes a `decsc` on the primary grid on the way in, so a
+    /// save on the wrong grid is covered for by a `saved_pos` the entry left
+    /// behind and the bug does not show; `47` writes no saved cursor at all.
+    /// `a_recreate_brings_a_pane_back_from_the_alternate_screen` uses `1049`
+    /// and passes either way.
+    ///
+    /// Two rows of dead output, because a homed cursor and a restored one have
+    /// to land somewhere different for the assertion to see them apart.
+    #[test]
+    fn the_handover_saves_the_cursor_on_the_grid_it_puts_it_back_on() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"serving requests\nstill serving\n");
+        s.process(b"\x1b[?47h");
+        assert!(
+            non_empty(&s).is_empty(),
+            "the switch to the alternate screen did nothing, so nothing is under test"
+        );
+
+        s.adopt("web-1-second", 1);
+        s.process(b"listening on 8080\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["serving requests", "still serving", "listening on 8080"],
+            "the handover saved the cursor on the alternate grid and restored it \
+             on the primary one"
+        );
+    }
+
+    /// A scroll region the dead container set is not a cosmetic inheritance:
+    /// `Grid::scroll_up` pushes an evicted row into the scrollback only
+    /// `if !self.scroll_region_active()`, so a successor writing inside a dead
+    /// container's region scrolls within it and the pane accumulates no
+    /// history at all. Everything that leaves the region is simply gone, and
+    /// no amount of scrolling up reaches it. That is #75.
+    ///
+    /// The premise is asserted against the dead container's own output first.
+    /// A `vt100` that ignored DECSTBM, or a region that did not bind at this
+    /// pane size, would make the second half pass on a store that never had a
+    /// scroll region to inherit.
+    #[test]
+    fn a_recreate_is_not_confined_to_the_dead_container_s_scroll_region() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[1;4r");
+        for i in 0..20 {
+            s.process(format!("dead {i}\n").as_bytes());
+        }
+        s.scroll_to_top();
+        assert_eq!(
+            s.scroll_offset(),
+            0,
+            "the scroll region never bound, so nothing here is under test"
+        );
+        s.scroll_to_bottom();
+
+        s.adopt("web-1-second", 1);
+        for i in 0..20 {
+            s.process(format!("live {i}\n").as_bytes());
+        }
+
+        s.scroll_to_top();
+        assert!(
+            s.scroll_offset() > 0,
+            "the replacement is still scrolling inside the dead container's \
+             region, so the pane retains no history"
+        );
+        assert!(
+            s.all_text().contains("live 0"),
+            "the replacement's earliest output fell out of the dead \
+             container's region and was lost"
+        );
+    }
+
+    /// The region reset has to be in `raw`, not only on the grid, for the same
+    /// reason the break and the rest of the handover do: a resize throws the
+    /// grid away and replays `raw` from scratch, and the pane a store was
+    /// created for is almost always a different size from the one it starts
+    /// at, so that resize is the ordinary case rather than an unusual one. A
+    /// reset applied to the live parser alone puts the dead container's region
+    /// straight back the first time the pane changes size.
+    ///
+    /// The control is the premise, and it is worth having on its own: it is
+    /// what shows that a `CSI r` in `raw` really does come back out of a
+    /// replay at the new size, so the second half is measuring the handover
+    /// rather than a region that had quietly stopped binding.
+    #[test]
+    fn the_scroll_region_reset_survives_a_replay() {
+        let mut control = LogStore::new(DEFAULT_SCROLLBACK);
+        control.resize(10, 80);
+        control.adopt("web-1-first", 1);
+        control.process(b"\x1b[1;4rdead output\n");
+        control.resize(10, 40);
+        for i in 0..20 {
+            control.process(format!("live {i}\n").as_bytes());
+        }
+        control.scroll_to_top();
+        assert_eq!(
+            control.scroll_offset(),
+            0,
+            "the region did not survive the replay on its own, so nothing here \
+             is under test"
+        );
+
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 80);
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[1;4rdead output\n");
+        s.adopt("web-1-second", 1);
+        s.resize(10, 40);
+        for i in 0..20 {
+            s.process(format!("live {i}\n").as_bytes());
+        }
+        s.scroll_to_top();
+        assert!(
+            s.scroll_offset() > 0,
+            "the replay put the dead container's scroll region back"
+        );
+    }
+
+    /// Resetting the region must not cost the rows the reset exists to
+    /// protect. `CSI r` on its own ends `Grid::set_scroll_region` with
+    /// `self.pos.row = self.scroll_top; self.pos.col = 0`, homing the cursor
+    /// to the top of the visible grid -- so the successor starts writing over
+    /// rows the dead container's output is still on. #75 read that as the
+    /// reason the region could not be reset at all; the `ESC 7` and `ESC 8`
+    /// around it are what make it affordable.
+    ///
+    /// Three rows is more than this needs, and what it needs is not rows.
+    /// `CSI r` resets the region to full height and ends by homing to
+    /// `(scroll_top, 0)`, which is now `(0, 0)`, so the homed cursor and the
+    /// restored one are told apart wherever the dead container's row is not row
+    /// 0 -- not, as this said twice before, wherever it is off the top of the
+    /// region the dead container had. The two coincide only for a region that
+    /// starts at row 0, which is the one this fixture uses. A single `first\n`
+    /// is enough: the trailing newline leaves the cursor on row 1. `first` with
+    /// no newline is not -- the cursor is still on row 0, and `adopt`'s own
+    /// break then moves the homed and the restored cursor to row 1 alike,
+    /// column included, because the break carries a `\r`. Measured across one,
+    /// two and three rows with and without the trailing newline, and again
+    /// across regions that do not start at row 0: every shape that leaves the
+    /// cursor off row 0 catches a bare `CSI r`, and every shape that does not,
+    /// does not. Three rows are kept for reading, not for reach.
+    #[test]
+    fn resetting_the_scroll_region_does_not_move_the_cursor() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[1;4rfirst\nsecond\nthird\n");
+
+        s.adopt("web-1-second", 1);
+        s.process(b"listening on 8080\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["first", "second", "third", "listening on 8080"],
+            "the dead container's output did not survive the handover intact"
+        );
+    }
+
+    /// [`HANDOVER`] resets the pen *before* it saves the cursor.
+    /// `Screen::save_cursor` saves `self.attrs` alongside the grid position
+    /// and `Screen::restore_cursor` puts both back, so an `ESC 7` taken ahead
+    /// of the `CSI m` would park the dead container's pen in `saved_attrs` --
+    /// where a successor's own `ESC 8` hands it straight back, which is the
+    /// fault #72's `CSI m` exists to prevent, merely deferred.
+    ///
+    /// A successor that restores a cursor it never saved is not a contrivance
+    /// worth building the test around on its own; what it is here is the only
+    /// way to read `saved_attrs`, which `vt100` exposes no other way.
+    ///
+    /// The first assertion is not scaffolding either. Before the handover
+    /// carried a save at all, `saved_pos` was `Pos::default()` and the same
+    /// `ESC 8` homed the cursor onto the dead container's row.
+    #[test]
+    fn a_recreate_does_not_leave_the_dead_container_s_pen_where_a_restore_finds_it() {
+        let mut s = LogStore::new(DEFAULT_SCROLLBACK);
+        s.resize(10, 40);
+
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[31mError: exiting\n");
+        s.adopt("web-1-second", 1);
+        s.process(b"\x1b8listening on 8080\n");
+
+        assert_eq!(
+            non_empty(&s),
+            vec!["Error: exiting", "listening on 8080"],
+            "the successor's restore put the cursor on the dead container's row"
+        );
+        let dead = s.screen().cell(0, 0).expect("the dead container's row");
+        assert_ne!(
+            dead.fgcolor(),
+            vt100::Color::Default,
+            "the dead container never set a colour, so nothing here is under test"
+        );
+        let replacement = s.screen().cell(1, 0).expect("the replacement's row");
+        assert_eq!(
+            replacement.fgcolor(),
+            vt100::Color::Default,
+            "the successor's restore handed back the dead container's pen"
+        );
+    }
+
+    /// The byte-ceiling trim is the one cut that can land inside the handover.
+    /// The line budget cannot: it cuts immediately after a `\n` and
+    /// [`HANDOVER`] carries none, so it takes the whole thing or none of it.
+    /// The ceiling fallback cuts at an arbitrary byte, and a cut between the
+    /// `ESC 7` and the `ESC 8` leaves a restore with no matching save in the
+    /// retained stream.
+    ///
+    /// It is harmless, and that is asserted rather than reasoned about. The
+    /// fallback cuts at the *front* of what survives, so the orphaned restore
+    /// runs against a parser that has read nothing but the carried pen: the
+    /// cursor is at the origin and `saved_pos` is still `Pos::default()`, so
+    /// the restore puts back the position the replay already has. The control
+    /// is the same retained bytes with the orphan removed, which is the only
+    /// comparison that can tell "did nothing" from "did something invisible
+    /// at this size".
+    #[test]
+    fn a_trim_that_orphans_the_handover_s_cursor_restore_changes_nothing() {
+        let mut s = LogStore::new(16);
+        s.resize(5, 40);
+        s.adopt("web-1-first", 1);
+        s.process(b"\x1b[1;3rgoodbye\n");
+        s.adopt("web-1-second", 1);
+
+        // Sized so the ceiling cut lands five bytes from the end of the
+        // handover, which is the `ESC 8` and the `CSI r` in front of it: the
+        // cut is measured back from the end of `raw`, so the prefix length
+        // does not enter into it.
+        let blob = vec![b'X'; MAX_RAW_BYTES - 5];
+        s.process(&blob);
+        assert!(
+            s.raw.starts_with(b"\x1b[r\x1b8"),
+            "the cut did not orphan a cursor restore, so nothing is under test"
+        );
+
+        let tail = s.raw.clone();
+        s.resize(5, 100);
+
+        let mut control = LogStore::new(16);
+        control.resize(5, 40);
+        control.process(&tail[..3]);
+        control.process(&tail[5..]);
+        control.resize(5, 100);
+
+        assert_eq!(
+            non_empty(&s),
+            non_empty(&control),
+            "the orphaned cursor restore moved the replay's cursor"
         );
     }
 
