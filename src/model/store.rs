@@ -186,14 +186,16 @@ const INITIAL_COLS: u16 = 80;
 /// the bound it would have used anyway.
 ///
 /// `CSI ? 1049 h` `CSI ? 1049 l` clears the alternate grid, which is #79.
-/// Everything ahead of this pair lands on the *primary* grid, and the
-/// `CSI ? 47 l` is what makes it: vt100 keeps `pos`, `saved_pos`,
+/// Everything grid-scoped ahead of this pair lands on the *primary* grid, and
+/// the `CSI ? 47 l` is what makes it: vt100 keeps `pos`, `saved_pos`,
 /// `scroll_top`, `scroll_bottom`, `origin_mode` and `saved_origin_mode` per
 /// `Grid` and reaches them through `Screen::grid_mut()`, which picks a grid
-/// off `MODE_ALTERNATE_SCREEN`. So the pen reset, the region reset and the row
-/// break after them all miss the alternate grid, and a container that drew on
-/// it and died leaves its content, its cursor and its scroll region sitting
-/// there for a successor.
+/// off `MODE_ALTERNATE_SCREEN`. So the region reset and the row break behind
+/// it both land on the primary grid, and a container that drew on the
+/// alternate one and died leaves its content, its cursor and its scroll region
+/// sitting there for a successor. The pen is not among them, and that is worth
+/// saying rather than leaving to be inferred: `Screen::attrs` is not per-grid,
+/// so the `CSI m` already covers both.
 ///
 /// The two ways in are not symmetric, which is the whole of it. `CSI ? 47 h`
 /// is `enter_alternate_grid()` alone; `CSI ? 1049 h` is `decsc();
@@ -244,8 +246,8 @@ const INITIAL_COLS: u16 = 80;
 ///
 /// What it costs is an alternate grid that would otherwise stay unallocated:
 /// `enter_alternate_grid` ends on `allocate_rows()`, so every store that takes
-/// a handover now materialises one, where before it `rows` stayed `vec![]`
-/// unless a container really used the alternate screen. Measured against
+/// a handover now materialises one, where before this change `rows` stayed
+/// `vec![]` unless a container really used the alternate screen. Measured against
 /// vt100 0.16.2 with a counting global allocator, live bytes across one
 /// `CSI ? 1049 h` `CSI ? 1049 l` round trip: 62,208 B at 24x80, 321,600 B at
 /// 50x200, 961,920 B at 60x500 -- `rows * (cols + 1) * 32` at all three, which
