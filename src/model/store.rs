@@ -73,6 +73,101 @@ fn pen_after(prefix: &[u8], dropped: &[u8]) -> Vec<u8> {
     scratch.screen().attributes_formatted()
 }
 
+/// Whether the emulator's last grid row has nothing drawn on it.
+///
+/// That row is where the cursor comes to rest after every line, because
+/// container output is newline-terminated, and the pane leaves it out of the
+/// frame while it is blank -- see `log_pane::blit_screen`. It is asked of the
+/// grid rather than of the byte stream because "the last byte was a newline"
+/// is not the same question: a container that ends a line with `\n\x1b[0m`
+/// leaves a blank row behind a non-newline last byte, and one redrawing a
+/// progress bar with `\r` leaves a full row behind a cursor back at column 0.
+/// `adopt` can afford that over-approximation because it costs one blank row
+/// once per recreate; a pane would wear it on every frame.
+///
+/// Takes the parser by `&mut` only to read: `Screen::cell` indexes the
+/// *visible* rows, which start `scrollback()` rows earlier, so the last grid
+/// row is out of reach of it whenever the reader has scrolled up. The offset
+/// is put back before returning, and `set_scrollback` clamps to a scrollback
+/// length nothing here changes, so the round trip restores it exactly.
+fn last_row_blank(parser: &mut vt100::Parser) -> bool {
+    let saved = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(0);
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    // `MIN_ROWS` keeps the grid non-empty, so there is always a last row.
+    let last = rows.saturating_sub(1);
+    let blank = (0..cols).all(|col| screen.cell(last, col).is_none_or(cell_is_invisible));
+    parser.screen_mut().set_scrollback(saved);
+    blank
+}
+
+/// Whether a cell would put nothing on the frame.
+///
+/// Visually blank, which is neither "no contents" nor "no attributes", and
+/// this asked each of those in turn before it asked both.
+///
+/// Contents first. A cell holding a space is not empty: `\r` only moves the
+/// cursor, so a program that clears a progress line by overwriting it --
+/// `"\rprogress\r        \r"`, which is how a good deal of CLI tooling erases
+/// -- leaves a row of space cells behind. Reading that as content kept a
+/// visually blank row in the pane's window and cost a row of log, which is
+/// #93's own symptom. So the test is whitespace rather than emptiness: Rust's
+/// `char::is_whitespace`, the Unicode `White_Space` property, so a no-break
+/// space or an ideographic space counts too -- each of those draws nothing,
+/// which is the only question being asked. An empty cell passes it trivially.
+///
+/// Attributes second, and still on top rather than instead. `vt100` keeps the
+/// pen on a cell it erases -- `Cell::clear` stores the live attributes
+/// alongside `len = 0` -- so a row wiped under `CSI 41 m` is a row of
+/// contentless cells that `log_pane::cell_style` still paints, as a red bar.
+/// A row of *spaces* written under the same pen is the same red bar, which is
+/// why widening the contents test cannot be allowed to widen the whole
+/// predicate: blank contents and a plain pen, both.
+///
+/// Which attributes count is decided by two things together: what `cell_style`
+/// emits, and which of those a cell with no glyph can show. It emits
+/// foreground, background, bold, italic, underline and inverse. Of those only
+/// background, underline and inverse are visible with nothing to draw --
+/// ratatui paints an underlined or reversed space, and a background fills the
+/// cell whatever is in it. Foreground, bold and italic colour and weight a
+/// glyph that is not there.
+///
+/// So this checks exactly three attributes, and adding the other three would
+/// be a regression rather than extra safety. Six is the size of `cell_style`'s
+/// list, not of `vt100`'s: `Cell` also answers `dim()`, which the renderer
+/// never asks for, so a dim cell is as invisible as a plain one and checking
+/// it here would be the same regression by a different name. That is the one
+/// the demo would have hit -- `common.ts` draws its progress bar's timestamp
+/// under `CSI 2 m`. A predicate stricter than the
+/// frame hides nothing; what it does is keep a blank cursor row on screen
+/// whenever the pen happens to be bold or coloured when a line ends, which is
+/// #93 coming back. `only_the_attributes_a_frame_shows_on_a_blank_cell_count`
+/// pins both directions.
+///
+/// The three reads are free; the scan around them is not, and was not before
+/// this either. Measured in release at 50x200, 50k iterations: a blank row
+/// costs 5.6 us and the same scan asking only `contents()` -- the predicate
+/// this replaced -- costs 5.2 to 6.5 us across runs, which is the same figure
+/// inside the noise. What it buys is a `Screen::cell` call per column, at
+/// about 27 ns each: 5.6 us at 200 columns, 1.1 us at 40, flat in the grid's
+/// row count and in the scrollback depth behind it. A row with content exits
+/// at its first non-blank cell: 20 to 40 ns for a row that starts in column
+/// 0, and about 150 ns for one indented four columns, which is what this
+/// project's own demo emits for stack-trace frames.
+///
+/// So the cost is one `Screen::cell` per column of one row per `process`, and
+/// for scale `vt100` parses one log line in about 1 us. A chunk carrying a
+/// single line at 200 columns therefore pays several times its own parse; a
+/// chunk carrying fifty pays a few per cent. Worth knowing before anything
+/// widens this to more rows.
+fn cell_is_invisible(cell: &vt100::Cell) -> bool {
+    cell.contents().chars().all(char::is_whitespace)
+        && cell.bgcolor() == vt100::Color::Default
+        && !cell.underline()
+        && !cell.inverse()
+}
+
 fn bytecount(bytes: &[u8]) -> usize {
     bytes.iter().filter(|b| **b == b'\n').count()
 }
@@ -84,8 +179,10 @@ fn keep_lines_for(scrollback: usize, rows: u16) -> usize {
 /// Floor on the emulated screen size.
 ///
 /// `vt100` underflows in `col_wrap` on very narrow grids, so this is a crash
-/// guard rather than a cosmetic minimum. It matches the floor the pane's own
-/// geometry already applies, so it never binds in the render path.
+/// guard rather than a cosmetic minimum. A pane asks for at least as much:
+/// `log_pane::emulator_size` floors columns at `MIN_COLS` exactly, and rows one
+/// above `MIN_ROWS`, because it adds its own `CURSOR_ROW` on top of its floor
+/// of three. So neither ever binds in the render path.
 const MIN_ROWS: u16 = 3;
 const MIN_COLS: u16 = 20;
 
@@ -320,6 +417,14 @@ pub struct LogStore {
     pen: Vec<u8>,
     /// True once any output at all has been received.
     has_output: bool,
+    /// Whether the emulator's last grid row is blank, as of the last write.
+    ///
+    /// Cached rather than asked at render time because answering it needs the
+    /// scroll offset moved and put back, which a `&LogStore` cannot do -- see
+    /// [`last_row_blank`]. It is a property of the grid, not of the view, so
+    /// scrolling does not stale it; only a write or a rebuild can, and both
+    /// refresh it.
+    tail_blank: bool,
     /// Whether the emulator is the placeholder a release left behind rather
     /// than this store's screen.
     ///
@@ -345,12 +450,31 @@ impl LogStore {
             pen: Vec::new(),
             replay_pending: false,
             has_output: false,
+            // An emulator nothing has been written to is blank throughout.
+            tail_blank: true,
             released: false,
         }
     }
 
     pub fn has_output(&self) -> bool {
         self.has_output
+    }
+
+    /// Whether the emulator's last grid row has nothing on it.
+    ///
+    /// The pane is given a grid one row taller than it draws, and this is what
+    /// tells it which row to leave out: while the last one is blank the window
+    /// ends above it, and the pane fills with content rather than showing the
+    /// cursor's row as a permanent blank line. Held to `live_screen`'s rule
+    /// even though it reads a cached bool, because the answer describes a grid
+    /// a released store no longer has.
+    pub fn tail_row_blank(&self) -> bool {
+        debug_assert!(
+            !self.released,
+            "asked a released store about its last row: readers must resolve \
+             through `App::pane_key`, the set `release_offscreen_stores` leaves alone"
+        );
+        self.tail_blank
     }
 
     pub fn screen(&self) -> &vt100::Screen {
@@ -561,6 +685,7 @@ impl LogStore {
         // regardless of what was fed to it in the meantime.
         if !self.released {
             self.parser.process(&normalised);
+            self.tail_blank = last_row_blank(&mut self.parser);
         }
         self.has_output = true;
     }
@@ -695,7 +820,9 @@ impl LogStore {
             return;
         }
 
-        // More visible rows means more history to be able to reproduce.
+        // More grid rows means more history to be able to reproduce. The grid
+        // is a row taller than the pane draws, so this is one line more
+        // generous than the window it feeds -- the safe direction.
         self.keep_lines = keep_lines_for(self.scrollback_len, rows);
 
         let old_offset = self.parser.screen().scrollback();
@@ -736,6 +863,9 @@ impl LogStore {
             old_offset
         };
         self.parser.screen_mut().set_scrollback(target);
+        // Both branches above changed the grid -- one rebuilt it, the other
+        // resized it -- so neither can be trusted to have kept the answer.
+        self.tail_blank = last_row_blank(&mut self.parser);
     }
 
     /// Drops the emulator, keeping the bytes needed to rebuild it.
@@ -906,6 +1036,173 @@ mod tests {
             .map(|l| l.trim_end().to_string())
             .filter(|l| !l.is_empty())
             .collect()
+    }
+
+    /// #93: the pane is given a grid a row taller than it draws, and this is
+    /// the answer that decides which row it leaves out.
+    #[test]
+    fn a_trailing_newline_leaves_the_last_row_blank() {
+        let mut s = store_with(20);
+        assert!(
+            s.tail_row_blank(),
+            "every line ended in a newline, so the cursor is on an empty row"
+        );
+        s.process(b"no newline here");
+        assert!(
+            !s.tail_row_blank(),
+            "a line still being written occupies the row it is on"
+        );
+        s.process(b"\n");
+        assert!(s.tail_row_blank(), "ending the line frees the row again");
+    }
+
+    /// CodeRabbit on #94: `vt100` keeps the pen on a cell it erases, so a row
+    /// wiped under a background colour has no contents and is still a red bar
+    /// on the frame. Reading blankness from `contents()` alone dropped it.
+    #[test]
+    fn a_row_erased_under_a_colour_is_not_blank() {
+        let mut s = store_with(20);
+        assert!(s.tail_row_blank(), "the cursor's row starts empty");
+        s.process(b"\x1b[41m\x1b[K");
+        assert!(
+            !s.tail_row_blank(),
+            "an erase under `CSI 41 m` leaves a row of red cells, not a blank row"
+        );
+        s.process(b"\x1b[0m\x1b[K");
+        assert!(
+            s.tail_row_blank(),
+            "erasing again under the default pen really does leave it blank"
+        );
+    }
+
+    /// CodeRabbit on #94 again, the sibling of the erased-row case: `\r` only
+    /// moves the cursor, so a progress line cleared by overwriting it with
+    /// spaces leaves a row of space cells. Those are contents, and reading
+    /// them as content kept a visually blank row in the window and cost a row
+    /// of log -- #93's symptom, by a route the newline tests do not reach.
+    #[test]
+    fn a_row_overwritten_with_spaces_is_blank() {
+        let mut s = store_with(20);
+        s.process(b"\rprogress\r        \r");
+        assert!(
+            s.tail_row_blank(),
+            "a progress line cleared with spaces leaves nothing to show"
+        );
+
+        // Contents and attributes are asked together, not one instead of the
+        // other: the same spaces under a background are a red bar.
+        let mut s = store_with(20);
+        s.process(b"\x1b[41m\rprogress\r        \r");
+        assert!(
+            !s.tail_row_blank(),
+            "spaces under `CSI 41 m` paint the row even though they show no glyph"
+        );
+
+        // And the predicate still finds real content among the blanks.
+        let mut s = store_with(20);
+        s.process(b"\r        x\r");
+        assert!(
+            !s.tail_row_blank(),
+            "one non-blank cell is enough to make the row worth drawing"
+        );
+    }
+
+    /// The boundary the predicate sits on, from both sides.
+    ///
+    /// `cell_style` emits six attributes; only three of them show on a cell
+    /// with no glyph in it -- and a cell holding a space has no glyph either,
+    /// so these run over spaces rather than over empty cells, which is the
+    /// case a service actually produces. Checking fewer attributes drops a
+    /// visible row out of the pane's window, which is the bug above. Checking
+    /// more is not safer: it would keep the blank cursor row on screen
+    /// whenever a service happens to end a line with a colour or a weight
+    /// still set, which is #93 again.
+    #[test]
+    fn only_the_attributes_a_frame_shows_on_a_blank_cell_count() {
+        for (sgr, blank, what) in [
+            (
+                "\x1b[41m",
+                false,
+                "a background fills a cell with nothing in it",
+            ),
+            ("\x1b[4m", false, "ratatui draws an underlined space"),
+            ("\x1b[7m", false, "inverse swaps the colours of a space"),
+            (
+                "\x1b[31m",
+                true,
+                "a foreground colours a glyph that is not there",
+            ),
+            ("\x1b[1m", true, "bold weights a glyph that is not there"),
+            ("\x1b[3m", true, "italic slants a glyph that is not there"),
+            ("\x1b[2m", true, "`cell_style` does not emit dim at all"),
+        ] {
+            // Erased, and then the same attributes over printed spaces: the
+            // predicate has to reach the same answer whichever way the row
+            // came to show nothing.
+            for clear in [&b"\x1b[K"[..], b"    \r"] {
+                let mut s = store_with(20);
+                s.process(sgr.as_bytes());
+                s.process(clear);
+                assert_eq!(s.tail_row_blank(), blank, "{what} (cleared with {clear:?})");
+            }
+        }
+    }
+
+    /// The `\r` case the issue calls out: a progress bar leaves the cursor at
+    /// column 0 of a row that is full of output, so "the last byte was a
+    /// newline" would get this one wrong in the direction that eats the line.
+    #[test]
+    fn a_carriage_return_redraw_still_occupies_its_row() {
+        let mut s = store_with(20);
+        s.process(b"\r[###-------]  30%");
+        s.process(b"\r[######----]  60%");
+        assert!(
+            !s.tail_row_blank(),
+            "the bar is on the last row whatever column the cursor is in"
+        );
+        s.process(b"\r[##########] 100%\n");
+        assert!(s.tail_row_blank(), "the bar's own newline frees the row");
+    }
+
+    /// The answer describes the grid, not the view, so a reader who has
+    /// scrolled away must still get the grid's answer -- and must not be moved
+    /// by the asking.
+    #[test]
+    fn scrolling_neither_changes_the_answer_nor_is_changed_by_it() {
+        let mut s = store_with(60);
+        s.scroll_up(4);
+        assert_eq!(s.scroll_offset(), 4);
+        s.process(b"one more line\n");
+        assert!(
+            s.tail_row_blank(),
+            "the last grid row is blank however far back the reader is"
+        );
+        assert_eq!(
+            s.scroll_offset(),
+            5,
+            "asking must leave the reader where the new row put them"
+        );
+    }
+
+    /// A rebuild replays the whole buffer into a grid of a different shape, so
+    /// the row that was last is not the row that is last afterwards: twenty
+    /// lines fill a ten-row grid to its last row and leave a forty-row one
+    /// half empty.
+    #[test]
+    fn a_resize_re_asks_which_row_is_last() {
+        let mut s = store_with(20);
+        s.process(b"still writing this one");
+        assert!(!s.tail_row_blank());
+        s.resize(40, 40);
+        assert!(
+            s.tail_row_blank(),
+            "the replay left the partial line well above the new last row"
+        );
+        s.resize(10, 40);
+        assert!(
+            !s.tail_row_blank(),
+            "and back at ten rows the partial line is on the last one again"
+        );
     }
 
     fn store_with(lines: usize) -> LogStore {
