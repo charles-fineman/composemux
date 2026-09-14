@@ -178,9 +178,12 @@ jobs:
     # Same protected environment as the crates.io publish: a tag push alone must
     # not be able to push a formula that `brew install` users then execute.
     environment: release
-    # Serialize same-tag runs so a re-run can't race the push (as crates-io does).
+    # A single constant group serializes ALL tap updates, not just same-tag
+    # ones: every release tag pushes the same tap branch, so two different tags
+    # racing here would hit a non-fast-forward push or clobber each other's
+    # formula. (crates-io keys by tag because each tag is a distinct version.)
     concurrency:
-      group: homebrew-tap-${{ github.ref_name }}
+      group: homebrew-tap-update
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
