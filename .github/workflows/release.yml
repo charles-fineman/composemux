@@ -169,3 +169,123 @@ jobs:
         if: steps.published.outputs.already != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  homebrew-tap:
+    name: update sofired/homebrew-tap
+    # Its own job so a tap-side hiccup (bad token, tap unreachable, formula
+    # drift) can never hold up the crates.io publish or the GitHub release.
+    needs: github-release
+    # Same protected environment as the crates.io publish: a tag push alone must
+    # not be able to push a formula that `brew install` users then execute.
+    environment: release
+    # A single constant group serializes ALL tap updates, not just same-tag
+    # ones: every release tag pushes the same tap branch, so two different tags
+    # racing here would hit a non-fast-forward push or clobber each other's
+    # formula. (crates-io keys by tag because each tag is a distinct version.)
+    concurrency:
+      group: homebrew-tap-update
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to contents:write on
+      # sofired/homebrew-tap only, provisioned on the `release` environment. It
+      # is optional: a run before the maintainer provisions it degrades to a
+      # clear skip rather than failing the release (as the crates.io and Codecov
+      # steps do). Every other step is gated on this, so an unconfigured repo
+      # does no wasted work.
+      - name: Does the tap have a token?
+        id: gate
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the tap update. Bump Formula/composemux.rb in the tap by hand for this release."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The tag is attacker-influenceable (anyone who can push a tag), and its
+      # derived values get written into a Ruby file Homebrew executes on every
+      # user's machine. Validate them here (strict semver, 64-hex digest) and
+      # refuse otherwise; this is the injection defense, not the verify job.
+      - name: Validate the tag and compute the tarball checksum
+        id: meta
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "refusing to update the tap: '$version' is not a semver version" >&2
+            exit 1
+          fi
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          sha=$(curl -fsSL --connect-timeout 10 --max-time 60 "$url" | sha256sum | cut -d' ' -f1)
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "refusing to update the tap: computed sha256 '$sha' is malformed" >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "url=$url"
+            echo "sha256=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      # actions/checkout stores the token as an http.extraheader that it scrubs
+      # in its post step, rather than us baking it into a remote URL that would
+      # persist in .git/config. It is the pinned, allow-listed action this repo
+      # already uses.
+      - name: Check out the tap
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: sofired/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update Formula/composemux.rb and push
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          F_URL: ${{ steps.meta.outputs.url }}
+          F_SHA256: ${{ steps.meta.outputs.sha256 }}
+          F_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          formula="tap/Formula/composemux.rb"
+          if [ ! -f "$formula" ]; then
+            echo "::warning::$formula not found in the tap; has the formula been committed yet? Skipping."
+            exit 0
+          fi
+          # Rewrite only the first stable url/sha256 pair, via python with literal
+          # replacements read from the environment (no sed delimiter hazard, no
+          # untrusted data spliced into a program). The head stanza is a `head`
+          # line, not a `url` line, so it is untouched.
+          python3 <<'PY'
+          import os, re, sys
+          path = "tap/Formula/composemux.rb"
+          url, sha = os.environ["F_URL"], os.environ["F_SHA256"]
+          text = open(path).read()
+          text, n_url = re.subn(r'^(\s*)url "[^"]*"',
+                                lambda m: m.group(1) + 'url "' + url + '"',
+                                text, count=1, flags=re.M)
+          text, n_sha = re.subn(r'^(\s*)sha256 "[^"]*"',
+                                lambda m: m.group(1) + 'sha256 "' + sha + '"',
+                                text, count=1, flags=re.M)
+          if (n_url, n_sha) != (1, 1):
+              sys.exit("expected exactly one url and one sha256 stanza (got url=%d, sha256=%d)" % (n_url, n_sha))
+          open(path, "w").write(text)
+          PY
+          # Post-conditions: the new values landed on the first stanza.
+          grep -qF "url \"$F_URL\"" "$formula"
+          grep -qF "sha256 \"$F_SHA256\"" "$formula"
+          cd tap
+          if git diff --quiet; then
+            echo "::notice::the tap already has this url/sha256; nothing to commit."
+            exit 0
+          fi
+          git -c user.name="composemux-release" \
+              -c user.email="actions@users.noreply.github.com" \
+              commit -am "composemux ${F_VERSION}"
+          git push
