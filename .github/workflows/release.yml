@@ -402,26 +402,36 @@ jobs:
             sleep 10
           done
           gh pr checks "$pr_number" --repo "$TAP" --watch --fail-fast
-          # Record the newest publish.yml run before dispatch so we can find the
-          # exact run we trigger (gh workflow run does not return a run id).
-          before=$(gh run list --repo "$TAP" --workflow publish.yml --json databaseId --jq '.[0].databaseId // 0')
+          # Snapshot the existing publish.yml run ids so we can identify the run
+          # our dispatch creates (gh workflow run returns no id). The tap's
+          # homebrew-tap-update lock this job holds already keeps two automated
+          # releases from dispatching at once; the set-difference below plus the
+          # fail-closed handling also cover a manual dispatch racing this one.
+          before_ids=$(gh run list --repo "$TAP" --workflow publish.yml --limit 50 --json databaseId --jq '.[].databaseId')
           gh workflow run publish.yml --repo "$TAP" \
             -f pull_request="$pr_number" -f head_sha="$head_sha"
-          # Block on that run. gh workflow run is fire-and-forget; without this
-          # wait the job would exit and release the homebrew-tap-update lock while
-          # the publish is still uploading bottles and pushing the bump to the
-          # tap's main, letting the next release dispatch a second pr-pull that
-          # races this one. Holding the lock here serializes tap publishes.
+          # Wait for exactly the run we triggered: the one publish.yml run id that
+          # was not present before. gh workflow run is fire-and-forget, so without
+          # this the job would release the lock while the publish is still
+          # uploading bottles and pushing to the tap's main, letting the next
+          # release race a second pr-pull. Fail closed rather than release the
+          # lock on an unknown state: no run, or two new runs we can't tell apart.
           run_id=""
           for _ in $(seq 1 24); do
-            latest=$(gh run list --repo "$TAP" --workflow publish.yml --json databaseId --jq '.[0].databaseId // 0')
-            if [ -n "$latest" ] && [ "$latest" != "$before" ]; then run_id="$latest"; break; fi
+            new_ids=$(gh run list --repo "$TAP" --workflow publish.yml --limit 50 --json databaseId --jq '.[].databaseId' \
+              | grep -vxF -f <(printf '%s\n' "$before_ids") || true)
+            count=$(printf '%s' "$new_ids" | grep -c . || true)
+            if [ "$count" -eq 1 ]; then run_id="$new_ids"; break; fi
+            if [ "$count" -gt 1 ]; then
+              echo "::error::more than one new publish.yml run appeared after dispatch (${new_ids//$'\n'/, }); cannot tell which is ours, so failing rather than release the tap lock on an unverified publish."
+              exit 1
+            fi
             sleep 5
           done
-          if [ -n "$run_id" ]; then
-            echo "::notice::waiting for the tap's publish run ${run_id} for composemux ${F_VERSION}..."
-            gh run watch "$run_id" --repo "$TAP" --exit-status
-            echo "::notice::composemux ${F_VERSION} bottles published from ${pr_url}"
-          else
-            echo "::warning::dispatched publish.yml for ${pr_url} but could not resolve its run to wait on; not blocking the release. Verify the tap published composemux ${F_VERSION}."
+          if [ -z "$run_id" ]; then
+            echo "::error::dispatched publish.yml for ${pr_url} but its run never appeared; failing so the tap lock is not released while the publish state is unknown."
+            exit 1
           fi
+          echo "::notice::waiting for the tap's publish run ${run_id} for composemux ${F_VERSION}..."
+          gh run watch "$run_id" --repo "$TAP" --exit-status
+          echo "::notice::composemux ${F_VERSION} bottles published from ${pr_url}"
