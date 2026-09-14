@@ -202,12 +202,14 @@ jobs:
     steps:
       # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to sofired/homebrew-tap
       # only, provisioned on the `release` environment, with contents:write
-      # (push the bump branch), pull-requests:write (open the PR), checks:read
-      # (watch the PR's checks) and actions:write (dispatch the tap's publish
-      # workflow). It is optional: a run before the maintainer provisions it
-      # degrades to a clear skip rather than failing the release (as the
-      # crates.io and Codecov steps do). Every other step is gated on this, so
-      # an unconfigured repo does no wasted work.
+      # (push the bump branch), pull-requests:write (open the PR and read its
+      # checks with `gh pr checks`) and actions:write (dispatch the tap's
+      # publish workflow). Fine-grained PATs offer no separate Checks
+      # permission, so the first real release is what confirms the check
+      # watch sees the tap's runs. It is optional: a run before the maintainer
+      # provisions it degrades to a clear skip rather than failing the release
+      # (as the crates.io and Codecov steps do). Every other step is gated on
+      # this, so an unconfigured repo does no wasted work.
       - name: Does the tap have a token?
         id: gate
         env:
