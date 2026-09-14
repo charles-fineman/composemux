@@ -54,9 +54,11 @@ cargo install composemux
 On macOS or Linux with Homebrew, via a tap (not yet in homebrew-core):
 
 ```sh
-brew tap sofired/tap
-brew install composemux
+brew install sofired/tap/composemux
 ```
+
+Use the full name: it is what lets Homebrew 6+ trust the formula without a
+separate `brew tap` and `brew trust` step.
 
 Prefer a file you can check first? Prebuilt archives are on the
 [Releases page](https://github.com/sofired/composemux/releases) — Linux x86-64
