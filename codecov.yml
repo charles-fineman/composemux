@@ -2,7 +2,7 @@
 #
 # Both checks below are `informational: true` on purpose: measured baseline at
 # the time this file was added was ~93.9% line coverage (cargo llvm-cov
-# --all-features --workspace). The project target is set a few points under
+# --all-features --workspace). The project target (88%) is set a few points under
 # that so normal variance doesn't fail unrelated PRs, and the patch target
 # starts at a conservative 80% since new code naturally lags the calibrated
 # baseline. Leave both informational for a release or two while the numbers
