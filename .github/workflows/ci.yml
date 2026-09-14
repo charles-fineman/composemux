@@ -38,10 +38,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
       - run: cargo fmt --all -- --check
         if: matrix.os == 'ubuntu-latest'
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
       # The clipboard fallback is optional; make sure it still builds without it.
-      - run: cargo build --no-default-features
+      - run: cargo build --locked --no-default-features
 
   release-build:
     name: build (${{ matrix.target }})
@@ -61,7 +61,7 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: composemux-${{ matrix.target }}
@@ -75,7 +75,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # master, 2026-09-03
         with:
           toolchain: stable
-      - run: cargo publish --dry-run
+      - run: cargo publish --locked --dry-run
 
   coverage:
     name: coverage
@@ -98,7 +98,7 @@ jobs:
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
         with:
           tool: cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - run: cargo llvm-cov --locked --all-features --workspace --lcov --output-path lcov.info
       # Codecov requires a token to upload to a protected branch (main is
       # protected), even though this public repo's org has tokenless uploads
       # enabled otherwise. Without it the main-branch report is rejected and

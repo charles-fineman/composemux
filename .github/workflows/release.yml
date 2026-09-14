@@ -33,17 +33,27 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
       - name: Tag must match the version in Cargo.toml
         run: |
-          crate_version=$(cargo metadata --no-deps --format-version 1 \
+          crate_version=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
           tag_version="${GITHUB_REF_NAME#v}"
           if [ "$crate_version" != "$tag_version" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version" >&2
             exit 1
           fi
+      - name: Rehearse the Homebrew formula's install and test
+        # Mirrors the sofired/homebrew-tap formula exactly: its `std_cargo_args`
+        # installs with `--locked`, and its `test do` asserts on `composemux
+        # --version` output. Running the same two steps here catches a
+        # `--version` format change or lockfile drift before the tag is
+        # published, rather than the tap's test-bot going red after the
+        # formula is already live.
+        run: |
+          cargo install --locked --path . --root "$RUNNER_TEMP/brewcheck"
+          "$RUNNER_TEMP/brewcheck/bin/composemux" --version | grep -qF "composemux ${GITHUB_REF_NAME#v}"
 
   build:
     name: build (${{ matrix.target }})
@@ -66,7 +76,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -151,7 +161,7 @@ jobs:
       - name: Is this version already on crates.io?
         id: published
         run: |
-          name=$(cargo metadata --no-deps --format-version 1 \
+          name=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["name"])')
           version="${GITHUB_REF_NAME#v}"
           code=$(curl -sS --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' \
@@ -165,7 +175,7 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
         id: auth
         if: steps.published.outputs.already != 'true'
-      - run: cargo publish
+      - run: cargo publish --locked
         if: steps.published.outputs.already != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
