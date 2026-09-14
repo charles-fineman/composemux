@@ -97,8 +97,10 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      # No token: sofired has Codecov's "require token for public repos"
+      # setting turned off, so uploads for this public repo are tokenless
+      # (v5+). Fork PRs upload tokenless regardless.
       - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           files: lcov.info
           fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
