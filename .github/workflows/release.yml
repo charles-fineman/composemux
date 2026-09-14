@@ -273,6 +273,21 @@ jobs:
             echo "::warning::$formula not found in the tap; has the formula been committed yet? Skipping."
             exit 0
           fi
+          # Retry-safe: an earlier run of this job may already have pushed the
+          # branch (and opened the PR) before failing further on. Build on that
+          # branch rather than on main, so the push below fast-forwards.
+          branch="composemux-${F_VERSION}"
+          reused=false
+          cd tap
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::notice::$branch already exists on the tap from an earlier run; reusing it."
+            git fetch -q origin "$branch"
+            git checkout -q -B "$branch" FETCH_HEAD
+            reused=true
+          else
+            git checkout -q -b "$branch"
+          fi
+          cd ..
           # Rewrite only the first stable url/sha256 pair, via python with literal
           # replacements read from the environment (no sed delimiter hazard, no
           # untrusted data spliced into a program). The head stanza is a `head`
@@ -297,17 +312,21 @@ jobs:
           grep -qF "sha256 \"$F_SHA256\"" "$formula"
           cd tap
           if git diff --quiet; then
-            echo "::notice::the tap already has this url/sha256; nothing to commit."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            if [ "$reused" = true ]; then
+              echo "::notice::$branch already carries this url/sha256; continuing to its PR."
+            else
+              echo "::notice::the tap's main already has this url/sha256; nothing to do."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # A branch, not main: the tap bottles a formula on its PR CI, and
+            # `brew pr-pull` lands the bump together with the bottle block.
+            git -c user.name="composemux-release" \
+                -c user.email="actions@users.noreply.github.com" \
+                commit -am "composemux ${F_VERSION}"
           fi
-          # A branch, not main: the tap bottles a formula on its PR CI, and
-          # `brew pr-pull` lands the bump together with the bottle block.
-          git checkout -q -b "composemux-${F_VERSION}"
-          git -c user.name="composemux-release" \
-              -c user.email="actions@users.noreply.github.com" \
-              commit -am "composemux ${F_VERSION}"
-          git push origin "HEAD:refs/heads/composemux-${F_VERSION}"
+          git push origin "HEAD:refs/heads/${branch}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       # The tap's tests.yml builds and tests the bumped formula on every bottle
@@ -327,12 +346,24 @@ jobs:
           set -euo pipefail
           cd tap
           head_sha=$(git rev-parse HEAD)
-          pr_url=$(gh pr create --repo "$TAP" --base main \
-            --head "composemux-${F_VERSION}" \
-            --title "composemux ${F_VERSION}" \
-            --body "Version bump from the composemux ${GITHUB_REF_NAME} release. This PR's checks build the bottles; the brew pr-pull workflow publishes them and lands the bump.")
+          branch="composemux-${F_VERSION}"
+          # Retry-safe: reuse the PR an earlier run opened for this branch. If
+          # that PR already merged, the earlier run got all the way through and
+          # there is nothing left to do.
+          pr_url=$(gh pr list --repo "$TAP" --head "$branch" --state open --json url --jq '.[0].url // empty')
+          if [ -n "$pr_url" ]; then
+            echo "::notice::reusing the open PR ${pr_url} from an earlier run."
+          elif [ -n "$(gh pr list --repo "$TAP" --head "$branch" --state merged --json number --jq '.[0].number // empty')" ]; then
+            echo "::notice::the PR for ${branch} already merged; the bottles were published by an earlier run."
+            exit 0
+          else
+            pr_url=$(gh pr create --repo "$TAP" --base main \
+              --head "$branch" \
+              --title "composemux ${F_VERSION}" \
+              --body "Version bump from the composemux ${GITHUB_REF_NAME} release. This PR's checks build the bottles; the brew pr-pull workflow publishes them and lands the bump.")
+            echo "::notice::opened ${pr_url}"
+          fi
           pr_number="${pr_url##*/}"
-          echo "::notice::opened ${pr_url}"
           # Checks register a few seconds after the PR opens, and `gh pr checks`
           # errors until they do (exit 8 means they exist and are pending).
           for _ in $(seq 1 18); do
