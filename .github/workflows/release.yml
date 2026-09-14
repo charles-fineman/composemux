@@ -37,7 +37,7 @@ jobs:
       - run: cargo test --locked
       - name: Tag must match the version in Cargo.toml
         run: |
-          crate_version=$(cargo metadata --no-deps --format-version 1 \
+          crate_version=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
           tag_version="${GITHUB_REF_NAME#v}"
           if [ "$crate_version" != "$tag_version" ]; then
@@ -161,7 +161,7 @@ jobs:
       - name: Is this version already on crates.io?
         id: published
         run: |
-          name=$(cargo metadata --no-deps --format-version 1 \
+          name=$(cargo metadata --locked --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["name"])')
           version="${GITHUB_REF_NAME#v}"
           code=$(curl -sS --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' \
