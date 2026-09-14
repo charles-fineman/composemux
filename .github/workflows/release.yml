@@ -186,9 +186,13 @@ jobs:
       group: homebrew-tap-update
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    # Three bottle builds on the tap plus its publish run; waiting is the bulk.
+    timeout-minutes: 90
     steps:
-      # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to contents:write on
-      # sofired/homebrew-tap only, provisioned on the `release` environment. It
+      # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to sofired/homebrew-tap
+      # only, provisioned on the `release` environment, with contents:write
+      # (push the bump branch), pull-requests:write (open the PR) and
+      # actions:write (dispatch the tap's publish workflow). It
       # is optional: a run before the maintainer provisions it degrades to a
       # clear skip rather than failing the release (as the crates.io and Codecov
       # steps do). Every other step is gated on this, so an unconfigured repo
@@ -245,7 +249,8 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
 
-      - name: Update Formula/composemux.rb and push
+      - name: Update Formula/composemux.rb on a branch
+        id: bump
         if: steps.gate.outputs.enabled == 'true'
         env:
           F_URL: ${{ steps.meta.outputs.url }}
@@ -283,9 +288,49 @@ jobs:
           cd tap
           if git diff --quiet; then
             echo "::notice::the tap already has this url/sha256; nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # A branch, not main: the tap bottles a formula on its PR CI, and
+          # `brew pr-pull` lands the bump together with the bottle block.
+          git checkout -q -b "composemux-${F_VERSION}"
           git -c user.name="composemux-release" \
               -c user.email="actions@users.noreply.github.com" \
               commit -am "composemux ${F_VERSION}"
-          git push
+          git push origin "HEAD:refs/heads/composemux-${F_VERSION}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # The tap's tests.yml builds and tests the bumped formula on every bottle
+      # platform and stores the bottles as artifacts; its publish.yml (`brew
+      # pr-pull`) then uploads them to the tap's `bottles` release and pushes
+      # the bump plus the `bottle do` block to main. This step opens the PR,
+      # waits for its checks, and dispatches that workflow. A failure here
+      # leaves the PR open for a maintainer; the crates.io publish and the
+      # GitHub release are already done by then.
+      - name: Open the tap pull request, wait for its bottles, and publish them
+        if: steps.gate.outputs.enabled == 'true' && steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          F_VERSION: ${{ steps.meta.outputs.version }}
+          TAP: sofired/homebrew-tap
+        run: |
+          set -euo pipefail
+          cd tap
+          head_sha=$(git rev-parse HEAD)
+          pr_url=$(gh pr create --repo "$TAP" --base main \
+            --head "composemux-${F_VERSION}" \
+            --title "composemux ${F_VERSION}" \
+            --body "Version bump from the composemux ${GITHUB_REF_NAME} release. This PR's checks build the bottles; the brew pr-pull workflow publishes them and lands the bump.")
+          pr_number="${pr_url##*/}"
+          echo "::notice::opened ${pr_url}"
+          # Checks register a few seconds after the PR opens, and `gh pr checks`
+          # errors until they do (exit 8 means they exist and are pending).
+          for _ in $(seq 1 18); do
+            gh pr checks "$pr_number" --repo "$TAP" >/dev/null 2>&1 && break
+            [ "$?" -eq 8 ] && break
+            sleep 10
+          done
+          gh pr checks "$pr_number" --repo "$TAP" --watch --fail-fast
+          gh workflow run publish.yml --repo "$TAP" \
+            -f pull_request="$pr_number" -f head_sha="$head_sha"
+          echo "::notice::bottles for composemux ${F_VERSION} are being published from ${pr_url}"
