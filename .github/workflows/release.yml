@@ -189,9 +189,10 @@ jobs:
     # not be able to push a formula that `brew install` users then execute.
     environment: release
     # A single constant group serializes ALL tap updates, not just same-tag
-    # ones: every release tag pushes the same tap branch, so two different tags
-    # racing here would hit a non-fast-forward push or clobber each other's
-    # formula. (crates-io keys by tag because each tag is a distinct version.)
+    # ones. Each tag gets its own branch and PR, but two runs racing here would
+    # still either duplicate a retry's PR for the same tag or pile several tap
+    # bottle builds and publishes on top of each other. (crates-io keys by tag
+    # because each tag is a distinct version.)
     concurrency:
       group: homebrew-tap-update
       cancel-in-progress: false
@@ -201,19 +202,19 @@ jobs:
     steps:
       # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to sofired/homebrew-tap
       # only, provisioned on the `release` environment, with contents:write
-      # (push the bump branch), pull-requests:write (open the PR) and
-      # actions:write (dispatch the tap's publish workflow). It
-      # is optional: a run before the maintainer provisions it degrades to a
-      # clear skip rather than failing the release (as the crates.io and Codecov
-      # steps do). Every other step is gated on this, so an unconfigured repo
-      # does no wasted work.
+      # (push the bump branch), pull-requests:write (open the PR), checks:read
+      # (watch the PR's checks) and actions:write (dispatch the tap's publish
+      # workflow). It is optional: a run before the maintainer provisions it
+      # degrades to a clear skip rather than failing the release (as the
+      # crates.io and Codecov steps do). Every other step is gated on this, so
+      # an unconfigured repo does no wasted work.
       - name: Does the tap have a token?
         id: gate
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the tap update. Bump Formula/composemux.rb in the tap by hand for this release."
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the tap update. Open a PR bumping Formula/composemux.rb in the tap by hand for this release, so the tap's CI still builds its bottles."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -271,10 +272,11 @@ jobs:
           formula="tap/Formula/composemux.rb"
           if [ ! -f "$formula" ]; then
             echo "::warning::$formula not found in the tap; has the formula been committed yet? Skipping."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Retry-safe: an earlier run of this job may already have pushed the
-          # branch (and opened the PR) before failing further on. Build on that
+          # branch (and opened the PR) before a later step failed. Build on that
           # branch rather than on main, so the push below fast-forwards.
           branch="composemux-${F_VERSION}"
           reused=false
@@ -336,7 +338,7 @@ jobs:
       # waits for its checks, and dispatches that workflow. A failure here
       # leaves the PR open for a maintainer; the crates.io publish and the
       # GitHub release are already done by then.
-      - name: Open the tap pull request, wait for its bottles, and publish them
+      - name: Open the tap pull request, wait for its bottles, and dispatch their publish
         if: steps.gate.outputs.enabled == 'true' && steps.bump.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -347,14 +349,23 @@ jobs:
           cd tap
           head_sha=$(git rev-parse HEAD)
           branch="composemux-${F_VERSION}"
-          # Retry-safe: reuse the PR an earlier run opened for this branch. If
-          # that PR already merged, the earlier run got all the way through and
-          # there is nothing left to do.
-          pr_url=$(gh pr list --repo "$TAP" --head "$branch" --state open --json url --jq '.[0].url // empty')
+          # Retry-safe: reuse the PR an earlier run opened for this branch. Only
+          # a PR whose head lives in the tap itself counts: `--head` matches by
+          # branch name alone, and a fork could carry the same name. A closed
+          # PR means an earlier run got all the way through: pr-pull lands by
+          # cherry-pick, so GitHub shows the PR merged after a fast-forward and
+          # the tap's publish workflow closes it otherwise, and gh's `closed`
+          # state covers both.
+          pr_of() {
+            gh pr list --repo "$TAP" --head "$branch" --state "$1" \
+              --json url,headRepositoryOwner \
+              --jq '[.[] | select(.headRepositoryOwner.login == "sofired")][0].url // empty'
+          }
+          pr_url=$(pr_of open)
           if [ -n "$pr_url" ]; then
             echo "::notice::reusing the open PR ${pr_url} from an earlier run."
-          elif [ -n "$(gh pr list --repo "$TAP" --head "$branch" --state merged --json number --jq '.[0].number // empty')" ]; then
-            echo "::notice::the PR for ${branch} already merged; the bottles were published by an earlier run."
+          elif [ -n "$(pr_of closed)" ]; then
+            echo "::notice::the PR for ${branch} is already closed, so an earlier run published its bottles. If it was closed by hand instead, reopen it or delete the branch, then re-run."
             exit 0
           else
             pr_url=$(gh pr create --repo "$TAP" --base main \
