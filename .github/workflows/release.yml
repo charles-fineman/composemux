@@ -123,6 +123,13 @@ jobs:
     name: publish to crates.io
     needs: [verify, build]
     runs-on: ubuntu-latest
+    # Serialize publishes for a given tag so two runs of the same tag can't both
+    # read "not published yet" and race into a double `cargo publish`. Queue
+    # rather than cancel: never interrupt a publish already in flight, and let
+    # the one that waited fall through to the "already published" skip.
+    concurrency:
+      group: crates-io-${{ github.ref_name }}
+      cancel-in-progress: false
     # Gate on a protected environment so a tag push alone cannot publish.
     environment: release
     permissions:
@@ -147,7 +154,7 @@ jobs:
           name=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["name"])')
           version="${GITHUB_REF_NAME#v}"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+          code=$(curl -sS --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' \
             -H 'User-Agent: composemux-release (github actions)' \
             "https://crates.io/api/v1/crates/${name}/${version}")
           case "$code" in
