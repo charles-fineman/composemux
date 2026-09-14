@@ -1,0 +1,20 @@
+# Coverage gates for CI (see .github/workflows/ci.yml `coverage` job).
+#
+# Both checks below are `informational: true` on purpose: measured baseline at
+# the time this file was added was ~93.9% line coverage (cargo llvm-cov
+# --all-features --workspace). The project target is set a few points under
+# that so normal variance doesn't fail unrelated PRs, and the patch target
+# starts at a conservative 80% since new code naturally lags the calibrated
+# baseline. Leave both informational for a release or two while the numbers
+# settle, then flip `informational` to `false` on both to make them required.
+# Tracked in https://github.com/sofired/composemux/issues/99.
+coverage:
+  status:
+    project:
+      default:
+        target: 88%
+        informational: true
+    patch:
+      default:
+        target: 80%
+        informational: true

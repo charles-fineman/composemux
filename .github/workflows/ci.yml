@@ -76,3 +76,29 @@ jobs:
         with:
           toolchain: stable
       - run: cargo publish --dry-run
+
+  coverage:
+    name: coverage
+    # A separate job, deliberately: a Codecov outage or a bad token must never
+    # block the test/build gates above. This job's own failure is soft (see
+    # fail_ci_if_error below) for the same reason.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # master, 2026-09-03
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      # taiki-e/install-action fetches a prebuilt cargo-llvm-cov binary instead
+      # of compiling it, which is the same "install a CI tool" idiom this repo
+      # would otherwise reach for `cargo install --locked` for, just faster.
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
