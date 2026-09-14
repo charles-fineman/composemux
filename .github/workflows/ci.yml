@@ -79,7 +79,7 @@ jobs:
 
   coverage:
     name: coverage
-    # A separate job, deliberately: a Codecov outage or a bad token must never
+    # A separate job, deliberately: a Codecov outage must never
     # block the test/build gates above. This job's own failure is soft (see
     # fail_ci_if_error below) for the same reason.
     runs-on: ubuntu-latest
@@ -90,12 +90,11 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-      # taiki-e/install-action fetches a prebuilt cargo-llvm-cov binary instead
-      # of compiling it, which is the same "install a CI tool" idiom this repo
-      # would otherwise reach for `cargo install --locked` for, just faster.
-      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375  # v2.87.12
-        with:
-          tool: cargo-llvm-cov
+      # Install cargo-llvm-cov from crates.io so Codecov's is the only
+      # third-party Action in this workflow. --locked builds it against its
+      # committed lockfile; the compile adds a couple of minutes to this
+      # separate, non-blocking job only.
+      - run: cargo install cargo-llvm-cov --locked
       - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
       # No token: sofired has Codecov's "require token for public repos"
       # setting turned off, so uploads for this public repo are tokenless
