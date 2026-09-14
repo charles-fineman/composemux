@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/sofired/composemux/actions/workflows/ci.yml/badge.svg)](https://github.com/sofired/composemux/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Codecov](https://codecov.io/gh/sofired/composemux/graph/badge.svg)](https://codecov.io/gh/sofired/composemux)
 
 Six services, one interleaved stream, and the stack trace you actually needed
 has already scrolled off the top. `docker compose logs -f` shows you everything
