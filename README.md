@@ -51,6 +51,13 @@ Or, with a Rust toolchain (MSRV 1.88):
 cargo install composemux
 ```
 
+On macOS or Linux with Homebrew, via a tap (not yet in homebrew-core):
+
+```sh
+brew tap sofired/tap
+brew install composemux
+```
+
 Prefer a file you can check first? Prebuilt archives are on the
 [Releases page](https://github.com/sofired/composemux/releases) — Linux x86-64
 (gnu and musl), Linux aarch64 (gnu), Apple Silicon macOS, and Windows x86-64,
