@@ -196,6 +196,12 @@ jobs:
     concurrency:
       group: homebrew-tap-update
       cancel-in-progress: false
+      # Queue every pending release (up to 100) rather than GitHub's default of
+      # retaining only one pending run: without this a third release would
+      # cancel the second's pending tap bump, and that release would then have
+      # no tap branch, PR, or bottles. Requires cancel-in-progress: false.
+      # (actionlint's schema predates this key and flags it; GitHub accepts it.)
+      queue: max
     runs-on: ubuntu-latest
     # Three bottle builds on the tap plus its publish run; waiting is the bulk.
     timeout-minutes: 90
@@ -345,37 +351,48 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           F_VERSION: ${{ steps.meta.outputs.version }}
+          F_URL: ${{ steps.meta.outputs.url }}
           TAP: sofired/homebrew-tap
         run: |
           set -euo pipefail
           cd tap
           head_sha=$(git rev-parse HEAD)
           branch="composemux-${F_VERSION}"
-          # Retry-safe: reuse the PR an earlier run opened for this branch. Only
-          # a PR whose head lives in the tap itself counts: `--head` matches by
-          # branch name alone, and a fork could carry the same name. A closed
-          # PR means an earlier run got all the way through: pr-pull lands by
-          # cherry-pick, so GitHub shows the PR merged after a fast-forward and
-          # the tap's publish workflow closes it otherwise, and gh's `closed`
-          # state covers both.
-          pr_of() {
-            gh pr list --repo "$TAP" --head "$branch" --state "$1" \
-              --json url,headRepositoryOwner \
-              --jq '[.[] | select(.headRepositoryOwner.login == "sofired")][0].url // empty'
-          }
-          pr_url=$(pr_of open)
-          if [ -n "$pr_url" ]; then
-            echo "::notice::reusing the open PR ${pr_url} from an earlier run."
-          elif [ -n "$(pr_of closed)" ]; then
-            echo "::notice::the PR for ${branch} is already closed, so an earlier run published its bottles. If it was closed by hand instead, reopen it or delete the branch, then re-run."
+          # Whether this bump is already published is decided by the tap's main,
+          # not by PR state: brew pr-pull lands by cherry-pick, so a *successful*
+          # publish leaves the PR either merged (fast-forward) or closed by the
+          # tap's publish workflow. Treating "closed" as "published" would both
+          # miss a hand-closed PR and be redundant here, so check main for this
+          # version first; only if it is absent do we (re)drive a PR.
+          git fetch -q origin main
+          if git show origin/main:Formula/composemux.rb 2>/dev/null | grep -qF "url \"$F_URL\""; then
+            echo "::notice::the tap's main already carries composemux ${F_VERSION}; bottles are published. Nothing to do."
             exit 0
-          else
-            pr_url=$(gh pr create --repo "$TAP" --base main \
-              --head "$branch" \
-              --title "composemux ${F_VERSION}" \
-              --body "Version bump from the composemux ${GITHUB_REF_NAME} release. This PR's checks build the bottles; the brew pr-pull workflow publishes them and lands the bump.")
-            echo "::notice::opened ${pr_url}"
           fi
+          # Not on main yet. Find this branch's PR in the tap. Only one whose head
+          # lives in the tap itself counts: `--head` matches by branch name alone
+          # and a fork could reuse it. Reuse an open one, reopen a closed one that
+          # never actually published, or open a fresh PR.
+          pr_json=$(gh pr list --repo "$TAP" --head "$branch" --state all \
+            --json url,number,state,headRepositoryOwner \
+            --jq '[.[] | select(.headRepositoryOwner.login == "sofired")][0] // empty')
+          pr_url=$(printf '%s' "$pr_json" | jq -r '.url // empty')
+          pr_number=$(printf '%s' "$pr_json" | jq -r '.number // empty')
+          case "$(printf '%s' "$pr_json" | jq -r '.state // "NONE"')" in
+            OPEN)
+              echo "::notice::reusing the open PR ${pr_url} from an earlier run." ;;
+            CLOSED)
+              echo "::notice::${pr_url} was closed without publishing ${F_VERSION} (it is not on main); reopening to finish."
+              gh pr reopen "$pr_number" --repo "$TAP" ;;
+            *)
+              # No PR for the branch, or a merged one that never reached main
+              # (which cannot be reopened): open a fresh PR from the branch.
+              pr_url=$(gh pr create --repo "$TAP" --base main \
+                --head "$branch" \
+                --title "composemux ${F_VERSION}" \
+                --body "Version bump from the composemux ${GITHUB_REF_NAME} release. This PR's checks build the bottles; the brew pr-pull workflow publishes them and lands the bump.")
+              echo "::notice::opened ${pr_url}" ;;
+          esac
           pr_number="${pr_url##*/}"
           # Checks register a few seconds after the PR opens, and `gh pr checks`
           # errors until they do (exit 8 means they exist and are pending).
@@ -385,6 +402,26 @@ jobs:
             sleep 10
           done
           gh pr checks "$pr_number" --repo "$TAP" --watch --fail-fast
+          # Record the newest publish.yml run before dispatch so we can find the
+          # exact run we trigger (gh workflow run does not return a run id).
+          before=$(gh run list --repo "$TAP" --workflow publish.yml --json databaseId --jq '.[0].databaseId // 0')
           gh workflow run publish.yml --repo "$TAP" \
             -f pull_request="$pr_number" -f head_sha="$head_sha"
-          echo "::notice::bottles for composemux ${F_VERSION} are being published from ${pr_url}"
+          # Block on that run. gh workflow run is fire-and-forget; without this
+          # wait the job would exit and release the homebrew-tap-update lock while
+          # the publish is still uploading bottles and pushing the bump to the
+          # tap's main, letting the next release dispatch a second pr-pull that
+          # races this one. Holding the lock here serializes tap publishes.
+          run_id=""
+          for _ in $(seq 1 24); do
+            latest=$(gh run list --repo "$TAP" --workflow publish.yml --json databaseId --jq '.[0].databaseId // 0')
+            if [ -n "$latest" ] && [ "$latest" != "$before" ]; then run_id="$latest"; break; fi
+            sleep 5
+          done
+          if [ -n "$run_id" ]; then
+            echo "::notice::waiting for the tap's publish run ${run_id} for composemux ${F_VERSION}..."
+            gh run watch "$run_id" --repo "$TAP" --exit-status
+            echo "::notice::composemux ${F_VERSION} bottles published from ${pr_url}"
+          else
+            echo "::warning::dispatched publish.yml for ${pr_url} but could not resolve its run to wait on; not blocking the release. Verify the tap published composemux ${F_VERSION}."
+          fi
