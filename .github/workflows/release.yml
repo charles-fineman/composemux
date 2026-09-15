@@ -189,27 +189,40 @@ jobs:
     # not be able to push a formula that `brew install` users then execute.
     environment: release
     # A single constant group serializes ALL tap updates, not just same-tag
-    # ones: every release tag pushes the same tap branch, so two different tags
-    # racing here would hit a non-fast-forward push or clobber each other's
-    # formula. (crates-io keys by tag because each tag is a distinct version.)
+    # ones. Each tag gets its own branch and PR, but two runs racing here would
+    # still either duplicate a retry's PR for the same tag or pile several tap
+    # bottle builds and publishes on top of each other. (crates-io keys by tag
+    # because each tag is a distinct version.)
     concurrency:
       group: homebrew-tap-update
       cancel-in-progress: false
+      # Queue every pending release (up to 100) rather than GitHub's default of
+      # retaining only one pending run: without this a third release would
+      # cancel the second's pending tap bump, and that release would then have
+      # no tap branch, PR, or bottles. Requires cancel-in-progress: false.
+      # (actionlint's schema predates this key and flags it; GitHub accepts it.)
+      queue: max
     runs-on: ubuntu-latest
+    # Three bottle builds on the tap plus its publish run; waiting is the bulk.
+    timeout-minutes: 90
     steps:
-      # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to contents:write on
-      # sofired/homebrew-tap only, provisioned on the `release` environment. It
-      # is optional: a run before the maintainer provisions it degrades to a
-      # clear skip rather than failing the release (as the crates.io and Codecov
-      # steps do). Every other step is gated on this, so an unconfigured repo
-      # does no wasted work.
+      # HOMEBREW_TAP_TOKEN is a fine-grained PAT scoped to sofired/homebrew-tap
+      # only, provisioned on the `release` environment, with contents:write
+      # (push the bump branch), pull-requests:write (open the PR and read its
+      # checks with `gh pr checks`) and actions:write (dispatch the tap's
+      # publish workflow). Fine-grained PATs offer no separate Checks
+      # permission, so the first real release is what confirms the check
+      # watch sees the tap's runs. It is optional: a run before the maintainer
+      # provisions it degrades to a clear skip rather than failing the release
+      # (as the crates.io and Codecov steps do). Every other step is gated on
+      # this, so an unconfigured repo does no wasted work.
       - name: Does the tap have a token?
         id: gate
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the tap update. Bump Formula/composemux.rb in the tap by hand for this release."
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the tap update. Open a PR bumping Formula/composemux.rb in the tap by hand for this release, so the tap's CI still builds its bottles."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -255,7 +268,8 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
 
-      - name: Update Formula/composemux.rb and push
+      - name: Update Formula/composemux.rb on a branch
+        id: bump
         if: steps.gate.outputs.enabled == 'true'
         env:
           F_URL: ${{ steps.meta.outputs.url }}
@@ -266,8 +280,24 @@ jobs:
           formula="tap/Formula/composemux.rb"
           if [ ! -f "$formula" ]; then
             echo "::warning::$formula not found in the tap; has the formula been committed yet? Skipping."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Retry-safe: an earlier run of this job may already have pushed the
+          # branch (and opened the PR) before a later step failed. Build on that
+          # branch rather than on main, so the push below fast-forwards.
+          branch="composemux-${F_VERSION}"
+          reused=false
+          cd tap
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::notice::$branch already exists on the tap from an earlier run; reusing it."
+            git fetch -q origin "$branch"
+            git checkout -q -B "$branch" FETCH_HEAD
+            reused=true
+          else
+            git checkout -q -b "$branch"
+          fi
+          cd ..
           # Rewrite only the first stable url/sha256 pair, via python with literal
           # replacements read from the environment (no sed delimiter hazard, no
           # untrusted data spliced into a program). The head stanza is a `head`
@@ -292,10 +322,116 @@ jobs:
           grep -qF "sha256 \"$F_SHA256\"" "$formula"
           cd tap
           if git diff --quiet; then
-            echo "::notice::the tap already has this url/sha256; nothing to commit."
+            if [ "$reused" = true ]; then
+              echo "::notice::$branch already carries this url/sha256; continuing to its PR."
+            else
+              echo "::notice::the tap's main already has this url/sha256; nothing to do."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # A branch, not main: the tap bottles a formula on its PR CI, and
+            # `brew pr-pull` lands the bump together with the bottle block.
+            git -c user.name="composemux-release" \
+                -c user.email="actions@users.noreply.github.com" \
+                commit -am "composemux ${F_VERSION}"
+          fi
+          git push origin "HEAD:refs/heads/${branch}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # The tap's tests.yml builds and tests the bumped formula on every bottle
+      # platform and stores the bottles as artifacts; its publish.yml (`brew
+      # pr-pull`) then uploads them to the tap's `bottles` release and pushes
+      # the bump plus the `bottle do` block to main. This step opens the PR,
+      # waits for its checks, and dispatches that workflow. A failure here
+      # leaves the PR open for a maintainer; the crates.io publish and the
+      # GitHub release are already done by then.
+      - name: Open the tap pull request, wait for its bottles, and dispatch their publish
+        if: steps.gate.outputs.enabled == 'true' && steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          F_VERSION: ${{ steps.meta.outputs.version }}
+          F_URL: ${{ steps.meta.outputs.url }}
+          TAP: sofired/homebrew-tap
+        run: |
+          set -euo pipefail
+          cd tap
+          head_sha=$(git rev-parse HEAD)
+          branch="composemux-${F_VERSION}"
+          # Whether this bump is already published is decided by the tap's main,
+          # not by PR state: brew pr-pull lands by cherry-pick, so a *successful*
+          # publish leaves the PR either merged (fast-forward) or closed by the
+          # tap's publish workflow. Treating "closed" as "published" would both
+          # miss a hand-closed PR and be redundant here, so check main for this
+          # version first; only if it is absent do we (re)drive a PR.
+          git fetch -q origin main
+          if git show origin/main:Formula/composemux.rb 2>/dev/null | grep -qF "url \"$F_URL\""; then
+            echo "::notice::the tap's main already carries composemux ${F_VERSION}; bottles are published. Nothing to do."
             exit 0
           fi
-          git -c user.name="composemux-release" \
-              -c user.email="actions@users.noreply.github.com" \
-              commit -am "composemux ${F_VERSION}"
-          git push
+          # Not on main yet. Find this branch's PR in the tap. Only one whose head
+          # lives in the tap itself counts: `--head` matches by branch name alone
+          # and a fork could reuse it. Reuse an open one, reopen a closed one that
+          # never actually published, or open a fresh PR.
+          pr_json=$(gh pr list --repo "$TAP" --head "$branch" --state all \
+            --json url,number,state,headRepositoryOwner \
+            --jq '[.[] | select(.headRepositoryOwner.login == "sofired")][0] // empty')
+          pr_url=$(printf '%s' "$pr_json" | jq -r '.url // empty')
+          pr_number=$(printf '%s' "$pr_json" | jq -r '.number // empty')
+          case "$(printf '%s' "$pr_json" | jq -r '.state // "NONE"')" in
+            OPEN)
+              echo "::notice::reusing the open PR ${pr_url} from an earlier run." ;;
+            CLOSED)
+              echo "::notice::${pr_url} was closed without publishing ${F_VERSION} (it is not on main); reopening to finish."
+              gh pr reopen "$pr_number" --repo "$TAP" ;;
+            *)
+              # No PR for the branch, or a merged one that never reached main
+              # (which cannot be reopened): open a fresh PR from the branch.
+              pr_url=$(gh pr create --repo "$TAP" --base main \
+                --head "$branch" \
+                --title "composemux ${F_VERSION}" \
+                --body "Version bump from the composemux ${GITHUB_REF_NAME} release. This PR's checks build the bottles; the brew pr-pull workflow publishes them and lands the bump.")
+              echo "::notice::opened ${pr_url}" ;;
+          esac
+          pr_number="${pr_url##*/}"
+          # Checks register a few seconds after the PR opens, and `gh pr checks`
+          # errors until they do (exit 8 means they exist and are pending).
+          for _ in $(seq 1 18); do
+            gh pr checks "$pr_number" --repo "$TAP" >/dev/null 2>&1 && break
+            [ "$?" -eq 8 ] && break
+            sleep 10
+          done
+          gh pr checks "$pr_number" --repo "$TAP" --watch --fail-fast
+          # Snapshot the existing publish.yml run ids so we can identify the run
+          # our dispatch creates (gh workflow run returns no id). The tap's
+          # homebrew-tap-update lock this job holds already keeps two automated
+          # releases from dispatching at once; the set-difference below plus the
+          # fail-closed handling also cover a manual dispatch racing this one.
+          before_ids=$(gh run list --repo "$TAP" --workflow publish.yml --limit 50 --json databaseId --jq '.[].databaseId')
+          gh workflow run publish.yml --repo "$TAP" \
+            -f pull_request="$pr_number" -f head_sha="$head_sha"
+          # Wait for exactly the run we triggered: the one publish.yml run id that
+          # was not present before. gh workflow run is fire-and-forget, so without
+          # this the job would release the lock while the publish is still
+          # uploading bottles and pushing to the tap's main, letting the next
+          # release race a second pr-pull. Fail closed rather than release the
+          # lock on an unknown state: no run, or two new runs we can't tell apart.
+          run_id=""
+          for _ in $(seq 1 24); do
+            new_ids=$(gh run list --repo "$TAP" --workflow publish.yml --limit 50 --json databaseId --jq '.[].databaseId' \
+              | grep -vxF -f <(printf '%s\n' "$before_ids") || true)
+            count=$(printf '%s' "$new_ids" | grep -c . || true)
+            if [ "$count" -eq 1 ]; then run_id="$new_ids"; break; fi
+            if [ "$count" -gt 1 ]; then
+              echo "::error::more than one new publish.yml run appeared after dispatch (${new_ids//$'\n'/, }); cannot tell which is ours, so failing rather than release the tap lock on an unverified publish."
+              exit 1
+            fi
+            sleep 5
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::dispatched publish.yml for ${pr_url} but its run never appeared; failing so the tap lock is not released while the publish state is unknown."
+            exit 1
+          fi
+          echo "::notice::waiting for the tap's publish run ${run_id} for composemux ${F_VERSION}..."
+          gh run watch "$run_id" --repo "$TAP" --exit-status
+          echo "::notice::composemux ${F_VERSION} bottles published from ${pr_url}"
